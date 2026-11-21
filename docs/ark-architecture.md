@@ -49,9 +49,32 @@ Reviewed at bark `1ab6ccb`, Second docs `7ecd7e2`, arkd `fee16a7`, emulator `30a
 | Renewal without any owner | No | Yes, for covenant coins using `OP_TUNNEL` (`renewProgramContractOutputs`) |
 | Status of the programmable layer | Not applicable | Emulator README: "Alpha — available on testnet". A mainnet emulator endpoint also responds (v0.0.9) |
 
-**bark** has no contract coin type. A DLC would need a new `VtxoPolicy` and server support. A MuSig key inside `Pubkey` would make the exit path need both parties, and bark's signing code does not support that nesting.
+**bark** has no contract coin type, so it cannot host a trustless p2pFiat contract today. See [Can bark be used?](#can-bark-be-used).
 
 **Arkade** can express a two-party script today. Its `StabilityVault` example targets this exact use case, but **it does not work yet**: all functions except the exit are commented out, because "settlement currently hits unsupported runtime bindings". Its design document also says the exit path enforces the same settlement math, while the code lets the seeker alone spend the whole output after the delay.
+
+### Can bark be used?
+
+**Not for a trustless contract today, but bark is not ruled out.** It needs a contract coin type in both the client and the server.
+
+Why it does not work today:
+
+- **No contract coin.** A bark coin has one owner key or a fixed Lightning HTLC form. A DLC needs a coin held jointly by user and LP, with payout and refund paths.
+- **A combined key is not enough.** Putting a user+LP MuSig key in `Pubkey` makes the emergency exit need both parties, so either one can block it. bark's signing code also does not support that nested signing.
+- **Delegated refresh does not fill the gap.** It is built for single-owner coins, and the wallet still signs a forfeit when next opened.
+
+What would make it usable:
+
+| Route | What it needs | Result |
+|---|---|---|
+| **Fixed-term DLC on bark** | A new `VtxoPolicy` with server validation, signing, exit and recovery support, upstream or in a fork | Design 1, with terms inside the 28-day coin lifetime on Second's server |
+| **Generic custom scripts in bark** | A larger protocol change by Second | Could support DLCs and other contracts |
+| **Trusted LP balance on plain bark coins** | No bark changes: the hedge lives with the LP, outside Ark | Works with bark as it is, but the user trusts the LP, so it misses R3 |
+| **Covenants on Bitcoin** | A soft fork | Could remove the renewal problem, but is not available |
+
+A fork has a practical cost: users could only use a server running that fork, and it would carry changes to security-critical server code. Upstream support from Second is the better route.
+
+bark remains attractive for its mainnet server, native mobile SDKs and longer coin lifetime. If Second adds contract coins, Design 1 can move to bark: the oracle, LP logic and contract terms stay the same, while the coin script and signing flow change.
 
 ### The exit-path limit
 
