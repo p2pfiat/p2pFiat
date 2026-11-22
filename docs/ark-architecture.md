@@ -279,7 +279,7 @@ The grace period exists because testing broke the first version: 1 malicious mem
 | 1 or 2 | 0 leaks | **Leak possible** |
 | 3 | **Leak possible** | **Leak possible** |
 
-The healed-split result covers 43,008 scripted attack runs with 0 to 3 malicious members, of which 18,432 had 1 or 2, plus 20,000 randomized attacks per test run. This is a broad search, not a proof.
+The healed-split result covers 43,008 scripted attack runs with 0 to 2 malicious members, of which 18,432 had 1 or 2, plus 20,000 randomized attacks per test run. This is a broad search, not a proof.
 
 The contract still sees one oracle, so the roll cost stays at 3,496 adaptor signatures per signer. Event setup took 0.5 to 1.7 seconds in one process and sent 8.4 KB per member.
 
