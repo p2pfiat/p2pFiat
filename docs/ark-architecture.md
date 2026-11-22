@@ -1,6 +1,6 @@
 # p2pFiat on Ark: architecture note
 
-Status: audited draft, updated 2026-11-22 with four regtest experiments, a signing-cost measurement and a threshold oracle prototype. Nothing has run on a public network, and no product has been built.
+Status: audited draft, updated 2026-11-22 with four regtest experiments, a signing-cost measurement and two threshold oracle prototypes. Nothing has run on a public network, and no product has been built.
 
 ## Summary
 
@@ -13,7 +13,8 @@ Status: audited draft, updated 2026-11-22 with four regtest experiments, a signi
 - **Regtest results:** all four tests passed. See [Regtest results](#regtest-results) for what they do and do not show.
 - **Signing cost:** with independent 3-of-5 attestations, each signer needs about 140,000 adaptor signatures per position per roll. That works for one position but does not scale. See [Signing cost](#signing-cost).
 - **Threshold oracle:** a prototype cuts that cost 40 times by making the nostracles act as one oracle. It needs a price certificate, because a network split and 2 malicious members could otherwise reveal the group key. See [Threshold oracle](#threshold-oracle).
-- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a threshold oracle with 7 members and a 5-vote price certificate, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
+- **4-of-7 two-speed oracle:** a simulated group attested with up to 3 of 7 members offline. Up to 2 malicious members could not leak a key in any tested attack on a split that healed in time. **A split lasting past about 660 seconds, plus 1 malicious member, can still leak one event key.** See [4-of-7 two-speed oracle](#4-of-7-two-speed-oracle).
+- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a 4-of-7 threshold oracle with two-speed voting and per-event keys, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
 
 ## What must hold
 
@@ -250,19 +251,50 @@ The 40-times increase comes from the 10 possible oracle groups and about 4 digit
 | 7 | 4 | No | Yes |
 | **7** | **5** | **Yes** | **Yes** |
 
-The certificate was tested with 5 members. The 7-member rows are arithmetic over the voting rule, and a live 7-member group has not been run.
+Experiment 6 tested the certificate with 5 members. The 7-member rows are arithmetic over a single vote quorum. Experiment 7 ran 7 simulated members with two quorums.
 
-What remains trusted:
+### 4-of-7 two-speed oracle
 
-- **The signing threshold controls the oracle.** Any 3 colluding members can attest any price or reveal the key. A 7-member group should reconsider this threshold.
-- **A key leak affects every open contract.** Emergency key rotation is not built.
-- **Members must keep vote and nonce state.** Losing it could cause a double vote or nonce reuse. Crash recovery is not built.
+[Experiment 7](../experiments/07-two-speed-oracle/README.md) tested whether 4 of 7 members can keep attesting with 3 offline, without the key-leak risk of a plain 4-vote quorum. All 11 scenarios passed in 5 of 5 runs. Key generation, attestations and contract signatures used real cryptography. **The network and voting were a simulation with authenticated messages**, with no nostr transport.
+
+- **Fast path:** with 5 matching votes, a member signs immediately, about 31 seconds after the event.
+- **Slow path:** after 600 seconds, a member with 4 matching votes waits a further 60 seconds and signs only if those votes are still valid.
+- **Per-event keys:** each event gets its own key and digit nonces, certified by the long-term group key.
+
+| Each oracle offline | Fast path | Slow path | No attestation |
+|---|---|---|---|
+| 1% | 99.997% | 0.003% | 0.000% |
+| 5% | 99.624% | 0.356% | 0.019% |
+| 10% | 97.431% | 2.296% | 0.273% |
+| 20% | 85.197% | 11.469% | 3.334% |
+| 30% | 64.707% | 22.689% | 12.604% |
+
+These figures assume independent failures. A shared hosting, relay or price feed outage would make them worse.
+
+The grace period exists because testing broke the first version: 1 malicious member double-voted one second before the timeout and leaked the event key, even after the split had healed.
+
+| Malicious members | Split heals before signing | Split outlasts the slow path |
+|---|---|---|
+| 0 | 0 leaks | 0 leaks |
+| 1 or 2 | 0 leaks | **Leak possible** |
+| 3 | **Leak possible** | **Leak possible** |
+
+The healed-split result covers 43,008 scripted attack runs with 0 to 3 malicious members, of which 18,432 had 1 or 2, plus 20,000 randomized attacks per test run. This is a broad search, not a proof.
+
+The contract still sees one oracle, so the roll cost stays at 3,496 adaptor signatures per signer. Event setup took 0.5 to 1.7 seconds in one process and sent 8.4 KB per member.
+
+### What remains trusted
+
+- **4 colluding members control a 4-of-7 oracle.** They can attest any price.
+- **3 malicious members can leak an event key,** even after a short split. With a split past about 660 seconds, 1 is enough.
+- **A leaked event key exposes every contract settling on that event,** because the attacker can forge any price for it. The long-term key and other events stayed safe in the test. Staggering contracts across events would limit this, but is not built.
+- **Members must keep vote and nonce state.** Losing it could cause a double vote or nonce reuse. Crash recovery and key rotation are not built.
 
 ## Next steps
 
 Before building a product on Design 3:
 
-1. **Harden the threshold oracle:** a live 7-member group, its signing threshold, key rotation and crash recovery.
+1. **Harden the 4-of-7 oracle:** independently run members over nostr, long-split protection, staggered events, key rotation and crash recovery.
 2. **Connect real nostracles:** liveness challenges, mandates and attestations over nostr.
 3. **Test failed rolls:** a batch failure or a nostracle dropping out during signing.
 4. **Add perpetual terms:** funding payments, closing at any time, and liquidation.
@@ -290,7 +322,7 @@ Questions for the teams:
 
 **Keyword-searched, not read line by line:** the remaining Second pages (83 total) and Arkade pages (74 total).
 
-**Run:** the four regtest experiments listed under [Regtest results](#regtest-results) the measurement under [Signing cost](#signing-cost), and the prototype under [Threshold oracle](#threshold-oracle).
+**Run:** the four regtest experiments listed under [Regtest results](#regtest-results), the measurement under [Signing cost](#signing-cost), and the two prototypes under [Threshold oracle](#threshold-oracle).
 
 **Not done:** a formal security review, running a contract on a public network, or an exhaustive literature review. The 10101 failure reason comes from the project's history and was not independently researched.
 
