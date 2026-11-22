@@ -1,6 +1,6 @@
 # p2pFiat on Ark: architecture note
 
-Status: audited draft, updated 2026-11-22 with four regtest experiments, a signing-cost measurement and two threshold oracle prototypes. Nothing has run on a public network, and no product has been built.
+Status: audited draft, updated 2026-11-22 with four regtest experiments, a signing-cost measurement and three threshold oracle prototypes, the latest over local nostr relays. Nothing has run on a public network, and no product has been built.
 
 ## Summary
 
@@ -14,6 +14,7 @@ Status: audited draft, updated 2026-11-22 with four regtest experiments, a signi
 - **Signing cost:** with independent 3-of-5 attestations, each signer needs about 140,000 adaptor signatures per position per roll. That works for one position but does not scale. See [Signing cost](#signing-cost).
 - **Threshold oracle:** a prototype cuts that cost 40 times by making the nostracles act as one oracle. It needs a price certificate, because a network split and 2 malicious members could otherwise reveal the group key. See [Threshold oracle](#threshold-oracle).
 - **4-of-7 two-speed oracle:** a simulated group attested with up to 3 of 7 members offline. Up to 2 malicious members could not leak a key in any tested attack on a split that healed in time. **A split lasting past about 660 seconds, plus 1 malicious member, can still leak one event key.** See [4-of-7 two-speed oracle](#4-of-7-two-speed-oracle).
+- **Over nostr relays:** seven separate processes ran that oracle through three local strfry relays and survived 3 members offline and full relay outages. The long-split attack also worked there. Public relays and independent operators are untested. See [Over nostr relays](#over-nostr-relays).
 - **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a 4-of-7 threshold oracle with two-speed voting and per-event keys, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
 
 ## What must hold
@@ -207,7 +208,7 @@ What the tests do not show:
 - A stale exit of a contract settled offchain. Test 4 covers a stale exit of a rolled coin with the operator online.
 - Recovery of a swept coin, or a working watchtower.
 - A numeric DLC settled through a live arkd server, real nostracle attestations, Nitro enclave protections, real fee conditions, reorgs or public-network behavior.
-- Real nostr messaging, independently operated nostracles, a batch that fails during a roll, funding payments or liquidation.
+- Public nostr relays, independently operated nostracles, a batch that fails during a roll, funding payments or liquidation.
 - A threshold-attested payout through a live arkd server.
 
 ## Signing cost
@@ -283,6 +284,28 @@ The healed-split result covers 43,008 scripted attack runs with 0 to 2 malicious
 
 The contract still sees one oracle, so the roll cost stays at 3,496 adaptor signatures per signer. Event setup took 0.5 to 1.7 seconds in one process and sent 8.4 KB per member.
 
+### Over nostr relays
+
+[Experiment 8](../experiments/08-nostr-oracle/README.md) ran the same protocol with 7 separate processes that communicated only through signed nostr events on 3 strfry relays. Key shares were NIP-44 encrypted, and an outside client verified each attestation from the relays. All 17 scenarios passed in 5 of 5 runs, and the production timers passed in 1 run. **Everything ran on one machine**, and nothing was published to public relays.
+
+| Scenario | Result |
+|---|---|
+| All 7 online, production timers | Attested after 30.2 s |
+| 3 offline, production timers | Attested after 660.2 s |
+| 4 offline | No attestation |
+| 1 or 2 of 3 relays killed | Fast path |
+| All 3 relays down across the vote deadline | Attested about 1 s after they returned |
+| Bad key share or conflicting key deal | Setup aborts and names the dealer |
+| Last-second double vote, split heals in time | No honest member signed, no leak |
+| **Split outlasts the slow path, 1 malicious member** | **Event key recovered** |
+
+Other scenarios used shortened timers. The test also showed that:
+
+- **Members must publish concurrently.** Waiting for each relay's reply made reports miss the vote deadline under latency.
+- **The nostr client needs an update.** go-nostr v0.40.1 cannot use WebSocket compression under Go 1.27, so compression was off in this test.
+- **Key setup needs all 7 members online.** One member can stop it with a bad share. It is identified, but replacing it is not built.
+- **Relays can see prices, votes and timing.** Only key shares are encrypted.
+
 ### What remains trusted
 
 - **4 colluding members control a 4-of-7 oracle.** They can attest any price.
@@ -294,7 +317,7 @@ The contract still sees one oracle, so the roll cost stays at 3,496 adaptor sign
 
 Before building a product on Design 3:
 
-1. **Harden the 4-of-7 oracle:** independently run members over nostr, long-split protection, staggered events, key rotation and crash recovery.
+1. **Harden the 4-of-7 oracle:** independently run members on public relays, member replacement during setup, long-split protection, staggered events, key rotation and crash recovery.
 2. **Connect real nostracles:** liveness challenges, mandates and attestations over nostr.
 3. **Test failed rolls:** a batch failure or a nostracle dropping out during signing.
 4. **Add perpetual terms:** funding payments, closing at any time, and liquidation.
@@ -322,7 +345,7 @@ Questions for the teams:
 
 **Keyword-searched, not read line by line:** the remaining Second pages (83 total) and Arkade pages (74 total).
 
-**Run:** the four regtest experiments listed under [Regtest results](#regtest-results), the measurement under [Signing cost](#signing-cost), and the two prototypes under [Threshold oracle](#threshold-oracle).
+**Run:** the four regtest experiments listed under [Regtest results](#regtest-results), the measurement under [Signing cost](#signing-cost), and the three prototypes under [Threshold oracle](#threshold-oracle).
 
 **Not done:** a formal security review, running a contract on a public network, or an exhaustive literature review. The 10101 failure reason comes from the project's history and was not independently researched.
 
