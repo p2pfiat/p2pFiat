@@ -1,6 +1,6 @@
 # p2pFiat on Ark: architecture note
 
-Status: audited draft, updated 2026-11-22 with four regtest experiments and a signing-cost measurement. Nothing has run on a public network, and no product has been built.
+Status: audited draft, updated 2026-11-22 with four regtest experiments, a signing-cost measurement and a threshold oracle prototype. Nothing has run on a public network, and no product has been built.
 
 ## Summary
 
@@ -12,7 +12,8 @@ Status: audited draft, updated 2026-11-22 with four regtest experiments and a si
   3. **Nostracle quorum rolling DLC.** Any 3 of 5 nostracles can roll the DLC for an offline user, after a timelock and on terms the user fixed at opening. The operator cannot spend a live coin alone. **3 nostracles colluding with the LP can take the collateral.**
 - **Regtest results:** all four tests passed. See [Regtest results](#regtest-results) for what they do and do not show.
 - **Signing cost:** with independent 3-of-5 attestations, each signer needs about 140,000 adaptor signatures per position per roll. That works for one position but does not scale. See [Signing cost](#signing-cost).
-- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. It needs a cheaper oracle scheme, most likely a threshold oracle, before it can serve many positions. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
+- **Threshold oracle:** a prototype cuts that cost 40 times by making the nostracles act as one oracle. It needs a price certificate, because a network split and 2 malicious members could otherwise reveal the group key. See [Threshold oracle](#threshold-oracle).
+- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a threshold oracle with 7 members and a 5-vote price certificate, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
 
 ## What must hold
 
@@ -103,7 +104,7 @@ Yes = meets it; Partly = with a stated limit; No = does not.
 | **Fixed-term DLC on an Ark coin** | Partly: online once per term, and someone must act before expiry | Partly: operator must cosign and can sweep after expiry | Yes on regtest, with pre-signed exits | Partly: user signs each roll | Partly: passed on arkd regtest; needs new policy on bark | **Build next** |
 | DLC renewed by re-signing | No | Partly | Yes | Yes | Unproven | Same liveness problem as 10101 |
 | **Arkade Script vault** | Yes, while a keeper renews | **No: emulator key can take the coin** | Partly: exit unsolved | Yes | Partly: custom contract passed on regtest; alpha, reference vault disabled | **Second track** |
-| **Nostracle quorum rolling DLC** | Yes, while a quorum is online | Partly: operator must cosign and can refuse, but cannot spend a live coin alone | Partly: 3 of 5 nostracles + LP can take the collateral | Yes | Partly: passed on arkd regtest with simulated nostracles; 3-of-5 signing does not scale yet | **Primary candidate** |
+| **Nostracle quorum rolling DLC** | Yes, while a quorum is online | Partly: operator must cosign and can refuse, but cannot spend a live coin alone | Partly: 3 of 5 nostracles + LP can take the collateral | Yes | Partly: passed on arkd regtest with simulated nostracles; threshold oracle is an unreviewed prototype | **Primary candidate** |
 | CTV, TEMPLATEHASH, APO or CSFS | Yes | Yes | Yes | Yes | No: not active | Best long-term, not buildable now |
 | Witness encryption (VweTS) | Same as DLC | Yes | Yes | Same as DLC | Research | Improves multi-oracle efficiency, not liveness |
 | Cashu or Fedimint | Yes | No: mint or federation custody | Partly | Yes | Yes | Custodial trust |
@@ -175,11 +176,11 @@ Limits:
 - **The timelock gives no unilateral escape.** The user's paths also need the LP, so a user cannot move the coin away from a colluding quorum and LP.
 - **Nostracles must be independent.** One party running three of them defeats the design.
 - **Stale-exit protection needs an online operator.** Without one, an old coin could also exit. That loss should fall on the operator's liquidity rather than the user, but this was not tested.
-- **Independent 3-of-5 attestations are expensive.** See [Signing cost](#signing-cost).
+- **Independent 3-of-5 attestations are expensive.** See [Signing cost](#signing-cost). A [threshold oracle](#threshold-oracle) removes that cost, but adds a shared group key.
 
 ## The oracle
 
-In Design 1, a DLC oracle holds no key in the contract and cannot see who uses it. In Design 3, nostracles also hold quorum keys and see the contracts they roll. That adds a revenue stream per roll, but removes the oracle's privacy from those contracts. [nostracle](https://github.com/p2pfiat/nostracle) is built for Design 1, but **it has not been connected to a contract yet**. The regtest tests used a throwaway oracle key and two outcomes, and test 4 simulated the five nostracles.
+In Design 1, a DLC oracle holds no key in the contract and cannot see who uses it. In Design 3, nostracles also hold quorum keys and see the contracts they roll. That adds a revenue stream per roll, but removes the oracle's privacy from those contracts. With a [threshold oracle](#threshold-oracle), the group also shares one oracle key. [nostracle](https://github.com/p2pfiat/nostracle) is built for Design 1, but **it has not been connected to a contract yet**. The regtest tests used a throwaway oracle key and two outcomes, and test 4 simulated the five nostracles.
 
 Design 2 needs a different signed message: Arkade's examples verify `sha256(ticker || price || time)` with `OP_CHECKSIGFROMSTACK`. nostracle would need to publish this format too. These signatures would be visible when used, which affects the paid-attestation model.
 
@@ -206,6 +207,7 @@ What the tests do not show:
 - Recovery of a swept coin, or a working watchtower.
 - A numeric DLC settled through a live arkd server, real nostracle attestations, Nitro enclave protections, real fee conditions, reorgs or public-network behavior.
 - Real nostr messaging, independently operated nostracles, a batch that fails during a roll, funding payments or liquidation.
+- A threshold-attested payout through a live arkd server.
 
 ## Signing cost
 
@@ -224,19 +226,50 @@ The 40-times increase comes from the 10 possible oracle groups and about 4 digit
 - **Contract terms reduce the cost, but do not fix it.** A ±10% band needs 13.6 MB. Rounding to $10 at ±25%, with up to $5 of error, needs 5.9 MB.
 - **A phone should not verify a full roll.** It should fetch only the signatures it needs at settlement. This is not built, and no phone was measured.
 - **The first oracle in a group has limited price power.** It can move the settlement price by up to about twice the tolerance, about 0.5% at $256.
-- **A threshold oracle is the most promising fix.** If nostracles agree on one price and produce one threshold signature per digit, the contract should cost about the same as a single oracle. This needs distributed key generation and a price agreement step, and has not been built or tested.
+- **A threshold oracle removes the multiplier.** See [Threshold oracle](#threshold-oracle).
+
+## Threshold oracle
+
+[Experiment 6](../experiments/06-threshold-oracle/README.md) built a research prototype in which nostracles generate a shared key and per-digit nonces, agree on one price, and produce one normal BIP340 signature per digit. The contract sees a single oracle. All members ran in one process, without nostr transport or a cryptographic review.
+
+| Per position, per roll | Independent 3-of-5 | Threshold 3-of-5 |
+|---|---|---|
+| Adaptor signatures per signer | 140,140 | 3,496 |
+| Stored for all 4 signers | 35.3 MB | 0.9 MB |
+| Sign and verify 3 other signers, 8 cores | About 56 to 82 s | About 2 to 5 s |
+| Positions per day, per 8-core signer | About 1,000 to 1,500 | About 19,000 to 40,000 |
+
+**The simple protocol is unsafe.** Signing two prices with one nonce reveals the key. If a network split makes two honest members choose different prices, 2 malicious members can combine with each and produce both attestations. Test 6 demonstrated this key leak.
+
+**A price certificate prevents it.** Each member votes once and signs only with enough votes for one price:
+
+| Members | Votes needed | Safe from a split with 2 malicious | Still attests if those 2 stop |
+|---|---|---|---|
+| 5 | 3 | No | Yes |
+| 5 | 4 | Yes | No |
+| 7 | 4 | No | Yes |
+| **7** | **5** | **Yes** | **Yes** |
+
+The certificate was tested with 5 members. The 7-member rows are arithmetic over the voting rule, and a live 7-member group has not been run.
+
+What remains trusted:
+
+- **The signing threshold controls the oracle.** Any 3 colluding members can attest any price or reveal the key. A 7-member group should reconsider this threshold.
+- **A key leak affects every open contract.** Emergency key rotation is not built.
+- **Members must keep vote and nonce state.** Losing it could cause a double vote or nonce reuse. Crash recovery is not built.
 
 ## Next steps
 
 Before building a product on Design 3:
 
-1. **Test a threshold oracle:** distributed key generation, price agreement and one threshold signature per digit, to remove the 40-times signing cost.
+1. **Harden the threshold oracle:** a live 7-member group, its signing threshold, key rotation and crash recovery.
 2. **Connect real nostracles:** liveness challenges, mandates and attestations over nostr.
 3. **Test failed rolls:** a batch failure or a nostracle dropping out during signing.
 4. **Add perpetual terms:** funding payments, closing at any time, and liquidation.
 5. **Test adversarial cases:** operator censorship, collusion and stale exits without an operator.
 6. **Decide who pays exit fees** for an offline phone.
-7. **Repeat the lifecycle on a test network.**
+7. **Get a cryptographic review** of the threshold oracle and contract.
+8. **Repeat the lifecycle on a test network.**
 
 Questions for the teams:
 
@@ -246,7 +279,7 @@ Questions for the teams:
 | Milestone | Deliverable | Depends on |
 |---|---|---|
 | M1 | nostracle oracle | Built; not deployed |
-| M2 | Regtest tests 1–4, then choose a design | Tests passed; Design 3 recommended, threshold oracle needed for scale, decision pending |
+| M2 | Regtest tests 1–4, then choose a design | Tests passed; Design 3 with a threshold oracle recommended, decision pending |
 | M3 | Chosen contract on a test network | M2 |
 | M4 | LP service: quotes, hedging, rolls | M3 |
 | M5 | Mobile wallet with a stable balance | M4 |
@@ -257,7 +290,7 @@ Questions for the teams:
 
 **Keyword-searched, not read line by line:** the remaining Second pages (83 total) and Arkade pages (74 total).
 
-**Run:** the four regtest experiments listed under [Regtest results](#regtest-results) and the measurement under [Signing cost](#signing-cost).
+**Run:** the four regtest experiments listed under [Regtest results](#regtest-results) the measurement under [Signing cost](#signing-cost), and the prototype under [Threshold oracle](#threshold-oracle).
 
 **Not done:** a formal security review, running a contract on a public network, or an exhaustive literature review. The 10101 failure reason comes from the project's history and was not independently researched.
 
