@@ -1,15 +1,17 @@
 # p2pFiat on Ark: architecture note
 
-Status: audited draft, 2026-11-21. Nothing below has been prototyped.
+Status: audited draft, updated 2026-11-22 with four regtest experiments. Nothing has run on a public network, and no product has been built.
 
 ## Summary
 
 - **No reviewed design gives all four at once:** a phone that stays offline, no trust in the Ark operator, rolling positions, and working software today.
 - **The previous version of this note was wrong.** It said a phone could sign once and an LP could renew a DLC weekly. Pre-signed DLC transactions commit to the exact coin they spend, and renewal replaces that coin.
-- **Two designs are worth testing:**
-  1. **Fixed-term DLC.** It keeps the operator out of the payout logic. The phone must come online once per term to roll. If it doesn't, the position settles to BTC at maturity and the user loses the hedge, not the funds.
-  2. **Arkade Script vault.** It can renew without the phone and settle from an oracle price. The operator's enclave enforces the contract, so this adds operator trust.
-- **Recommendation:** prototype the fixed-term DLC first, and run the three tests under [Next steps](#next-steps) before committing to either design.
+- **Three designs were tested:**
+  1. **Fixed-term DLC.** It keeps the operator out of the payout logic. The phone must come online once per term to roll. If it doesn't, the LP can settle the position to BTC at maturity, so the user loses the hedge, not the funds. **If nobody settles or exits before the coin expires, the operator can sweep it.**
+  2. **Arkade Script vault.** It renewed and settled from an oracle price with no owner signature. **In our test, the emulator key alone was enough to take the whole coin**, so this design depends on the operator's enclave.
+  3. **Nostracle quorum rolling DLC.** Any 3 of 5 nostracles can roll the DLC for an offline user, after a timelock and on terms the user fixed at opening. The operator cannot spend a live coin alone. **3 nostracles colluding with the LP can take the collateral.**
+- **Regtest results:** all four tests passed. See [Regtest results](#regtest-results) for what they do and do not show.
+- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
 
 ## What must hold
 
@@ -31,11 +33,12 @@ After a renewal, **every CET and refund signature is invalid**, and the user mus
 - a contract that ends before the coin must renew;
 - a signature that doesn't commit to the outpoint (APO, not active on Bitcoin);
 - a covenant (CTV or TEMPLATEHASH, not active on Bitcoin);
-- an off-chain script engine, such as Arkade's emulator, which adds trust in its operator.
+- an off-chain script engine, such as Arkade's emulator, which adds trust in its operator;
+- a quorum that re-signs for an absent user at each renewal, which adds trust in that quorum (Design 3).
 
 ## bark and Arkade today
 
-Reviewed at bark `1ab6ccb`, Second docs `7ecd7e2`, arkd `fee16a7`, emulator `30a59c7`, compiler `4075d82` and ts-sdk `bd6057c`.
+Reviewed at bark `1ab6ccb`, Second docs `7ecd7e2`, arkd `fee16a7`, emulator `30a59c7`, compiler `4075d82` and ts-sdk `bd6057c`. The covenant test ran on arkd `v0.9.25`, the version pinned by the emulator.
 
 | | **bark** (Second) | **Arkade** (Ark Labs) |
 |---|---|---|
@@ -82,9 +85,9 @@ Bitcoin cannot run Arkade Script, so after a unilateral exit the contract math n
 
 - **One party alone**, as in `StabilityVault` and the option templates. That party can claim the other's collateral after the delay unless another spend happens first.
 - **N-of-N**, as in the escrow template. If one party disappears, the funds are stuck.
-- **N-of-N plus pre-signed payouts.** This is safe, but it brings back the outpoint problem.
+- **N-of-N plus pre-signed payouts.** Either party can exit alone with the correct amount. It brings back the outpoint problem, so it only fits a coin that is not renewed.
 
-Any design has to choose one explicitly. This is the main unresolved risk for R3 and R4.
+**Design 1 uses the third option, which worked on regtest (test 2).** Design 3 keeps this option across rolls, because its quorum signs the new coin's payouts before giving up the old coin (test 4). Design 2 renews with no signer, so pre-signed payouts would stop working at each renewal. Its exit remains the main unresolved risk for R3 and R4.
 
 ## Methods compared
 
@@ -96,9 +99,10 @@ Yes = meets it; Partly = with a stated limit; No = does not.
 | DLC in Lightning channel (10101) | No | Yes | Yes | Yes, interactive | Yes | The failure this project avoids |
 | DLC factory | No: must watch before settlement | Yes | Yes | Yes, with both parties | Design | Good on-chain design; a VTXO renewal would break its signatures |
 | Ticketed DLC | Partly | Yes | Yes | No | Library | One-shot, multi-player |
-| **Fixed-term DLC on an Ark coin** | Partly: online once per term | Partly: operator must cosign; exit needs design | Yes, if exit is solved | Partly: user signs each roll | Unproven on arkd; needs new policy on bark | **Prototype first** |
+| **Fixed-term DLC on an Ark coin** | Partly: online once per term, and someone must act before expiry | Partly: operator must cosign and can sweep after expiry | Yes on regtest, with pre-signed exits | Partly: user signs each roll | Partly: passed on arkd regtest; needs new policy on bark | **Build next** |
 | DLC renewed by re-signing | No | Partly | Yes | Yes | Unproven | Same liveness problem as 10101 |
-| **Arkade Script vault** | Yes | **No: relies on operator enclave** | Partly: exit leaf | Yes | Partly: alpha, reference vault disabled | **Second track** |
+| **Arkade Script vault** | Yes, while a keeper renews | **No: emulator key can take the coin** | Partly: exit unsolved | Yes | Partly: custom contract passed on regtest; alpha, reference vault disabled | **Second track** |
+| **Nostracle quorum rolling DLC** | Yes, while a quorum is online | Partly: operator must cosign and can refuse, but cannot spend a live coin alone | Partly: 3 of 5 nostracles + LP can take the collateral | Yes | Partly: passed on arkd regtest with simulated nostracles | **Primary candidate** |
 | CTV, TEMPLATEHASH, APO or CSFS | Yes | Yes | Yes | Yes | No: not active | Best long-term, not buildable now |
 | Witness encryption (VweTS) | Same as DLC | Yes | Yes | Same as DLC | Research | Improves multi-oracle efficiency, not liveness |
 | Cashu or Fedimint | Yes | No: mint or federation custody | Partly | Yes | Yes | Custodial trust |
@@ -109,39 +113,109 @@ Yes = meets it; Partly = with a stated limit; No = does not.
 The contract ends well before the coin must renew.
 
 ```
-Open:      U and L fund a contract coin and pre-sign payouts for that exact coin
-Maturity:  oracle attests -> L completes the matching payout -> operator cosigns
+Open:      U and L fund a contract coin and adaptor-sign offchain and exit payouts for that exact coin
+Maturity:  oracle attests -> either party completes the matching payout -> operator cosigns
+Failure:   if the operator is gone, either party exits onchain with the same attestation
 Roll:      when U next opens the app, settle and open a new contract
 Missed:    position settles to plain BTC at the oracle price; U loses the hedge
 ```
 
-**The main benefit is a safer failure.** Missing a roll ends the hedge at a fair price, and does not force a channel closure. The user must still open the wallet before the resulting coin expires, as with any Ark wallet.
+**The main benefit is a safer failure.** Missing a roll ends the hedge at a fair price, and does not force a channel closure. **Coin expiry remains a hard deadline:** someone must settle or start the exit before the contract coin expires, and the user must refresh or exit the payout coin before it expires. A watchtower is probably needed for a phone that may stay offline.
 
 Limits:
 
 - The dollar value is protected only until maturity. An absent user then holds BTC.
 - A term must fit inside one coin lifetime, with margin for settlement and exit.
-- Arkade's offchain spend has a step where the wallet signs after the operator. Whether U can pre-sign it is **unverified** (test 1).
+- The refund locktime must fall before coin expiry.
+- Exit data comes from the operator, so it must be saved when the contract opens.
+- An exit needs separate BTC for fees. It took 3 transactions in our test, so small balances may not be worth exiting.
 
 ## Design 2: Arkade Script vault
 
-A covenant checks a signed oracle price and enforces the payout, and `OP_TUNNEL` lets a keeper renew the coin without its owners. This is the only reviewed design that meets R1 and R5 today.
+A covenant checks a signed oracle price and enforces the payout, and `OP_TUNNEL` lets a keeper renew the coin without its owners. This is the only reviewed design that meets R1 and R5 today, and it ran on regtest (test 3).
 
 The cost is trust. Covenant paths are signed by the operator's server and emulator keys, inside an AWS Nitro enclave. Arkade's docs state that a compromised key could sign a spend the script would refuse, and that paths also requiring the owner's signature stay protected. A renewal path has no owner signature, so **it has no such protection**.
 
+Test 3 confirmed this. Using the emulator key directly, the test paid a whole coin to an attacker, and unmodified arkd cosigned without running the covenant. The same attack failed on a path that also needed an owner signature, but requiring that signature for renewal brings back the liveness problem.
+
+Other limits from the test:
+
+- If the emulator is down, the contract cannot renew or settle.
+- The tested renewal script is pinned to one keeper, so a missing keeper stops renewal.
+- The contract has no refund path if the oracle never signs.
+
+## Design 3: nostracle quorum rolling DLC
+
+The contract is the Design 1 DLC with extra script paths for 3 of 5 independent nostracles. It keeps a position rolling for an absent user without an owner-free covenant.
+
+```
+Open:      U signs a mandate: payout keys, maximum term, absence limit
+Challenge: before each roll, nostracles send U a fresh liveness challenge
+Answered:  U signs the roll with L and the operator
+Missed:    after the timelock, 3 of 5 nostracles sign the roll with L and the operator
+Roll:      the quorum and L sign the new coin's payouts, then forfeit the old coin
+Failure:   if the operator is gone, the quorum's latest exit payout still works
+```
+
+Each coin has 22 script paths: user settle, user exit, and 10 quorum settle and 10 quorum exit paths. arkd refuses a path that combines absolute and relative timelocks, so the quorum exit uses a relative delay longer than the maximum term. The quorum therefore cannot claim the coin before the term ends.
+
+What each party can do:
+
+| Party | Can do | Cannot do |
+|---|---|---|
+| Operator | Refuse service; sweep an expired coin | Spend a live contract coin |
+| LP | Refuse to roll | Take the user's funds alone |
+| Up to 2 nostracles | Nothing alone | Sign or block a roll |
+| **3 nostracles + LP** | **Take the collateral after the timelock** | |
+
+Limits:
+
+- **The liveness test and mandate are policy.** Bitcoin and arkd enforce only signatures and timelocks, so these protect the user only while a majority of nostracles is honest.
+- **The timelock gives no unilateral escape.** The user's paths also need the LP, so a user cannot move the coin away from a colluding quorum and LP.
+- **Nostracles must be independent.** One party running three of them defeats the design.
+- **Stale-exit protection needs an online operator.** Without one, an old coin could also exit. That loss should fall on the operator's liquidity rather than the user, but this was not tested.
+
 ## The oracle
 
-A DLC oracle holds no key in the contract and cannot see who uses it. [nostracle](https://github.com/p2pfiat/nostracle) works for Design 1 as built.
+In Design 1, a DLC oracle holds no key in the contract and cannot see who uses it. In Design 3, nostracles also hold quorum keys and see the contracts they roll. That adds a revenue stream per roll, but removes the oracle's privacy from those contracts. [nostracle](https://github.com/p2pfiat/nostracle) is built for Design 1, but **it has not been connected to a contract yet**. The regtest tests used a throwaway oracle key and two outcomes, and test 4 simulated the five nostracles.
 
 Design 2 needs a different signed message: Arkade's examples verify `sha256(ticker || price || time)` with `OP_CHECKSIGFROMSTACK`. nostracle would need to publish this format too. These signatures would be visible when used, which affects the paid-attestation model.
 
+## Regtest results
+
+| Test | Question | Result | Runs |
+|---|---|---|---|
+| [1. Offline settlement](../experiments/01-offline-settlement/README.md) (Design 1) | Can L complete a pre-signed payout on arkd while U is offline, including the checkpoint? | **Yes**, while the operator cooperates | 10 of 10 |
+| [2. Failure paths](../experiments/02-failure-paths/README.md) (Design 1) | With the operator, LP or oracle gone, can each party recover the correct amount? | **Yes**, if someone acts before expiry and the exit data was saved. After expiry, the operator sweeps the coin and the exit fails | 5 of 5 |
+| [3. Covenant lifecycle](../experiments/03-covenant-lifecycle/README.md) (Design 2) | Can a position renew and settle at an oracle price, and what can the operator do alone? | **Lifecycle works with no owner signature**, but the emulator key alone can take the coin | 5 of 5 |
+| [4. Nostracle quorum rolling DLC](../experiments/04-guardian-rolling-dlc/README.md) (Design 3) | Can 3 of 5 nostracles roll for an offline user, with no single party able to take the funds? | **Yes**, but 3 nostracles colluding with the LP can take the collateral after the timelock | 5 of 5 |
+
+What the tests changed:
+
+- **Design 1 is feasible on arkd.** U can pre-sign the checkpoint, which was the main open question.
+- **The Design 1 exit leaf is user + LP after a delay, with payouts and a refund pre-signed at opening.** Either party can then exit without the other.
+- **Design 2 trades custody risk for liveness.** It avoids the phone's liveness problem by trusting the emulator key.
+- **Design 3 moves that trust from one operator to a quorum.** It keeps rolling for an offline user, and its exit payouts survive each roll.
+
+What the tests do not show:
+
+- A malicious operator beyond the emulator-key attack, including censorship or collusion with one party.
+- A stale exit of a contract settled offchain. Test 4 covers a stale exit of a rolled coin with the operator online.
+- Recovery of a swept coin, or a working watchtower.
+- A full numeric DLC, a multi-oracle price, nostracle attestations, Nitro enclave protections, real fee conditions, reorgs or public-network behavior.
+- Real nostr messaging, independently operated nostracles, a batch that fails during a roll, funding payments or liquidation.
+
 ## Next steps
 
-Run on regtest before building a product:
+Before building a product on Design 3:
 
-1. **Offline settlement (Design 1):** can L complete a pre-signed payout on arkd while U is offline, including the checkpoint?
-2. **Failure paths:** with the operator, LP or oracle gone, can each party recover the correct amount? Which exit leaf achieves this?
-3. **Covenant lifecycle (Design 2):** open, renew with `OP_TUNNEL`, and settle an oracle-priced position, measuring what the operator could do alone.
+1. **Measure the signing cost:** a numeric DLC with a 3-of-5 oracle price, to see whether frequent rolls are practical.
+2. **Connect real nostracles:** liveness challenges, mandates and attestations over nostr.
+3. **Test failed rolls:** a batch failure or a nostracle dropping out during signing.
+4. **Add perpetual terms:** funding payments, closing at any time, and liquidation.
+5. **Test adversarial cases:** operator censorship, collusion and stale exits without an operator.
+6. **Decide who pays exit fees** for an offline phone.
+7. **Repeat the lifecycle on a test network.**
 
 Questions for the teams:
 
@@ -151,7 +225,7 @@ Questions for the teams:
 | Milestone | Deliverable | Depends on |
 |---|---|---|
 | M1 | nostracle oracle | Built; not deployed |
-| M2 | Regtest tests 1–3, then choose a design | M1 |
+| M2 | Regtest tests 1–4, then choose a design | Tests passed; Design 3 recommended, decision pending |
 | M3 | Chosen contract on a test network | M2 |
 | M4 | LP service: quotes, hedging, rolls | M3 |
 | M5 | Mobile wallet with a stable balance | M4 |
@@ -162,7 +236,9 @@ Questions for the teams:
 
 **Keyword-searched, not read line by line:** the remaining Second pages (83 total) and Arkade pages (74 total).
 
-**Not done:** a formal security review, running any contract, or an exhaustive literature review. The 10101 failure reason comes from the project's history and was not independently researched.
+**Run:** the four regtest experiments listed under [Regtest results](#regtest-results).
+
+**Not done:** a formal security review, running a contract on a public network, or an exhaustive literature review. The 10101 failure reason comes from the project's history and was not independently researched.
 
 ## Sources
 
