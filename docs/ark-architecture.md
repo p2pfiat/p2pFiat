@@ -1,6 +1,6 @@
 # p2pFiat on Ark: architecture note
 
-Status: audited draft, updated 2026-11-22 with four regtest experiments. Nothing has run on a public network, and no product has been built.
+Status: audited draft, updated 2026-11-22 with four regtest experiments and a signing-cost measurement. Nothing has run on a public network, and no product has been built.
 
 ## Summary
 
@@ -11,7 +11,8 @@ Status: audited draft, updated 2026-11-22 with four regtest experiments. Nothing
   2. **Arkade Script vault.** It renewed and settled from an oracle price with no owner signature. **In our test, the emulator key alone was enough to take the whole coin**, so this design depends on the operator's enclave.
   3. **Nostracle quorum rolling DLC.** Any 3 of 5 nostracles can roll the DLC for an offline user, after a timelock and on terms the user fixed at opening. The operator cannot spend a live coin alone. **3 nostracles colluding with the LP can take the collateral.**
 - **Regtest results:** all four tests passed. See [Regtest results](#regtest-results) for what they do and do not show.
-- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
+- **Signing cost:** with independent 3-of-5 attestations, each signer needs about 140,000 adaptor signatures per position per roll. That works for one position but does not scale. See [Signing cost](#signing-cost).
+- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. It needs a cheaper oracle scheme, most likely a threshold oracle, before it can serve many positions. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
 
 ## What must hold
 
@@ -102,7 +103,7 @@ Yes = meets it; Partly = with a stated limit; No = does not.
 | **Fixed-term DLC on an Ark coin** | Partly: online once per term, and someone must act before expiry | Partly: operator must cosign and can sweep after expiry | Yes on regtest, with pre-signed exits | Partly: user signs each roll | Partly: passed on arkd regtest; needs new policy on bark | **Build next** |
 | DLC renewed by re-signing | No | Partly | Yes | Yes | Unproven | Same liveness problem as 10101 |
 | **Arkade Script vault** | Yes, while a keeper renews | **No: emulator key can take the coin** | Partly: exit unsolved | Yes | Partly: custom contract passed on regtest; alpha, reference vault disabled | **Second track** |
-| **Nostracle quorum rolling DLC** | Yes, while a quorum is online | Partly: operator must cosign and can refuse, but cannot spend a live coin alone | Partly: 3 of 5 nostracles + LP can take the collateral | Yes | Partly: passed on arkd regtest with simulated nostracles | **Primary candidate** |
+| **Nostracle quorum rolling DLC** | Yes, while a quorum is online | Partly: operator must cosign and can refuse, but cannot spend a live coin alone | Partly: 3 of 5 nostracles + LP can take the collateral | Yes | Partly: passed on arkd regtest with simulated nostracles; 3-of-5 signing does not scale yet | **Primary candidate** |
 | CTV, TEMPLATEHASH, APO or CSFS | Yes | Yes | Yes | Yes | No: not active | Best long-term, not buildable now |
 | Witness encryption (VweTS) | Same as DLC | Yes | Yes | Same as DLC | Research | Improves multi-oracle efficiency, not liveness |
 | Cashu or Fedimint | Yes | No: mint or federation custody | Partly | Yes | Yes | Custodial trust |
@@ -174,6 +175,7 @@ Limits:
 - **The timelock gives no unilateral escape.** The user's paths also need the LP, so a user cannot move the coin away from a colluding quorum and LP.
 - **Nostracles must be independent.** One party running three of them defeats the design.
 - **Stale-exit protection needs an online operator.** Without one, an old coin could also exit. That loss should fall on the operator's liquidity rather than the user, but this was not tested.
+- **Independent 3-of-5 attestations are expensive.** See [Signing cost](#signing-cost).
 
 ## The oracle
 
@@ -202,14 +204,33 @@ What the tests do not show:
 - A malicious operator beyond the emulator-key attack, including censorship or collusion with one party.
 - A stale exit of a contract settled offchain. Test 4 covers a stale exit of a rolled coin with the operator online.
 - Recovery of a swept coin, or a working watchtower.
-- A full numeric DLC, a multi-oracle price, nostracle attestations, Nitro enclave protections, real fee conditions, reorgs or public-network behavior.
+- A numeric DLC settled through a live arkd server, real nostracle attestations, Nitro enclave protections, real fee conditions, reorgs or public-network behavior.
 - Real nostr messaging, independently operated nostracles, a batch that fails during a roll, funding payments or liquidation.
+
+## Signing cost
+
+[Experiment 5](../experiments/05-numeric-signing-cost/README.md) measured a numeric 3-of-5 roll, using nostracle's 20-digit event shape with a reimplemented oracle. The position is $1,000 with 2,000,000 sats of collateral, payouts rounded to $1, a ±25% price band, a $256 tolerance, and pre-signed exit payouts only.
+
+| Per position, per roll | Single oracle | Independent 3-of-5 |
+|---|---|---|
+| Adaptor signatures per signer | 3,496 | 140,140 |
+| Stored for all 4 signers | 0.9 MB | 35.3 MB |
+| Time to sign, 8 cores | Under 1 s, estimated | 3.7 to 5.9 s |
+| Time to verify 3 other signers, 8 cores | Not run | About 53 to 76 s, extrapolated |
+
+The 40-times increase comes from the 10 possible oracle groups and about 4 digit combinations per group, needed because independent oracles will not report the identical price.
+
+- **One position can roll daily.** An 8-core signer could handle roughly 1,000 to 1,500 positions per day, so this does not scale to a product.
+- **Contract terms reduce the cost, but do not fix it.** A ±10% band needs 13.6 MB. Rounding to $10 at ±25%, with up to $5 of error, needs 5.9 MB.
+- **A phone should not verify a full roll.** It should fetch only the signatures it needs at settlement. This is not built, and no phone was measured.
+- **The first oracle in a group has limited price power.** It can move the settlement price by up to about twice the tolerance, about 0.5% at $256.
+- **A threshold oracle is the most promising fix.** If nostracles agree on one price and produce one threshold signature per digit, the contract should cost about the same as a single oracle. This needs distributed key generation and a price agreement step, and has not been built or tested.
 
 ## Next steps
 
 Before building a product on Design 3:
 
-1. **Measure the signing cost:** a numeric DLC with a 3-of-5 oracle price, to see whether frequent rolls are practical.
+1. **Test a threshold oracle:** distributed key generation, price agreement and one threshold signature per digit, to remove the 40-times signing cost.
 2. **Connect real nostracles:** liveness challenges, mandates and attestations over nostr.
 3. **Test failed rolls:** a batch failure or a nostracle dropping out during signing.
 4. **Add perpetual terms:** funding payments, closing at any time, and liquidation.
@@ -225,7 +246,7 @@ Questions for the teams:
 | Milestone | Deliverable | Depends on |
 |---|---|---|
 | M1 | nostracle oracle | Built; not deployed |
-| M2 | Regtest tests 1–4, then choose a design | Tests passed; Design 3 recommended, decision pending |
+| M2 | Regtest tests 1–4, then choose a design | Tests passed; Design 3 recommended, threshold oracle needed for scale, decision pending |
 | M3 | Chosen contract on a test network | M2 |
 | M4 | LP service: quotes, hedging, rolls | M3 |
 | M5 | Mobile wallet with a stable balance | M4 |
@@ -236,7 +257,7 @@ Questions for the teams:
 
 **Keyword-searched, not read line by line:** the remaining Second pages (83 total) and Arkade pages (74 total).
 
-**Run:** the four regtest experiments listed under [Regtest results](#regtest-results).
+**Run:** the four regtest experiments listed under [Regtest results](#regtest-results) and the measurement under [Signing cost](#signing-cost).
 
 **Not done:** a formal security review, running a contract on a public network, or an exhaustive literature review. The 10101 failure reason comes from the project's history and was not independently researched.
 
