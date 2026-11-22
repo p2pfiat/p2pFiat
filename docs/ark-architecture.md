@@ -1,6 +1,6 @@
 # p2pFiat on Ark: architecture note
 
-Status: audited draft, updated 2026-11-22 with four regtest experiments, a signing-cost measurement and three threshold oracle prototypes, the latest over local nostr relays. Nothing has run on a public network, and no product has been built.
+Status: audited draft, updated 2026-11-22 with four regtest experiments, a signing-cost measurement and four threshold oracle prototypes, the latest two over local nostr relays. Nothing has run on a public network, and no product has been built.
 
 ## Summary
 
@@ -15,6 +15,7 @@ Status: audited draft, updated 2026-11-22 with four regtest experiments, a signi
 - **Threshold oracle:** a prototype cuts that cost 40 times by making the nostracles act as one oracle. It needs a price certificate, because a network split and 2 malicious members could otherwise reveal the group key. See [Threshold oracle](#threshold-oracle).
 - **4-of-7 two-speed oracle:** a simulated group attested with up to 3 of 7 members offline. Up to 2 malicious members could not leak a key in any tested attack on a split that healed in time. **A split lasting past about 660 seconds, plus 1 malicious member, can still leak one event key.** See [4-of-7 two-speed oracle](#4-of-7-two-speed-oracle).
 - **Over nostr relays:** seven separate processes ran that oracle through three local strfry relays and survived 3 members offline and full relay outages. The long-split attack also worked there. Public relays and independent operators are untested. See [Over nostr relays](#over-nostr-relays).
+- **Event setup:** setting up a new event now works with up to 2 of 7 members offline or faulty. With 3 down, no new event can be set up, but events prepared earlier still attest. See [Fault-tolerant event setup](#fault-tolerant-event-setup).
 - **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a 4-of-7 threshold oracle with two-speed voting and per-event keys, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
 
 ## What must hold
@@ -303,8 +304,43 @@ Other scenarios used shortened timers. The test also showed that:
 
 - **Members must publish concurrently.** Waiting for each relay's reply made reports miss the vote deadline under latency.
 - **The nostr client needs an update.** go-nostr v0.40.1 cannot use WebSocket compression under Go 1.27, so compression was off in this test.
-- **Key setup needs all 7 members online.** One member can stop it with a bad share. It is identified, but replacing it is not built.
+- **Key setup needed all 7 members online in this experiment.** One member could stop it with a bad share. [Experiment 9](#fault-tolerant-event-setup) removes this limit for event keys.
 - **Relays can see prices, votes and timing.** Only key shares are encrypted.
+
+### Fault-tolerant event setup
+
+[Experiment 9](../experiments/09-fault-tolerant-setup/README.md) changed event setup so that it no longer needs all 7 members. Members deal key shares, publicly resolve complaints, and vote on a leader's proposed set of at least 4 dealers. **5 matching votes finalize the set.** Members that missed setup catch up from the relays. All 17 checks passed in 5 of 5 runs, on one machine with 3 local strfry relays and shortened setup timers.
+
+| Each oracle offline | All 7 needed | At least 5 needed | 3 independent attempts |
+|---|---|---|---|
+| 1% | 93.2% | 99.997% | Over 99.9999% |
+| 5% | 69.8% | 99.624% | Over 99.9999% |
+| 10% | 47.8% | 97.431% | 99.998% |
+| 20% | 21.0% | 85.197% | 99.676% |
+| 30% | 8.2% | 64.707% | 95.604% |
+
+These figures are calculated and assume independent failures. Real outages are often shared and can outlast several attempts, so events should be prepared in advance.
+
+| Scenario | Result |
+|---|---|
+| 2 offline during setup | Certified with 5 dealers, attested |
+| 3 offline during setup | 4 members voted, nothing certified |
+| 2 members miss setup, then help sign with only 4 online | Attested on the slow path |
+| Bad, missing or conflicting deal | Dealer excluded |
+| False complaints against every dealer | All answered, none excluded |
+| Leader stays silent | Attempt fails, next leader succeeds |
+| **Split with a two-faced leader** | **Each side reached 4 votes for a different key set, neither certified** |
+| 3 members down with 2 events prepared | New setup fails, both prepared events attest |
+
+Setup deliberately has no 4-vote path. In the split test, a 4-vote rule would have created two valid key sets. Setup can wait, unlike attestation.
+
+The test also left these limits open:
+
+- **A malicious leader or dealer can bias the key,** although it cannot learn it. A stronger key generation should replace this before production.
+- **A bad share sent to an offline member goes unnoticed until it returns.** That member then cannot sign that event, because share recovery is not built.
+- **3 malicious members can break certification** and could produce two valid key sets for one attempt.
+- **Retries, leader rotation and the event buffer were driven by the test.** They are not built as a service.
+- **The long-term key setup was only run with all 7 members honest.**
 
 ### What remains trusted
 
@@ -317,7 +353,7 @@ Other scenarios used shortened timers. The test also showed that:
 
 Before building a product on Design 3:
 
-1. **Harden the 4-of-7 oracle:** independently run members on public relays, member replacement during setup, long-split protection, staggered events, key rotation and crash recovery.
+1. **Harden the 4-of-7 oracle:** independently run members on public relays, a stronger key generation, share recovery, automatic setup retries with an event buffer, long-split protection, staggered events, member replacement, key rotation and crash recovery.
 2. **Connect real nostracles:** liveness challenges, mandates and attestations over nostr.
 3. **Test failed rolls:** a batch failure or a nostracle dropping out during signing.
 4. **Add perpetual terms:** funding payments, closing at any time, and liquidation.
@@ -345,7 +381,7 @@ Questions for the teams:
 
 **Keyword-searched, not read line by line:** the remaining Second pages (83 total) and Arkade pages (74 total).
 
-**Run:** the four regtest experiments listed under [Regtest results](#regtest-results), the measurement under [Signing cost](#signing-cost), and the three prototypes under [Threshold oracle](#threshold-oracle).
+**Run:** the four regtest experiments listed under [Regtest results](#regtest-results), the measurement under [Signing cost](#signing-cost), and the four prototypes under [Threshold oracle](#threshold-oracle).
 
 **Not done:** a formal security review, running a contract on a public network, or an exhaustive literature review. The 10101 failure reason comes from the project's history and was not independently researched.
 
