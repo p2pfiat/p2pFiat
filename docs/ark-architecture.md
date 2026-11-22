@@ -1,6 +1,6 @@
 # p2pFiat on Ark: architecture note
 
-Status: audited draft, updated 2026-11-22 with four regtest experiments, a signing-cost measurement and five threshold oracle prototypes, the latest three over local nostr relays. Nothing has run on a public network, and no product has been built.
+Status: audited draft, updated 2026-11-22 with four regtest experiments, a signing-cost measurement and six threshold oracle prototypes, the latest four over local nostr relays. Nothing has run on a public network, and no product has been built.
 
 ## Summary
 
@@ -16,8 +16,9 @@ Status: audited draft, updated 2026-11-22 with four regtest experiments, a signi
 - **4-of-7 two-speed oracle:** a simulated group attested with up to 3 of 7 members offline. Up to 2 malicious members could not leak a key in any tested attack on a split that healed in time. **A split lasting past about 660 seconds, plus 1 malicious member, can still leak one event key.** See [4-of-7 two-speed oracle](#4-of-7-two-speed-oracle).
 - **Over nostr relays:** seven separate processes ran that oracle through three local strfry relays and survived 3 members offline and full relay outages. The long-split attack also worked there. Public relays and independent operators are untested. See [Over nostr relays](#over-nostr-relays).
 - **Event setup:** setting up a new event now works with up to 2 of 7 members offline or faulty. With 3 down, no new event can be set up, but events prepared earlier still attest. See [Fault-tolerant event setup](#fault-tolerant-event-setup).
-- **Key generation:** a two-phase key generation stops a leader from choosing a favourable key and stops a dealer from changing its contribution. One bias remains: with only 5 members online, one malicious member can reject a key by forcing a restart. See [Stronger key generation](#stronger-key-generation).
-- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a 4-of-7 threshold oracle with two-speed voting, per-event keys and two-phase key generation, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
+- **Key generation:** a two-phase key generation stops a leader from choosing a favourable key and stops a dealer from changing its contribution. See [Stronger key generation](#stronger-key-generation).
+- **Restart bias:** a certified event slot can no longer restart, so up to 2 malicious members cannot swap a key they have seen. They can still delay or block that slot, and a blocked slot must never get a replacement key. See [Locked event slots](#locked-event-slots).
+- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a 4-of-7 threshold oracle with two-speed voting, per-event keys, two-phase key generation and locked event slots, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
 
 ## What must hold
 
@@ -362,10 +363,37 @@ Opening is guarded: members publish shares only for the exact dealers that 5 mem
 
 The test also left these limits open:
 
-- **Restart bias remains.** With no spare voter online, a malicious member can reject keys by forcing new attempts. Retry limits and penalties are not built.
+- **Restart bias remained in this experiment.** With no spare voter online, a malicious member could reject keys by forcing new attempts. [Experiment 11](#locked-event-slots) addresses this.
 - **3 malicious members break the guarantees** and could learn the key.
 - **A slow honest dealer can be excluded or opened.** Exclusion happened in early test runs when a harness fault overloaded the relays after a split. Opening one dealer does not expose the key while an unopened dealer is honest.
 - **Setup can stall** if too few members publish shares for an opened dealer.
+
+### Locked event slots
+
+[Experiment 11](../experiments/11-restart-bias/README.md) stopped a member from rejecting a key by forcing a restart. All 13 checks passed in 5 of 5 runs, on one machine with 3 local strfry relays and shortened setup timers. It adds three rules:
+
+- **At least 5 dealers** must be certified, up from 4.
+- **A certified slot is locked.** Members holding the 5-vote certificate refuse to restart it. A blocked slot resumes when another member returns and finishes with the same key.
+- **A restart needs 5 signed abandon messages** for that slot and attempt. This is only possible before the key can be known.
+
+To know the key, an attacker needs the reveal of every honest certified dealer. With 5 dealers and at most 2 attackers, at least 3 honest members have locked, which leaves only 4 possible abandon signers. An exhaustive count of 1,856 attacker and dealer combinations found 210 restart paths with 4 dealers and none with 5 or more.
+
+| Scenario | Result |
+|---|---|
+| 1 or 2 members abort after seeing the key | No restart, then finished with the same key when members returned |
+| Attacker blocks and no fifth voter returns | Slot stays unfinished, and no replacement key exists |
+| Silent leader, or split with a two-faced leader | Nothing revealed, restarted, attested |
+| Leader proposes only 4 dealers | Refused, restarted, attested |
+| 1 bad dealer with only 5 members online | Attempt fails, retry with a sixth member succeeds |
+| Abandon messages from another slot | Do not count |
+| Another slot is blocked | A prepared event still attests |
+
+The test also left these limits open:
+
+- **An attacker can still block a slot.** The product must not replace a blocked slot with a new key, or the bias returns. Each event date needs a fixed slot and a defined fallback, such as the fixed-term DLC. Neither is built.
+- **The lock is held in memory.** It must be stored durably before a member reveals, or a crashed member could sign a restart.
+- **3 malicious members break the guarantees.**
+- **The 5-dealer minimum costs availability.** With 5 members online, one bad dealer fails the attempt until a sixth good member is available.
 
 ### What remains trusted
 
@@ -378,7 +406,7 @@ The test also left these limits open:
 
 Before building a product on Design 3:
 
-1. **Harden the 4-of-7 oracle:** independently run members on public relays, limits on restart bias, share recovery, automatic setup retries with an event buffer, long-split protection, staggered events, member replacement, key rotation and crash recovery.
+1. **Harden the 4-of-7 oracle:** independently run members on public relays, fixed date slots with a fallback for blocked slots, durable slot locks, share recovery, automatic setup retries with an event buffer, long-split protection, staggered events, member replacement, key rotation and crash recovery.
 2. **Connect real nostracles:** liveness challenges, mandates and attestations over nostr.
 3. **Test failed rolls:** a batch failure or a nostracle dropping out during signing.
 4. **Add perpetual terms:** funding payments, closing at any time, and liquidation.
@@ -406,7 +434,7 @@ Questions for the teams:
 
 **Keyword-searched, not read line by line:** the remaining Second pages (83 total) and Arkade pages (74 total).
 
-**Run:** the four regtest experiments listed under [Regtest results](#regtest-results), the measurement under [Signing cost](#signing-cost), and the five prototypes under [Threshold oracle](#threshold-oracle).
+**Run:** the four regtest experiments listed under [Regtest results](#regtest-results), the measurement under [Signing cost](#signing-cost), and the six prototypes under [Threshold oracle](#threshold-oracle).
 
 **Not done:** a formal security review, running a contract on a public network, or an exhaustive literature review. The 10101 failure reason comes from the project's history and was not independently researched.
 
