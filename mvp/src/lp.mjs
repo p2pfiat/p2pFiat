@@ -64,7 +64,12 @@ function readJsonBody(req) {
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj, null, 2);
-  res.writeHead(status, { "Content-Type": "application/json" });
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+  });
   res.end(body);
 }
 
@@ -115,6 +120,14 @@ export async function createLpServer({
 
   const server = http.createServer(async (req, res) => {
     try {
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        });
+        return res.end();
+      }
       const url = new URL(req.url, `http://127.0.0.1:${port}`);
 
       if (req.method === "GET" && url.pathname === "/health") {

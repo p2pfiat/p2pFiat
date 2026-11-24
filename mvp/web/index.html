@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0f17" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <title>p2pFiat — Self-Custody USD on Arkade</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="dot"></span>
+          <h1>p2pFiat</h1>
+          <span class="badge">Mutinynet</span>
+        </div>
+        <div class="topbar-right">
+          <span id="spot-pill" class="pill">BTC/USD —</span>
+          <button id="refresh-btn" class="icon-btn" title="Refresh">↻</button>
+          <button id="settings-btn" class="icon-btn" title="Settings & Key Backup">⚙</button>
+        </div>
+      </header>
+
+      <section class="balance-card">
+        <div class="balance-label">Total Balance (Self-Custody on Arkade)</div>
+        <div id="total-usd" class="balance-main">$0.00</div>
+        <div class="balance-split">
+          <div class="split-item">
+            <span class="muted">Stable USD Peg</span>
+            <strong id="pegged-usd" class="accent-green">$0.00</strong>
+          </div>
+          <div class="split-item">
+            <span class="muted">Available BTC</span>
+            <strong id="avail-sats">0 sats</strong>
+          </div>
+          <div class="split-item">
+            <span class="muted">Boarding L1</span>
+            <strong id="boarding-sats">0 sats</strong>
+          </div>
+        </div>
+        <div class="action-row">
+          <button id="deposit-toggle" class="btn secondary">Receive / Board</button>
+          <button id="onboard-btn" class="btn secondary" disabled>Onboard L1 → Ark</button>
+        </div>
+      </section>
+
+      <section id="deposit-panel" class="card hidden">
+        <h2>Receive on Arkade or Board from Mutinynet L1</h2>
+        <div class="field">
+          <label>Arkade Address (instant offchain)</label>
+          <div class="copy-row">
+            <code id="ark-addr">—</code>
+            <button class="btn small" data-copy="ark-addr">Copy</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>Mutinynet Boarding Address (send from faucet.mutinynet.com, then click Onboard)</label>
+          <div class="copy-row">
+            <code id="board-addr">—</code>
+            <button class="btn small" data-copy="board-addr">Copy</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Lock USD Value (Trustless DLC)</h2>
+          <span id="lp-status" class="pill muted-pill">LP: checking…</span>
+        </div>
+        <div class="preset-row">
+          <button class="chip" data-usd="1">$1</button>
+          <button class="chip active" data-usd="2">$2</button>
+          <button class="chip" data-usd="5">$5</button>
+          <button class="chip" data-usd="10">$10</button>
+          <input id="usd-input" type="number" min="1" step="1" value="2" aria-label="USD amount" />
+        </div>
+        <div id="quote-box" class="quote-box">
+          Enter an amount to fetch a live trustless quote from the LP.
+        </div>
+        <div class="action-row">
+          <button id="quote-btn" class="btn secondary">Get Quote</button>
+          <button id="open-btn" class="btn primary">Lock USD Now</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Your USD Positions</h2>
+          <span id="pos-count" class="muted">0 open</span>
+        </div>
+        <div id="positions-list" class="positions-list">
+          <div class="empty">No positions yet. Board Mutinynet sats and lock USD above.</div>
+        </div>
+      </section>
+
+      <section id="settings-panel" class="card hidden">
+        <h2>Wallet Settings &amp; Self-Custody Backup</h2>
+        <div class="field">
+          <label>LP Service URL</label>
+          <div class="copy-row">
+            <input id="lp-url-input" type="text" value="http://127.0.0.1:3456" />
+            <button id="save-lp-btn" class="btn small">Save</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>Private Key (hex — stored only in your browser)</label>
+          <div class="copy-row">
+            <input id="privkey-input" type="password" readonly />
+            <button id="reveal-key-btn" class="btn small">Show</button>
+            <button id="import-key-btn" class="btn small">Import</button>
+          </div>
+        </div>
+      </section>
+
+      <div id="toast" class="toast hidden"></div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

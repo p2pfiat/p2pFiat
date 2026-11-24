@@ -1,0 +1,9 @@
+{
+  "name": "p2pFiat Wallet (Mutinynet)",
+  "short_name": "p2pFiat",
+  "description": "Self-custody BTC-collateralized USD-pegged wallet on Arkade",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0f17",
+  "theme_color": "#0b0f17"
+}

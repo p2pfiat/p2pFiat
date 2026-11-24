@@ -1,0 +1,17 @@
+{
+  "name": "p2pfiat-web-wallet",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5173",
+    "build": "vite build",
+    "preview": "vite preview --port 5173"
+  },
+  "dependencies": {
+    "@arkade-os/sdk": "0.5.13"
+  },
+  "devDependencies": {
+    "vite": "^6.2.0"
+  }
+}
