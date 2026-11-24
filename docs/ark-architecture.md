@@ -59,6 +59,7 @@ Reviewed at bark `1ab6ccb`, Second docs `7ecd7e2`, arkd `fee16a7`, emulator `30a
 | Delegated renewal for a normal coin | Yes, but the wallet **signs the forfeit when next opened**. Today it relies on the server's signature only; co-signers are not built | Yes: a presigned request and forfeit for specific coins. The SDK re-delegates each new coin **while the wallet runs** |
 | Renewal without any owner | No | Yes, for covenant coins using `OP_TUNNEL` (`renewProgramContractOutputs`) |
 | Status of the programmable layer | Not applicable | Emulator README: "Alpha — available on testnet". A mainnet emulator endpoint also responds (v0.0.9) |
+| Unilateral exit tooling | Built into wallet for supported policies; custom contract exits not yet supported | Keyless exit packages (`arkade-unilateral-exit` / `@arkade-os/sdk`) for standard wallets; multi-party DLC exits still require custom orchestration (storing exit branch at opening, CPFP bumping, watchtower) |
 
 **bark** has no contract coin type, so it cannot host a trustless p2pFiat contract today. See [Can bark be used?](#can-bark-be-used).
 
@@ -85,7 +86,18 @@ What would make it usable:
 
 A fork has a practical cost: users could only use a server running that fork, and it would carry changes to security-critical server code. Upstream support from Second is the better route.
 
-bark remains attractive for its mainnet server, native mobile SDKs and longer coin lifetime. If Second adds contract coins, Design 1 can move to bark: the oracle, LP logic and contract terms stay the same, while the coin script and signing flow change.
+bark remains attractive for its mainnet server, native mobile SDKs, longer coin lifetime (28 days vs ~7 days default on arkd) and focus on reliable on-chain exits. Second has indicated they are working on catching up on script/contract support and want to make on-chain contract exits solid.
+
+Minimum requirements for bark to host p2pFiat (no off-chain VM or covenants needed — pure Bitcoin Tapscript + pre-signed DLCs):
+
+1. **Contract `VtxoPolicy` (or generic Tapscript policy):**
+   - **Collaborative spend paths (off-chain):** `user + LP + server` (optionally with CLTV for refund), and for Design 3 rolling swaps, `M-of-N quorum + LP + server` paths with CLTV.
+   - **Unilateral exit paths (on-chain):** `user + LP` after a CSV delay (and for Design 3, `quorum + LP` after a longer CSV delay), so parties can pre-sign adaptor payouts and refunds on the exact VTXO outpoint at opening.
+2. **Hard on-chain exit tooling for custom leaves:**
+   - Export/save the full exit transaction branch at contract opening.
+   - Reliable unroll + CPFP fee-bumping that can finish by broadcasting a **pre-signed transaction** spending the custom exit leaf — ideally executable by a watchtower without private keys.
+
+If Second adds these, Design 1 (and Design 3) can move to bark: the oracle, LP logic and contract terms stay the same, while the coin script and signing flow change.
 
 ### The exit-path limit
 
@@ -449,7 +461,7 @@ Before building a product on Design 3:
 
 Questions for the teams:
 
-- **Second:** are contract coins or custom scripts planned for bark?
+- **Second:** feedback received — they are catching up on script support and want to make on-chain contract exits solid; follow up with the minimum bark requirements above (`VtxoPolicy` + hard exit tooling for pre-signed spends).
 - **Ark Labs:** what is the mainnet status of the emulator, the public batch expiry, and the plan for `StabilityVault`?
 
 | Milestone | Deliverable | Depends on |
