@@ -1,0 +1,29 @@
+# Copy to config.toml and adjust.
+
+# Watchtower's independent P2TR fee wallet key (also used as its Nostr identity
+# for NIP-17 package intake). Holds ZERO user or LP private keys.
+wallet_key_file = "data/watchtower.key"
+db_file         = "data/watchtower.json"
+
+# Bitcoin network: bitcoin, testnet, signet, regtest
+network     = "bitcoin"
+esplora_url = "https://mempool.space/api"
+
+# Optional default Ark indexer HTTP URL for the stale-exit guard.
+# ark_indexer_url = "https://arkade.computer"
+
+# Nostr relays used to receive NIP-17 exit packages and fetch external DLC
+# oracle announcements (kind 88) and attestations (kind 89).
+relays = [
+  "wss://relay.damus.io",
+  "wss://nos.lol",
+  "wss://relay.primal.net",
+]
+
+cpfp_fee_sats   = 600   # minimum / fallback CPFP fee per unroll hop
+sweep_fee_sats  = 400   # minimum / fallback bounty sweep fee
+min_bounty_sats = 2000  # refuse packages with smaller bounties
+min_profit_sats = 500   # refuse unrolls when estimated net profit < this
+tick_secs       = 30    # main loop period
+
+accept_nostr_packages = true

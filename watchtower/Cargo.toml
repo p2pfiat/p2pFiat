@@ -1,0 +1,27 @@
+[package]
+name = "ark-watchtower"
+version = "0.1.0"
+edition = "2021"
+description = "Keyless Ark watchtower with tiered Taproot onchain exit bounties (p2pFiat Experiment 13)"
+license = "MIT"
+repository = "https://github.com/p2pfiat/p2pFiat"
+
+[dependencies]
+kormir = { version = "1.1.2", features = ["nostr"] }
+nostr-sdk = { version = "0.44", features = ["nip59"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+nostr-relay-builder = "0.44"
