@@ -1,6 +1,6 @@
 # p2pFiat on Ark: architecture note
 
-Status: audited draft, updated 2026-11-22 with four regtest experiments, a signing-cost measurement and six threshold oracle prototypes, the latest four over local nostr relays. Nothing has run on a public network, and no product has been built.
+Status: audited draft, updated 2026-11-24 with four regtest experiments, a signing-cost measurement and seven threshold oracle prototypes, the latest five over local nostr relays. Nothing has run on a public network, and no product has been built.
 
 ## Summary
 
@@ -18,7 +18,8 @@ Status: audited draft, updated 2026-11-22 with four regtest experiments, a signi
 - **Event setup:** setting up a new event now works with up to 2 of 7 members offline or faulty. With 3 down, no new event can be set up, but events prepared earlier still attest. See [Fault-tolerant event setup](#fault-tolerant-event-setup).
 - **Key generation:** a two-phase key generation stops a leader from choosing a favourable key and stops a dealer from changing its contribution. See [Stronger key generation](#stronger-key-generation).
 - **Restart bias:** a certified event slot can no longer restart, so up to 2 malicious members cannot swap a key they have seen. They can still delay or block that slot, and a blocked slot must never get a replacement key. See [Locked event slots](#locked-event-slots).
-- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a 4-of-7 threshold oracle with two-speed voting, per-event keys, two-phase key generation and locked event slots, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
+- **Crash recovery:** each member writes every message and its slot lock to a journal on disk before publishing. In 380 stepwise trials and a final 5-run test, no killed or restarted member published a second value, and a member with a lost disk refused to sign a restart. Power loss is not tested. See [Crash recovery](#crash-recovery).
+- **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a 4-of-7 threshold oracle with two-speed voting, per-event keys, two-phase key generation, locked event slots and a journal on disk for each member, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
 
 ## What must hold
 
@@ -391,9 +392,40 @@ To know the key, an attacker needs the reveal of every honest certified dealer. 
 The test also left these limits open:
 
 - **An attacker can still block a slot.** The product must not replace a blocked slot with a new key, or the bias returns. Each event date needs a fixed slot and a defined fallback, such as the fixed-term DLC. Neither is built.
-- **The lock is held in memory.** It must be stored durably before a member reveals, or a crashed member could sign a restart.
+- **The lock was held in memory.** A crashed member could forget it and sign a restart. [Experiment 12](#crash-recovery) stores it on disk.
 - **3 malicious members break the guarantees.**
 - **The 5-dealer minimum costs availability.** With 5 members online, one bad dealer fails the attempt until a sixth good member is available.
+
+### Crash recovery
+
+[Experiment 12](../experiments/12-crash-recovery/README.md) tested whether a member that crashes, restarts or loses its disk can break the oracle's promises. All 27 checks passed in 5 of 5 runs, on one machine with 3 local strfry relays and shortened setup timers. A guard between each member's protocol logic and the relays adds these rules:
+
+- **Journal before release.** Every outgoing message is signed, written to a checksummed journal and flushed to disk before any relay sees it. A restart republishes the same message.
+- **One value per protocol step.** A restarted member that computes a different deal, vote or price for a step it already published is blocked. A signature share must match the member's stored price vote.
+- **The lock reaches the disk first,** before a member reveals or votes to open dealers.
+- **Signing a restart gives up the attempt.** A member that signed an abandon message can no longer vote or reveal in that attempt. Experiment 11's rule allowed this.
+- **Lost disks show up on the relays.** A restarted member that finds its own unknown messages stops publishing for that event. Before signing a restart, it reads the attempt from the relays and refuses if it finds its own messages or a 5-vote certificate.
+
+Members were killed with SIGKILL before the journal write, after it and after sending, at each setup and attestation message. Before the final test, a stepwise series checked each layer apart, with a fresh cluster per trial and a relay scan for conflicting messages after every trial:
+
+| Step | Trials | Result |
+|---|---|---|
+| Guard and journal, no kills | 20 | 20 ok |
+| Each of the 18 kill points, 10 times | 180 | 180 ok |
+| Each recovery scenario, 10 times | 60 | 60 ok |
+| Seeded random kills: any member, any of its messages | 100 | 79 kills ok, 21 never reached a kill |
+
+No trial found a member publishing two values for one step. In the control, 4 members that lost their disks formed a restart certificate when they did not check the relays. With the check, all 4 refused.
+
+The first test batches failed on the test machine, not in the protocol: WSL stopped responding twice, a crash-looping arkd regtest stack loaded the CPU, and the PC went to sleep during a run. With those removed, no step failed.
+
+The test also left these limits open:
+
+- **SIGKILL is not power loss.** Writes lost in a disk or file-system cache are not tested.
+- **Secrets are stored in plain text** in a 0600 journal. A production member needs encryption at rest or a hardware key.
+- **The disk-loss check trusts the relays to show history.** If every relay a member reads hides its earlier messages, it could still sign a restart.
+- **Quarantine costs availability.** A member whose disk was rolled back stops publishing for that event.
+- **A late reveal costs an open vote.** A member that has not seen every reveal by the open-vote deadline skips its open vote and does not retry. With only 5 members online, this can stall the slot.
 
 ### What remains trusted
 
@@ -406,7 +438,7 @@ The test also left these limits open:
 
 Before building a product on Design 3:
 
-1. **Harden the 4-of-7 oracle:** independently run members on public relays, fixed date slots with a fallback for blocked slots, durable slot locks, share recovery, automatic setup retries with an event buffer, long-split protection, staggered events, member replacement, key rotation and crash recovery.
+1. **Harden the 4-of-7 oracle:** independently run members on public relays, fixed date slots with a fallback for blocked slots, encrypted member storage and power-loss tests, an open-vote retry, share recovery, automatic setup retries with an event buffer, long-split protection, staggered events, member replacement and key rotation.
 2. **Connect real nostracles:** liveness challenges, mandates and attestations over nostr.
 3. **Test failed rolls:** a batch failure or a nostracle dropping out during signing.
 4. **Add perpetual terms:** funding payments, closing at any time, and liquidation.
@@ -434,7 +466,7 @@ Questions for the teams:
 
 **Keyword-searched, not read line by line:** the remaining Second pages (83 total) and Arkade pages (74 total).
 
-**Run:** the four regtest experiments listed under [Regtest results](#regtest-results), the measurement under [Signing cost](#signing-cost), and the six prototypes under [Threshold oracle](#threshold-oracle).
+**Run:** the four regtest experiments listed under [Regtest results](#regtest-results), the measurement under [Signing cost](#signing-cost), and the seven prototypes under [Threshold oracle](#threshold-oracle).
 
 **Not done:** a formal security review, running a contract on a public network, or an exhaustive literature review. The 10101 failure reason comes from the project's history and was not independently researched.
 
