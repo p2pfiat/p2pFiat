@@ -1,0 +1,9 @@
+{
+  "name": "p2pfiat-exp16-mutinynet-arkade-dlc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@arkade-os/sdk": "latest"
+  }
+}
