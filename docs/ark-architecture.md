@@ -1,6 +1,6 @@
 # p2pFiat on Ark: architecture note
 
-Status: audited draft, updated 2026-11-24 with five regtest experiments on `arkd` (including a keyless watchtower exit bounty), a signing-cost measurement and seven threshold oracle prototypes, the latest five over local nostr relays. Nothing has run on a public network, and no product has been built.
+Status: audited draft, updated 2026-11-24 with six regtest experiments on `arkd` (including a keyless watchtower exit bounty and a full end-to-end integration with a 4-of-7 threshold oracle over local `strfry` nostr relays), a signing-cost measurement and seven threshold oracle prototypes. Nothing has run on a public network, and no product has been built.
 
 ## Summary
 
@@ -20,6 +20,7 @@ Status: audited draft, updated 2026-11-24 with five regtest experiments on `arkd
 - **Restart bias:** a certified event slot can no longer restart, so up to 2 malicious members cannot swap a key they have seen. They can still delay or block that slot, and a blocked slot must never get a replacement key. See [Locked event slots](#locked-event-slots).
 - **Crash recovery:** each member writes every message and its slot lock to a journal on disk before publishing. In 380 stepwise trials and a final 5-run test, no killed or restarted member published a second value, and a member with a lost disk refused to sign a restart. Power loss is not tested. See [Crash recovery](#crash-recovery).
 - **Watchtower exit bounty:** a keyless watchtower holding only saved exit data and its own BTC fee wallet unrolled orphaned `arkd` contracts, paid real CPFP fees, settled DLC payouts or refunds, and profited (`+2,800` sats net per exit) via a tiered P2TR bounty output (`W1` immediate, backup watchtowers after 4-block CSV). Miners and early backup snipers were rejected by Bitcoin Core in 5 of 5 runs. See [Regtest results](#regtest-results).
+- **End-to-end integration:** a live 4-of-7 threshold oracle over 3 local `strfry` nostr relays (with 2 members offline) attested real 20-bit numeric prices (`$91,420` and `$114,800`) to settle two rolled `2,000,000`-sat (`$1,000`) numeric DLCs (527 binary prefixes each) on a live `arkd` — both offchain and via a keyless watchtower onchain exit (`+4,000` sats net profit) after `arkd` was stopped. Passed 5 of 5 runs. See [Regtest results](#regtest-results).
 - **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a 4-of-7 threshold oracle with two-speed voting, per-event keys, two-phase key generation, locked event slots and a journal on disk for each member, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
 
 ## What must hold
@@ -212,6 +213,7 @@ Design 2 needs a different signed message: Arkade's examples verify `sha256(tick
 | [3. Covenant lifecycle](../experiments/03-covenant-lifecycle/README.md) (Design 2) | Can a position renew and settle at an oracle price, and what can the operator do alone? | **Lifecycle works with no owner signature**, but the emulator key alone can take the coin | 5 of 5 |
 | [4. Nostracle quorum rolling DLC](../experiments/04-guardian-rolling-dlc/README.md) (Design 3) | Can 3 of 5 nostracles roll for an offline user, with no single party able to take the funds? | **Yes**, but 3 nostracles colluding with the LP can take the collateral after the timelock | 5 of 5 |
 | [13. Watchtower exit bounty](../experiments/13-watchtower-bounty/README.md) (generic) | Can a keyless watchtower unroll an orphaned contract, pay CPFP fees and profit from a snipe-resistant bounty? | **Yes**: tiered P2TR bounty (`W1` immediate, backups after 4-block CSV) rejected miners and early snipers, netting `+2,800` sats per exit | 5 of 5 |
+| [14. End-to-end integration](../experiments/14-end-to-end-integration/README.md) (Design 3 + bounty) | Do the 4-of-7 `strfry` threshold oracle, 20-bit numeric DLC, `arkd` quorum roll and keyless watchtower bounty work together? | **Yes**: 527-prefix `$1,000` positions rolled in 7.5–11.7 s and settled both offchain on `arkd` (`$91,420`) and onchain via keyless watchtower after `arkd` stopped (`$114,800`, `+4,000` sats net profit) | 5 of 5 |
 
 What the tests changed:
 
@@ -227,7 +229,7 @@ What the tests do not show:
 - Recovery of a swept coin, or a working watchtower.
 - A numeric DLC settled through a live arkd server, real nostracle attestations, Nitro enclave protections, real fee conditions, reorgs or public-network behavior.
 - Public nostr relays, independently operated nostracles, a batch that fails during a roll, funding payments or liquidation.
-- A threshold-attested payout through a live arkd server.
+- Combining the full anti-bias DKG, locked slots and disk journal of experiments 10–12 into the live `arkd` integration (experiment 14 used Feldman VSS DKG).
 
 ## Signing cost
 
