@@ -1,6 +1,6 @@
 # p2pFiat on Ark: architecture note
 
-Status: audited draft, updated 2026-11-24 with four regtest experiments, a signing-cost measurement and seven threshold oracle prototypes, the latest five over local nostr relays. Nothing has run on a public network, and no product has been built.
+Status: audited draft, updated 2026-11-24 with five regtest experiments on `arkd` (including a keyless watchtower exit bounty), a signing-cost measurement and seven threshold oracle prototypes, the latest five over local nostr relays. Nothing has run on a public network, and no product has been built.
 
 ## Summary
 
@@ -19,6 +19,7 @@ Status: audited draft, updated 2026-11-24 with four regtest experiments, a signi
 - **Key generation:** a two-phase key generation stops a leader from choosing a favourable key and stops a dealer from changing its contribution. See [Stronger key generation](#stronger-key-generation).
 - **Restart bias:** a certified event slot can no longer restart, so up to 2 malicious members cannot swap a key they have seen. They can still delay or block that slot, and a blocked slot must never get a replacement key. See [Locked event slots](#locked-event-slots).
 - **Crash recovery:** each member writes every message and its slot lock to a journal on disk before publishing. In 380 stepwise trials and a final 5-run test, no killed or restarted member published a second value, and a member with a lost disk refused to sign a restart. Power loss is not tested. See [Crash recovery](#crash-recovery).
+- **Watchtower exit bounty:** a keyless watchtower holding only saved exit data and its own BTC fee wallet unrolled orphaned `arkd` contracts, paid real CPFP fees, settled DLC payouts or refunds, and profited (`+2,800` sats net per exit) via a tiered P2TR bounty output (`W1` immediate, backup watchtowers after 4-block CSV). Miners and early backup snipers were rejected by Bitcoin Core in 5 of 5 runs. See [Regtest results](#regtest-results).
 - **Recommendation:** make the nostracle quorum rolling DLC the primary candidate for rolling swaps. Use a 4-of-7 threshold oracle with two-speed voting, per-event keys, two-phase key generation, locked event slots and a journal on disk for each member, subject to a cryptographic review. The fixed-term DLC is its fallback when no quorum is available. Keep the Arkade Script vault as a second track.
 
 ## What must hold
@@ -210,6 +211,7 @@ Design 2 needs a different signed message: Arkade's examples verify `sha256(tick
 | [2. Failure paths](../experiments/02-failure-paths/README.md) (Design 1) | With the operator, LP or oracle gone, can each party recover the correct amount? | **Yes**, if someone acts before expiry and the exit data was saved. After expiry, the operator sweeps the coin and the exit fails | 5 of 5 |
 | [3. Covenant lifecycle](../experiments/03-covenant-lifecycle/README.md) (Design 2) | Can a position renew and settle at an oracle price, and what can the operator do alone? | **Lifecycle works with no owner signature**, but the emulator key alone can take the coin | 5 of 5 |
 | [4. Nostracle quorum rolling DLC](../experiments/04-guardian-rolling-dlc/README.md) (Design 3) | Can 3 of 5 nostracles roll for an offline user, with no single party able to take the funds? | **Yes**, but 3 nostracles colluding with the LP can take the collateral after the timelock | 5 of 5 |
+| [13. Watchtower exit bounty](../experiments/13-watchtower-bounty/README.md) (generic) | Can a keyless watchtower unroll an orphaned contract, pay CPFP fees and profit from a snipe-resistant bounty? | **Yes**: tiered P2TR bounty (`W1` immediate, backups after 4-block CSV) rejected miners and early snipers, netting `+2,800` sats per exit | 5 of 5 |
 
 What the tests changed:
 
@@ -455,7 +457,7 @@ Before building a product on Design 3:
 3. **Test failed rolls:** a batch failure or a nostracle dropping out during signing.
 4. **Add perpetual terms:** funding payments, closing at any time, and liquidation.
 5. **Test adversarial cases:** operator censorship, collusion and stale exits without an operator.
-6. **Decide who pays exit fees** for an offline phone.
+6. **Harden watchtower fee handling:** Experiment 13 proved the tiered onchain bounty on regtest; dynamic mempool fee estimation, RBF and extreme fee-spike handling remain to be built.
 7. **Get a cryptographic review** of the threshold oracle and contract.
 8. **Repeat the lifecycle on a test network.**
 
