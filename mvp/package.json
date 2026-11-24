@@ -1,0 +1,10 @@
+{
+  "name": "p2pfiat-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "M4 MVP: Trustless BTC-collateralized USD-pegged LP service and User CLI on Arkade Mutinynet",
+  "dependencies": {
+    "@arkade-os/sdk": "0.5.13"
+  }
+}

@@ -475,10 +475,10 @@ Questions for the teams:
 
 | Milestone | Deliverable | Depends on |
 |---|---|---|
-| M1 | nostracle oracle | Built; not deployed |
-| M2 | Regtest tests 1–4, then choose a design | Tests passed; Design 3 with a threshold oracle recommended, decision pending |
-| M3 | Chosen contract on a test network | M2 |
-| M4 | LP service: quotes, hedging, rolls | M3 |
+| M1 | nostracle oracle | Built (`p2pfiat/nostracle`); not yet deployed 24/7 |
+| M2 | Regtest tests 1–14, then choose a design | **Done** — Design 3 with threshold oracle + watchtower bounty |
+| M3 | Chosen contract on a test network (Mutinynet) | **Done** — Experiments 15–19 + standalone Rust `watchtower/` verified live on `mutinynet.arkade.sh` |
+| M4 | LP service + User CLI (`mvp/`): quotes, atomic 2-party funding, early close | **MVP Done** — verified live on `mutinynet.arkade.sh` (`mvp/test/e2e.mjs`); hedging & quorum rolls next |
 | M5 | Mobile wallet with a stable balance | M4 |
 
 ## Scope of this audit
