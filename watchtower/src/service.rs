@@ -381,9 +381,17 @@ impl WatchtowerService {
 
                 let Some(st) = self.chain.tx_status(vtxo_txid).await? else { return Ok(()) };
                 let Some(conf_h) = st.block_height else { return Ok(()) };
-                let confs = tip.saturating_sub(conf_h).saturating_add(1);
-                if confs < pkg.exit_csv as u32 {
-                    return Ok(());
+                if let Some(csv_secs) = pkg.exit_csv_seconds {
+                    let Some(vtxo_time) = st.block_time else { return Ok(()) };
+                    let tip_mtp = self.chain.tip_mediantime().await?;
+                    if tip_mtp < vtxo_time.saturating_add(csv_secs as u64) {
+                        return Ok(());
+                    }
+                } else {
+                    let confs = tip.saturating_sub(conf_h).saturating_add(1);
+                    if confs < pkg.exit_csv as u32 {
+                        return Ok(());
+                    }
                 }
 
                 let vtxo_script = ScriptBuf::from_bytes(hex::decode(&pkg.vtxo_pk_script)?);

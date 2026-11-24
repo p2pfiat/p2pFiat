@@ -52,6 +52,7 @@ const EXIT_CSV: u16 = 20;
 #[derive(Default)]
 struct ChainState {
     tip: u32,
+    tip_time: u64,
     fee_rate_sat_vb: Option<f64>,
     utxos: HashMap<String, Vec<WalletUtxo>>,
     tx_status: HashMap<String, TxStatus>,
@@ -66,7 +67,13 @@ struct MockChain {
 
 impl MockChain {
     fn new(tip: u32) -> Arc<Self> {
-        Arc::new(Self { state: Mutex::new(ChainState { tip, ..Default::default() }) })
+        Arc::new(Self {
+            state: Mutex::new(ChainState { tip, tip_time: 1_700_000_000, ..Default::default() }),
+        })
+    }
+
+    fn advance_time(&self, secs: u64) {
+        self.state.lock().unwrap().tip_time += secs;
     }
 
     fn set_bounty_validator(&self, bounty: BountyScript) {
@@ -91,11 +98,14 @@ impl MockChain {
     fn mine_blocks(&self, n: u32) {
         let mut st = self.state.lock().unwrap();
         st.tip += n;
+        st.tip_time += (n as u64) * 30;
         let tip = st.tip;
+        let tip_time = st.tip_time;
         for status in st.tx_status.values_mut() {
             if !status.confirmed {
                 status.confirmed = true;
                 status.block_height = Some(tip);
+                status.block_time = Some(tip_time);
             }
         }
         for list in st.utxos.values_mut() {
@@ -135,7 +145,7 @@ impl MockChain {
                 }
             }
         }
-        st.tx_status.insert(txid.clone(), TxStatus { confirmed: false, block_height: None });
+        st.tx_status.insert(txid.clone(), TxStatus { confirmed: false, block_height: None, block_time: None });
         st.txs.insert(txid, tx.clone());
     }
 }
@@ -144,6 +154,11 @@ impl ChainClient for MockChain {
     fn tip_height(&self) -> BoxFuture<'_, u32> {
         let tip = self.state.lock().unwrap().tip;
         Box::pin(async move { Ok(tip) })
+    }
+
+    fn tip_mediantime(&self) -> BoxFuture<'_, u64> {
+        let t = self.state.lock().unwrap().tip_time;
+        Box::pin(async move { Ok(t) })
     }
 
     fn get_utxos(&self, address: &str) -> BoxFuture<'_, Vec<WalletUtxo>> {
@@ -454,6 +469,7 @@ fn build_contract_fixture(
         user_pubkey: u_pub.to_string(),
         lp_pubkey: l_pub.to_string(),
         exit_csv: EXIT_CSV,
+        exit_csv_seconds: None,
         bounty: bounty_spec,
         oracle_pubkey,
         oracle_event_id,
@@ -892,4 +908,76 @@ async fn decoupled_external_oracle_and_nip17_flow_on_local_relay() {
     let rec = svc.storage.get("decoupled-1").unwrap();
     assert!(matches!(rec.state, WatchState::BountySwept { net_profit_sats: 2800, .. }));
     assert_eq!(chain.wallet_balance(&w1), 1_002_800);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn time_based_csv_exit_waits_for_mediantime() {
+    let dir = tempfile::tempdir().unwrap();
+    let oracle_key = SecretKey::from_slice(&[77u8; 32]).unwrap();
+    let oracle = Oracle::from_signing_key(MemoryStorage::default(), oracle_key).unwrap();
+    let ann = oracle.create_numeric_event("btcusd-timecsv".into(), 20, false, 0, "USD".into(), 4000).await.unwrap();
+    let att = oracle.sign_numeric_event("btcusd-timecsv".into(), 95_000).await.unwrap();
+    let outcome_strs: Vec<&str> = att.outcomes[..10].iter().map(String::as_str).collect();
+    let prefix = outcome_strs.concat();
+    let t_point = kormir_anticipation_point(&ann.oracle_public_key, &ann.oracle_event.oracle_nonces[..10], &outcome_strs);
+
+    let w1 = WatchtowerWallet::from_secret(SecretKey::from_slice(&[1u8; 32]).unwrap(), Network::Regtest);
+    let spec = BountySpec {
+        amount_sats: BOUNTY_AMOUNT,
+        vout: 2,
+        primary_pubkey: w1.xonly_pubkey.to_string(),
+        backup_pubkeys: vec![],
+        backup_csv: BACKUP_CSV,
+    };
+    let chain = MockChain::new(100);
+    chain.set_bounty_validator(BountyScript::compile(spec.clone()).unwrap());
+    chain.fund_wallet(&w1, 1_000_000, 12);
+    let indexer = MockArkIndexer::new(ArkVtxoState::OperatorUnreachable);
+
+    let mut pkg = build_contract_fixture(
+        "time-csv-1",
+        spec,
+        Some(ann.oracle_public_key.to_string()),
+        Some("btcusd-timecsv".into()),
+        Some((prefix, t_point)),
+        500,
+        12,
+    );
+    // Matches live Arkade Mutinynet `unilateralExitDelay = 2048` seconds!
+    pkg.exit_csv_seconds = Some(2048);
+
+    let svc = WatchtowerService::new(
+        wt_config(dir.path()),
+        w1.clone(),
+        WatchtowerStorage::open(dir.path().join("wt.json")).unwrap(),
+        chain.clone(),
+        indexer,
+    );
+    svc.register_package(pkg, 1000).unwrap();
+
+    let mut atts = HashMap::new();
+    atts.insert("btcusd-timecsv".to_string(), att);
+
+    for _ in 0..3 {
+        svc.tick(&atts, 1010).await.unwrap();
+        chain.mine_blocks(1);
+    }
+    svc.tick(&atts, 1020).await.unwrap();
+    assert!(matches!(svc.storage.get("time-csv-1").unwrap().state, WatchState::VtxoConfirmed { .. }));
+
+    // Even after 30 blocks (900s < 2048s), watchtower must wait for BIP-68 time-based CSV.
+    chain.mine_blocks(30);
+    svc.tick(&atts, 1030).await.unwrap();
+    assert!(matches!(svc.storage.get("time-csv-1").unwrap().state, WatchState::VtxoConfirmed { .. }));
+
+    // Advance MTP past 2048s -> watchtower broadcasts DLC exit payout and sweeps bounty!
+    chain.advance_time(1200);
+    svc.tick(&atts, 1040).await.unwrap();
+    assert!(matches!(svc.storage.get("time-csv-1").unwrap().state, WatchState::ExitBroadcast { is_refund: false, .. }));
+
+    chain.mine_blocks(1);
+    svc.tick(&atts, 1050).await.unwrap();
+    chain.mine_blocks(1);
+    let rec = svc.storage.get("time-csv-1").unwrap();
+    assert!(matches!(rec.state, WatchState::BountySwept { net_profit_sats: 2800, .. }));
 }

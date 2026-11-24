@@ -356,6 +356,7 @@ async fn main() -> Result<()> {
         user_pubkey: u_pub.to_string(),
         lp_pubkey: l_pub.to_string(),
         exit_csv: EXIT_CSV,
+        exit_csv_seconds: None,
         bounty: bounty_spec,
         oracle_pubkey: Some(oracle_nostr_keys.public_key().to_hex()),
         oracle_event_id: Some(event_id.clone()),

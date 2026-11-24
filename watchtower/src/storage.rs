@@ -49,7 +49,12 @@ pub struct WatchtowerPackage {
     pub exit_control_block: String,
     pub user_pubkey: String,
     pub lp_pubkey: String,
+    /// Relative block CSV delay on the contract exit leaf (ignored when `exit_csv_seconds` is set).
     pub exit_csv: u16,
+    /// Optional BIP-68 time-based CSV delay in seconds (e.g. `2048` on Arkade Mutinynet,
+    /// which enforces time-based CSV on custom exit closures).
+    #[serde(default)]
+    pub exit_csv_seconds: Option<u32>,
     pub bounty: BountySpec,
     /// External DLC oracle pubkey (hex x-only or npub) whose kind-88/89 events
     /// settle this contract. Keeps the oracle completely separate from the watchtower.

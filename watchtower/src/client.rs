@@ -16,6 +16,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>
 pub struct TxStatus {
     pub confirmed: bool,
     pub block_height: Option<u32>,
+    /// Confirmation block timestamp / MTP (unix seconds), used for BIP-68 time-based CSV.
+    pub block_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +28,8 @@ pub struct OutspendStatus {
 
 pub trait ChainClient: Send + Sync {
     fn tip_height(&self) -> BoxFuture<'_, u32>;
+    /// Median Time Past (unix seconds) of the current chain tip, for BIP-68 time-based CSV.
+    fn tip_mediantime(&self) -> BoxFuture<'_, u64>;
     fn get_utxos(&self, address: &str) -> BoxFuture<'_, Vec<WalletUtxo>>;
     fn tx_status(&self, txid: &str) -> BoxFuture<'_, Option<TxStatus>>;
     fn outspend(&self, txid: &str, vout: u32) -> BoxFuture<'_, OutspendStatus>;
@@ -73,6 +77,13 @@ struct EsploraUtxo {
 struct EsploraStatus {
     confirmed: bool,
     block_height: Option<u32>,
+    block_time: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct EsploraBlock {
+    mediantime: Option<u64>,
+    timestamp: u64,
 }
 
 #[derive(Deserialize)]
@@ -95,6 +106,23 @@ impl ChainClient for EsploraClient {
                 .text()
                 .await?;
             text.trim().parse::<u32>().context("parse tip height")
+        })
+    }
+
+    fn tip_mediantime(&self) -> BoxFuture<'_, u64> {
+        Box::pin(async move {
+            let url = format!("{}/blocks", self.base_url);
+            let blocks: Vec<EsploraBlock> = self
+                .http
+                .get(&url)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let tip = blocks.first().ok_or_else(|| anyhow!("empty /blocks response"))?;
+            Ok(tip.mediantime.unwrap_or(tip.timestamp))
         })
     }
 
@@ -139,7 +167,11 @@ impl ChainClient for EsploraClient {
                 return Ok(None);
             }
             let st: EsploraStatus = resp.error_for_status()?.json().await?;
-            Ok(Some(TxStatus { confirmed: st.confirmed, block_height: st.block_height }))
+            Ok(Some(TxStatus {
+                confirmed: st.confirmed,
+                block_height: st.block_height,
+                block_time: st.block_time,
+            }))
         })
     }
 
