@@ -324,12 +324,17 @@ export async function createLpServer({
       }
 
       const userPubXOnly = hex.decode(body.userPubHex);
-      const { vtxoScript: contractScript, settleClosure, exitClosure } = buildDlcContractScript(
+      const posQuorum = quote.oracleQuorum || oracleQuorum;
+      const { vtxoScript: contractScript, settleClosure, exitClosure, disputeClosure } = buildDlcContractScript(
         userPubXOnly,
         lpKey.pubXOnly,
         serverXOnly,
-        exitDelaySecs
+        exitDelaySecs,
+        posQuorum
       );
+      const disputeControlBlockHex = disputeClosure
+        ? hex.encode(contractScript.findLeaf(disputeClosure.scriptHex)[0])
+        : null;
 
       const lpVtxos = await wallet.getVtxos();
       const lpVtxo = lpVtxos
@@ -425,6 +430,9 @@ export async function createLpServer({
         contractTapTreeHex: hex.encode(contractScript.encode()),
         settleScriptHex: hex.encode(settleClosure.script),
         exitScriptHex: hex.encode(exitClosure.script),
+        disputeScriptHex: disputeClosure?.scriptHex || null,
+        disputeControlBlockHex,
+        disputeCsvSequence: disputeClosure?.csvSequence || null,
         userCkUnsignedB64: base64.encode(userCk.toPSBT()),
         lpCkUnsignedB64,
         lpCkSigned,
@@ -489,6 +497,9 @@ export async function createLpServer({
         contractTapTreeHex: pend.contractTapTreeHex,
         settleScriptHex: pend.settleScriptHex,
         exitScriptHex: pend.exitScriptHex,
+        disputeScriptHex: pend.disputeScriptHex,
+        disputeControlBlockHex: pend.disputeControlBlockHex,
+        disputeCsvSequence: pend.disputeCsvSequence,
         exitDelaySecs: Number(exitDelaySecs),
       };
       store.update((d) => {
@@ -554,7 +565,13 @@ export async function createLpServer({
       const settleLeafHash = tapLeafHash(settleScript);
       const userPubXOnly = hex.decode(pos.userPubHex);
       const userArkScript = buildDefaultArkScript(userPubXOnly, serverXOnly, exitDelaySecs);
-      const { exitClosure } = buildDlcContractScript(userPubXOnly, lpKey.pubXOnly, serverXOnly, exitDelaySecs);
+      const { exitClosure } = buildDlcContractScript(
+        userPubXOnly,
+        lpKey.pubXOnly,
+        serverXOnly,
+        exitDelaySecs,
+        pos.oracleQuorum || oracleQuorum
+      );
 
       const outputs = [{ script: contractScript.pkScript, amount: newTotal }];
       if (userSurplus >= DUST) outputs.push({ script: userArkScript.pkScript, amount: userSurplus });

@@ -1403,4 +1403,156 @@ export class BrowserP2pFiatWallet {
     }
     return { wrapId, targetPub, unrollHops: pkg.unroll_txs.length, payouts: pkg.payouts.length };
   }
+
+  /**
+   * Emergency On-Demand Mid-Term Dispute Exit via Leaf 2 (`k-of-n` Nostracle BIP-342 quorum).
+   * Used if the LP goes offline mid-term or BTC drops >= 50% (early liquidation).
+   *
+   * 1. Builds the deterministic BIP-342 dispute payout tx at live spot + pro-rata yield/funding.
+   * 2. Requests BIP-340 Schnorr signatures from all `n` Nostracles in parallel over NIP-17 RPC (`sign_dispute`).
+   * 3. Verifies >= `k` signatures, assembles the BIP-342 `OP_CHECKSIGADD` witness, and broadcasts
+   *    onchain if the DLC VTXO is confirmed (or returns the signed raw tx for broadcast after unroll).
+   */
+  async forceDisputeExit(positionId, spotPrice = null) {
+    const map = loadPositions();
+    const pos = map[positionId];
+    if (!pos) throw new Error("Unknown position");
+    if (!pos.disputeScriptHex || !pos.disputeControlBlockHex || !pos.oracleQuorum?.oracles?.length) {
+      throw new Error("This position was opened before Leaf 2 On-Demand Dispute was enabled");
+    }
+
+    const cur = (pos.currency || "USD").toUpperCase();
+    const side = pos.side === "long" ? "long" : "short";
+    const total = BigInt(pos.totalCollateralSats);
+    const dust = 350n;
+    const notional = Number(pos.notional ?? pos.notionalUsd ?? 0);
+    const openedAt = Number(pos.lastRolledAt || pos.openedAt || Math.floor(Date.now() / 1000));
+    const disputeTimestamp = Math.floor(Date.now() / 1000);
+    const fundingBps = Number(pos.fundingRateBpsPerDay ?? (side === "long" ? -3 : 3));
+    const liveSpot = Number(spotPrice || pos.openSpotPrice || pos.openSpotUsd);
+    if (!Number.isFinite(liveSpot) || liveSpot <= 0) {
+      throw new Error("Live BTC spot price unavailable for dispute calculation");
+    }
+
+    const elapsedDays = Math.max(0, disputeTimestamp - openedAt) / 86_400;
+    const accruedFiat = notional * (fundingBps / 10_000) * elapsedDays;
+    const distributable = total;
+    const clampSats = (targetFiat) => {
+      const raw = BigInt(Math.round((Math.max(0.01, targetFiat) / liveSpot) * 1e8));
+      const maxOut = distributable - dust;
+      return raw < dust ? dust : raw > maxOut ? maxOut : raw;
+    };
+    const userAmt =
+      side === "long"
+        ? distributable - clampSats(Math.max(0.01, notional - accruedFiat))
+        : clampSats(Math.max(0.01, notional + accruedFiat));
+    const lpAmt = distributable - userAmt;
+
+    const uDest = btc.p2tr(this.userKey.pubXOnly, undefined, btc.TEST_NETWORK).script;
+    const lDest = btc.p2tr(hex.decode(pos.lpPubHex), undefined, btc.TEST_NETWORK).script;
+    const csvSeq =
+      Number(pos.disputeCsvSequence) ||
+      ((1 << 22) | Math.floor(Number(pos.exitDelaySecs || 512) / 512));
+
+    const tx = new btc.Transaction({ version: 2, lockTime: 0 });
+    tx.addInput({ txid: pos.vtxoTxid, index: Number(pos.vtxoVout || 0), sequence: csvSeq });
+    tx.addOutput({ script: uDest, amount: userAmt });
+    tx.addOutput({ script: lDest, amount: lpAmt });
+
+    const disputeScript = hex.decode(pos.disputeScriptHex);
+    const contractPkScript = hex.decode(pos.contractPkScriptHex);
+    const sighash = tx.preimageWitnessV1(
+      0,
+      [contractPkScript],
+      btc.SigHash.DEFAULT,
+      [total],
+      undefined,
+      disputeScript,
+      0xc0
+    );
+    const sighashHex = hex.encode(sighash);
+
+    const peer = this.getNip17Peer();
+    if (peer.sockets.size === 0) {
+      const ok = await peer.connect();
+      if (ok === 0) throw new Error("Could not connect to Nostr relays for dispute RPC");
+    }
+
+    const reqParams = {
+      contract_id: positionId,
+      currency: cur,
+      side,
+      total_collateral_sats: Number(total),
+      notional_fiat: notional,
+      opened_at: openedAt,
+      dispute_timestamp: disputeTimestamp,
+      funding_rate_bps_per_day: fundingBps,
+      bounty_sats: 0,
+      fee_paid_sats: 0,
+      sighash_hex: sighashHex,
+    };
+
+    const oracles = pos.oracleQuorum.oracles;
+    const threshold = Number(pos.oracleQuorum.threshold || 2);
+    const sigsByOracle = new Map();
+    const errors = [];
+
+    await Promise.all(
+      oracles.map(async (o) => {
+        try {
+          const res = await peer.request(o.pubkey, "sign_dispute", reqParams, 20_000);
+          if (!res?.signature_hex || res.signature_hex.length !== 128) {
+            throw new Error("missing signature_hex");
+          }
+          const sigBytes = hex.decode(res.signature_hex);
+          const okSig = schnorr.verify(sigBytes, sighash, hex.decode(o.pubkey));
+          if (!okSig) throw new Error("invalid BIP-340 signature");
+          sigsByOracle.set(o.pubkey.toLowerCase(), sigBytes);
+        } catch (err) {
+          errors.push(`${o.name || o.pubkey.slice(0, 8)}: ${err.message}`);
+        }
+      })
+    );
+
+    if (sigsByOracle.size < threshold) {
+      throw new Error(
+        `Only ${sigsByOracle.size}/${threshold} Nostracles signed (${errors.join("; ")})`
+      );
+    }
+
+    // BIP-342 OP_CHECKSIGADD witness stack: reverse order of pubkeys in script, empty byte for non-signers
+    const witnessStack = [];
+    for (let i = oracles.length - 1; i >= 0; i--) {
+      const sig = sigsByOracle.get(oracles[i].pubkey.toLowerCase());
+      witnessStack.push(sig || new Uint8Array(0));
+    }
+    witnessStack.push(disputeScript, hex.decode(pos.disputeControlBlockHex));
+    tx.updateInput(0, { finalScriptWitness: witnessStack });
+    const rawTxHex = hex.encode(tx.toBytes(true, true));
+
+    let broadcastTxid = null;
+    try {
+      const st = await this.esploraProvider.getTxStatus(pos.vtxoTxid);
+      if (st?.confirmed) {
+        const res = await fetch(`${ESPLORA_URL}/tx`, { method: "POST", body: rawTxHex });
+        if (res.ok) broadcastTxid = (await res.text()).trim();
+      }
+    } catch {}
+
+    pos.lastDisputeTxHex = rawTxHex;
+    if (broadcastTxid) pos.disputeBroadcastTxid = broadcastTxid;
+    map[positionId] = pos;
+    savePositions(map);
+
+    return {
+      signedCount: sigsByOracle.size,
+      threshold,
+      totalOracles: oracles.length,
+      userPayoutSats: Number(userAmt),
+      lpPayoutSats: Number(lpAmt),
+      spotPrice: liveSpot,
+      rawTxHex,
+      broadcastTxid,
+    };
+  }
 }

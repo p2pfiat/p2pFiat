@@ -840,7 +840,14 @@ function renderPositions() {
                  </div>
                  <div class="wt-footer">
                    ${wtStatusHtml}
-                   <button class="link-btn" data-wt="${p.positionId}">Backup JSON</button>
+                   <div style="display:flex;gap:10px;align-items:center">
+                     ${
+                       p.disputeScriptHex
+                         ? `<button class="link-btn warn" data-dispute="${p.positionId}" title="Emergency mid-term exit via k-of-n Nostracles if LP is offline">⚡ Force Exit</button>`
+                         : ""
+                     }
+                     <button class="link-btn" data-wt="${p.positionId}">Backup JSON</button>
+                   </div>
                  </div>`
               : ""
           }
@@ -877,6 +884,35 @@ function renderPositions() {
         showToast(`Roll failed: ${e.message}`, 5000);
         btn.disabled = false;
         btn.textContent = "Roll";
+      }
+    };
+  });
+
+  container.querySelectorAll("[data-dispute]").forEach((btn) => {
+    btn.onclick = async () => {
+      const id = btn.getAttribute("data-dispute");
+      const ok = window.confirm(
+        "Request an emergency mid-term On-Demand Dispute exit from the k-of-n Nostracle quorum via NIP-17?\n\nOnly needed if the LP is offline."
+      );
+      if (!ok) return;
+      btn.disabled = true;
+      btn.textContent = "Signing…";
+      try {
+        const pos = loadPositions()[id];
+        const cur = (pos?.currency || activeCurrency || "USD").toUpperCase();
+        const res = await appWallet.forceDisputeExit(id, spots[cur] || spots.USD || null);
+        await navigator.clipboard?.writeText(res.rawTxHex).catch(() => {});
+        showToast(
+          res.broadcastTxid
+            ? `⚡ ${res.signedCount}/${res.totalOracles} Nostracles signed! Broadcasted: ${res.broadcastTxid.slice(0, 14)}…`
+            : `⚡ ${res.signedCount}/${res.totalOracles} Nostracles signed! Payout: ${res.userPayoutSats.toLocaleString()} sats (signed tx copied)`,
+          7000
+        );
+      } catch (e) {
+        showToast(`Dispute exit failed: ${e.message}`, 6000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "⚡ Force Exit";
       }
     };
   });
