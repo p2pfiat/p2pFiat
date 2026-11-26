@@ -1624,7 +1624,9 @@ export class BrowserP2pFiatWallet {
 
     const elapsedDays = Math.max(0, disputeTimestamp - openedAt) / 86_400;
     const accruedFiat = notional * (fundingBps / 10_000) * elapsedDays;
-    const distributable = total;
+    // Leave 350 sats as Bitcoin L1 miner fee so the dispute tx passes mempool min-relay-fee directly.
+    const minerFeeSats = total > dust * 2n + 350n ? 350n : 0n;
+    const distributable = total - minerFeeSats;
     const clampSats = (targetFiat) => {
       const raw = BigInt(Math.round((Math.max(0.01, targetFiat) / liveSpot) * 1e8));
       const maxOut = distributable - dust;
@@ -1682,6 +1684,7 @@ export class BrowserP2pFiatWallet {
       dispute_timestamp: disputeTimestamp,
       funding_rate_bps_per_day: manifest.funding_rate_bps_per_day,
       bounty_sats: 0,
+      miner_fee_sats: Number(minerFeeSats),
       fee_paid_sats: 0,
       user_pubkey_hex: manifest.user_pubkey_hex,
       lp_pubkey_hex: manifest.lp_pubkey_hex,
