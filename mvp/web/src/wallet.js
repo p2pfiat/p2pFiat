@@ -45,8 +45,10 @@ import {
 
 export const ARK_URL = "https://mutinynet.arkade.sh";
 export const ESPLORA_URL = "https://mutinynet.com/api";
-export const DEFAULT_WATCHTOWER_PUBKEY =
+const LEGACY_DEV_WATCHTOWER_PUBKEY =
   "08d19fed75e500fa6763db118b951a906c3ad7dfa98ace6d1c2c5bebde6e282d";
+export const DEFAULT_WATCHTOWER_PUBKEY =
+  "beb4bc21ac4e61d62dbcec51dbd8cfd7d45cd941cfb36258011eafe1b5fc8ffe";
 
 const LS_KEY = "p2pfiat_user_privkey_hex";
 const LS_POSITIONS = "p2pfiat_user_positions";
@@ -252,7 +254,9 @@ export function setNostrRelays(relaysOrStr) {
 
 export function getWatchtowerPubkey() {
   const stored = localStorage.getItem(LS_WT_PUBKEY);
-  if (stored === null) return DEFAULT_WATCHTOWER_PUBKEY;
+  if (stored === null || stored === LEGACY_DEV_WATCHTOWER_PUBKEY) {
+    return DEFAULT_WATCHTOWER_PUBKEY;
+  }
   return stored;
 }
 

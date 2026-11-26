@@ -16,6 +16,8 @@ const RELAYS = [
   "wss://relay.damus.io",
   "wss://nos.lol",
   "wss://relay.primal.net",
+  "wss://nostr.oxtr.dev",
+  "wss://nostr.bitcoiner.social",
 ];
 const LIST_D_TAG = "p2pfiat-nostracles";
 const enc = new TextEncoder();

@@ -117,7 +117,7 @@ export async function createLpServer({
   lpKeyHex,
   lpName = process.env.LP_NAME || "p2pFiat-LP",
   pairs = ["BTC-USD", "BTC-EUR"],
-  spreadBps = Number(process.env.LP_SPREAD_BPS || 10),
+  spreadBps = Number(process.env.LP_SPREAD_BPS || 1),
   fundingRateBpsPerDay = Number(process.env.LP_FUNDING_BPS || 3),
   oracleQuorum = parseNostracleQuorumEnv(),
   relays = [],
@@ -871,7 +871,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.met
   const enableHttp = process.env.LP_NO_HTTP !== "1" && process.env.LP_NO_HTTP !== "true";
   const port = Number(process.env.LP_PORT || 3456);
   const lpName = process.env.LP_NAME || "p2pFiat-LP";
-  const spreadBps = Number(process.env.LP_SPREAD_BPS || 10);
+  const spreadBps = Number(process.env.LP_SPREAD_BPS || 1);
   const fundingRateBpsPerDay = Number(process.env.LP_FUNDING_BPS || 3);
   const publicUrl = process.env.LP_PUBLIC_URL || undefined;
   const dataDir = process.env.LP_DATA_DIR ? path.resolve(process.env.LP_DATA_DIR) : undefined;
