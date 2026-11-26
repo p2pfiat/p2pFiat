@@ -293,42 +293,92 @@ export class Nip17Peer {
     this.seenWrapIds = new Set();
     this.pendingReqs = new Map();
     this.subId = `nip17-${hex.encode(randomBytes(4))}`;
+    this.closed = false;
+    this._healthTimer = null;
+    this._onVisibility = null;
+  }
+
+  _openCount() {
+    let n = 0;
+    for (const ws of this.sockets.values()) {
+      if (ws && ws.readyState === 1) n++;
+    }
+    return n;
+  }
+
+  _startHealthCheck() {
+    if (this._healthTimer) return;
+    const checkAll = () => {
+      if (this.closed) return;
+      for (const relayUrl of this.relays) {
+        const ws = this.sockets.get(relayUrl);
+        if (!ws || ws.readyState === 2 || ws.readyState === 3) {
+          this.sockets.delete(relayUrl);
+          this._connectSingle(relayUrl, 5000);
+        }
+      }
+    };
+    this._healthTimer = setInterval(checkAll, 25_000);
+    if (typeof document !== "undefined" && !this._onVisibility) {
+      this._onVisibility = () => {
+        if (document.visibilityState === "visible") checkAll();
+      };
+      document.addEventListener("visibilitychange", this._onVisibility);
+    }
+  }
+
+  _connectSingle(relayUrl, timeoutMs = 5000) {
+    const existing = this.sockets.get(relayUrl);
+    if (existing && (existing.readyState === 0 || existing.readyState === 1)) {
+      return Promise.resolve(existing.readyState === 1);
+    }
+    const since = Math.floor(Date.now() / 1000) - 600;
+    const filter = { kinds: [KIND_GIFT_WRAP], "#p": [this.myKey.pubHex], since };
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      try {
+        const ws = new WebSocket(relayUrl);
+        this.sockets.set(relayUrl, ws);
+        ws.onopen = () => {
+          if (this.closed) {
+            try { ws.close(); } catch {}
+            finish(false);
+            return;
+          }
+          ws.send(JSON.stringify(["REQ", this.subId, filter]));
+          finish(true);
+        };
+        ws.onmessage = (msg) => this._handleMessage(msg.data);
+        ws.onerror = () => finish(false);
+        ws.onclose = () => {
+          if (this.sockets.get(relayUrl) === ws) this.sockets.delete(relayUrl);
+          finish(false);
+          if (!this.closed) {
+            setTimeout(() => {
+              if (!this.closed && !this.sockets.has(relayUrl)) {
+                this._connectSingle(relayUrl, 5000);
+              }
+            }, 5000);
+          }
+        };
+      } catch {
+        finish(false);
+      }
+    });
   }
 
   async connect(timeoutMs = 5000) {
     if (this.relays.length === 0) return 0;
-    const since = Math.floor(Date.now() / 1000) - 600;
-    const filter = { kinds: [KIND_GIFT_WRAP], "#p": [this.myKey.pubHex], since };
-
-    const attempts = this.relays.map(
-      (relayUrl) =>
-        new Promise((resolve) => {
-          let settled = false;
-          const finish = (ok) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            resolve(ok);
-          };
-          const timer = setTimeout(() => finish(false), timeoutMs);
-          try {
-            const ws = new WebSocket(relayUrl);
-            this.sockets.set(relayUrl, ws);
-            ws.onopen = () => {
-              ws.send(JSON.stringify(["REQ", this.subId, filter]));
-              finish(true);
-            };
-            ws.onmessage = (msg) => this._handleMessage(msg.data);
-            ws.onerror = () => finish(false);
-            ws.onclose = () => {
-              this.sockets.delete(relayUrl);
-              finish(false);
-            };
-          } catch {
-            finish(false);
-          }
-        })
-    );
+    this._startHealthCheck();
+    const attempts = this.relays.map((relayUrl) => this._connectSingle(relayUrl, timeoutMs));
     const res = await Promise.all(attempts);
     return res.filter(Boolean).length;
   }
@@ -405,9 +455,11 @@ export class Nip17Peer {
   }
 
   async request(recipientPubHex, method, params = {}, timeoutMs = 15_000) {
-    if (this.sockets.size === 0) {
-      const connected = await this.connect();
-      if (connected === 0) throw new Error("Could not connect to any Nostr relay for NIP-17 RPC");
+    if (this._openCount() < Math.min(2, this.relays.length)) {
+      await this.connect(4000);
+    }
+    if (this._openCount() === 0) {
+      throw new Error("Could not connect to any Nostr relay for NIP-17 RPC");
     }
     const reqId = `r-${hex.encode(randomBytes(6))}`;
     const payload = JSON.stringify({ type: "p2pfiat-rpc-req", reqId, method, params });
@@ -427,6 +479,15 @@ export class Nip17Peer {
   }
 
   close() {
+    this.closed = true;
+    if (this._healthTimer) {
+      clearInterval(this._healthTimer);
+      this._healthTimer = null;
+    }
+    if (this._onVisibility && typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this._onVisibility);
+      this._onVisibility = null;
+    }
     for (const pend of this.pendingReqs.values()) {
       clearTimeout(pend.timer);
       pend.reject(new Error("Nip17Peer closed"));

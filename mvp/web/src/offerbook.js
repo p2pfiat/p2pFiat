@@ -499,15 +499,25 @@ export class LocalOrderBook {
   ) {
     const subId = randomSubId();
     const statuses = new Map();
-    const sockets = [];
+    const sockets = new Map();
+    const reconnectTimers = new Map();
+    let closed = false;
     const emitStatus = () => onStatus?.(Object.fromEntries(statuses));
 
-    for (const relayUrl of relays) {
+    const connectRelay = (relayUrl) => {
+      if (closed) return;
+      const existing = sockets.get(relayUrl);
+      if (existing && (existing.readyState === 0 || existing.readyState === 1)) return;
       statuses.set(relayUrl, "connecting");
+      emitStatus();
       try {
         const ws = new WebSocket(relayUrl);
-        sockets.push(ws);
+        sockets.set(relayUrl, ws);
         ws.onopen = () => {
+          if (closed) {
+            try { ws.close(); } catch {}
+            return;
+          }
           statuses.set(relayUrl, "connected");
           emitStatus();
           ws.send(JSON.stringify(["REQ", subId, { kinds: [OFFER_KIND], "#t": [tag], limit: 50 }]));
@@ -531,24 +541,58 @@ export class LocalOrderBook {
           emitStatus();
         };
         ws.onclose = () => {
+          if (sockets.get(relayUrl) === ws) sockets.delete(relayUrl);
           if (statuses.get(relayUrl) !== "error") statuses.set(relayUrl, "closed");
           emitStatus();
+          if (!closed && !reconnectTimers.has(relayUrl)) {
+            const t = setTimeout(() => {
+              reconnectTimers.delete(relayUrl);
+              connectRelay(relayUrl);
+            }, 5000);
+            reconnectTimers.set(relayUrl, t);
+          }
         };
       } catch {
         statuses.set(relayUrl, "error");
         emitStatus();
       }
+    };
+
+    for (const relayUrl of relays) connectRelay(relayUrl);
+
+    const healthTimer = setInterval(() => {
+      if (closed) return;
+      for (const relayUrl of relays) {
+        const ws = sockets.get(relayUrl);
+        if (!ws || ws.readyState === 2 || ws.readyState === 3) connectRelay(relayUrl);
+      }
+    }, 25_000);
+
+    const onVisibility = () => {
+      if (!closed && document.visibilityState === "visible") {
+        for (const relayUrl of relays) connectRelay(relayUrl);
+      }
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibility);
     }
-    emitStatus();
 
     return {
       close: () => {
-        for (const ws of sockets) {
+        closed = true;
+        clearInterval(healthTimer);
+        if (typeof document !== "undefined") {
+          document.removeEventListener("visibilitychange", onVisibility);
+        }
+        for (const t of reconnectTimers.values()) clearTimeout(t);
+        reconnectTimers.clear();
+        for (const ws of sockets.values()) {
           try {
             if (ws.readyState === 1) ws.send(JSON.stringify(["CLOSE", subId]));
             ws.close();
           } catch {}
         }
+        sockets.clear();
       },
     };
   }
