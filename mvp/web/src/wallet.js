@@ -1343,6 +1343,7 @@ export class BrowserP2pFiatWallet {
         precompleted: Boolean(p.precompleted),
       })),
       refund: suite.refund || null,
+      dispute: suite.dispute || null,
       trigger_height: 0,
     };
   }

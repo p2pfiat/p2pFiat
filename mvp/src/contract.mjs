@@ -265,14 +265,16 @@ export function buildLpExitSuite({
   announcement = null,
   watchtowerPubHex,
   refundLockTime,
+  includeAdaptorPayouts = true,
+  disputeSpec = null,
 }) {
   const total = BigInt(totalCollateralSats);
   const dust = 350n;
-  // Reserve a Taproot bounty > 546 dust when collateral allows
-  const bountyAmt = total >= 2_500n ? 600n : 0n;
+  // Reserve a Taproot bounty >= 1000 sats (matches default Watchtower min_bounty_sats) when collateral allows
+  const bountyAmt = total >= 4_000n ? 1_000n : total >= 2_500n ? 600n : 0n;
   const distributable = total - bountyAmt;
   const bountySpec = {
-    amount_sats: Number(bountyAmt > 0n ? bountyAmt : 600n),
+    amount_sats: Number(bountyAmt > 0n ? bountyAmt : 1_000n),
     vout: 2,
     primary_pubkey: watchtowerPubHex || lpKey.pubHex,
     backup_pubkeys: [],
@@ -282,17 +284,19 @@ export function buildLpExitSuite({
   const effectiveOracleHex = announcement?.oraclePubkeyHex || oraclePubHex;
   const effectiveEventId = announcement?.eventId || oracleEventId;
   const oraclePubXOnly = hex.decode(effectiveOracleHex);
-  const usesRealKind88 = Boolean(announcement?.noncesHex?.length >= 10);
+  const usesRealKind88 = Boolean(includeAdaptorPayouts && announcement?.noncesHex?.length >= 10);
   const prefixLen = 10;
   const numDigits = announcement?.numDigits || 20;
 
-  const multipliers = [
-    { label: "spot-20pct", mult: 0.8 },
-    { label: "spot-10pct", mult: 0.9 },
-    { label: "spot-0pct", mult: 1.0 },
-    { label: "spot+10pct", mult: 1.1 },
-    { label: "spot+20pct", mult: 1.2 },
-  ];
+  const multipliers = includeAdaptorPayouts
+    ? [
+        { label: "spot-20pct", mult: 0.8 },
+        { label: "spot-10pct", mult: 0.9 },
+        { label: "spot-0pct", mult: 1.0 },
+        { label: "spot+10pct", mult: 1.1 },
+        { label: "spot+20pct", mult: 1.2 },
+      ]
+    : [];
 
   let exitCtrlHex = "";
   const payouts = [];
@@ -382,6 +386,7 @@ export function buildLpExitSuite({
     bounty: bountySpec,
     payouts,
     refund,
+    dispute: disputeSpec,
   };
 }
 

@@ -393,8 +393,9 @@ export async function createLpServer({
       const maturityEpoch = Math.floor(Date.now() / 1000) + Number(quote.termSecs || 86_400);
       const oracleEventId = `btc${cur.toLowerCase()}-${maturityEpoch}`;
       const refundLockTime = Math.floor(Date.now() / 1000) + 7 * 86_400;
+      const useLeanDisputeMode = Boolean(disputeClosure);
       const liveAnn =
-        primaryOracle && relays.length > 0
+        !useLeanDisputeMode && primaryOracle && relays.length > 0
           ? await fetchLatestNostracleAnnouncement({
               oraclePubkeyHex: primaryOracle.pubkey,
               unit: cur,
@@ -420,6 +421,15 @@ export async function createLpServer({
             announcement: liveAnn,
             watchtowerPubHex: body.watchtowerPubHex || lpKey.pubHex,
             refundLockTime,
+            includeAdaptorPayouts: !useLeanDisputeMode,
+            disputeSpec: useLeanDisputeMode
+              ? {
+                  script_hex: disputeClosure.scriptHex,
+                  control_block_hex: disputeControlBlockHex,
+                  csv_sequence: disputeClosure.csvSequence,
+                  oracle_quorum: posQuorum,
+                }
+              : null,
           })
         : null;
 

@@ -77,7 +77,7 @@ assert.equal(suite.payouts.length, 5, "expected 5 discrete price-bucket payouts"
 assert.ok(suite.refund, "expected timelocked refund tx");
 assert.ok(suite.exit_control_block.length >= 66, "expected valid taproot control block");
 assert.equal(suite.bounty.primary_pubkey, wtKey.pubHex);
-assert.equal(suite.bounty.amount_sats, 600);
+assert.equal(suite.bounty.amount_sats, 1000);
 
 function exitSighash(rawTxHex) {
   const tx = btc.Transaction.fromRaw(hex.decode(rawTxHex), {
@@ -86,7 +86,7 @@ function exitSighash(rawTxHex) {
   });
   // Verify vout 2 is exact Taproot bounty output
   const out2 = tx.getOutput(2);
-  assert.equal(out2.amount, 600n, "vout 2 must pay exact 600 sat watchtower bounty");
+  assert.equal(out2.amount, 1000n, "vout 2 must pay exact 1000 sat watchtower bounty");
   assert.equal(hex.encode(out2.script), bounty.pkScriptHex, "vout 2 must lock to NUMS Taproot bounty script");
   return tx.preimageWitnessV1(
     0,
