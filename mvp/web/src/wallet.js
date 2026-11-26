@@ -252,10 +252,20 @@ export function setNostrRelays(relaysOrStr) {
   return list;
 }
 
+let discoveredWatchtowers = [];
+
+export function setDiscoveredWatchtowers(list) {
+  discoveredWatchtowers = Array.isArray(list) ? list.filter((w) => /^[0-9a-f]{64}$/i.test(w?.pubkey || "")) : [];
+}
+
+export function getBackupWatchtowerPubkeys() {
+  return discoveredWatchtowers.slice(1).map((w) => w.pubkey.toLowerCase());
+}
+
 export function getWatchtowerPubkey() {
   const stored = localStorage.getItem(LS_WT_PUBKEY);
   if (stored === null || stored === LEGACY_DEV_WATCHTOWER_PUBKEY) {
-    return DEFAULT_WATCHTOWER_PUBKEY;
+    return discoveredWatchtowers[0]?.pubkey || DEFAULT_WATCHTOWER_PUBKEY;
   }
   return stored;
 }
@@ -1396,6 +1406,11 @@ export class BrowserP2pFiatWallet {
       if (ok === 0) throw new Error("Could not connect to Nostr relays for watchtower NIP-17 send");
     }
     const wrapId = await peer.sendWrapped(targetPub, payloadStr);
+    // Also mirror the exit package to any curated backup watchtowers from NIP-51 `p2pfiat-watchtowers`.
+    const backups = getBackupWatchtowerPubkeys().filter((pk) => pk !== targetPub.toLowerCase());
+    if (backups.length > 0) {
+      await Promise.allSettled(backups.map((bpk) => peer.sendWrapped(bpk, payloadStr)));
+    }
     const map = loadPositions();
     if (map[positionId]) {
       map[positionId].watchtowerRegistered = true;

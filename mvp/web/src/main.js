@@ -20,6 +20,7 @@ import {
   setNostrRelays,
   getWatchtowerPubkey,
   setWatchtowerPubkey,
+  setDiscoveredWatchtowers,
   getQuorumPreset,
   setQuorumPreset,
   getCustomNostracles,
@@ -39,6 +40,7 @@ import {
 import {
   scanNostracleReputation,
   fetchCuratedNostracleList,
+  fetchCuratedWatchtowerList,
 } from "./nostracle-client.js";
 import {
   importNostrAccount,
@@ -244,8 +246,17 @@ async function refreshNostracleReputation() {
   nostracleScanBusy = true;
   try {
     const relays = getNostrRelays();
-    const liveDir = await fetchCuratedNostracleList(relays).catch(() => null);
+    const [liveDir, liveWts] = await Promise.all([
+      fetchCuratedNostracleList(relays).catch(() => null),
+      fetchCuratedWatchtowerList(relays).catch(() => null),
+    ]);
     if (liveDir && liveDir.length > 0) curatedNostracles = liveDir;
+    if (liveWts && liveWts.length > 0) {
+      setDiscoveredWatchtowers(liveWts);
+      if ($("wt-pubkey-input") && !$("wt-pubkey-input").matches(":focus")) {
+        $("wt-pubkey-input").value = getWatchtowerPubkey();
+      }
+    }
     const pool = getEffectiveNostraclePool();
     nostracleRep = await scanNostracleReputation(
       pool.map((o) => o.pubkey),

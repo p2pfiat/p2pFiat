@@ -9,6 +9,7 @@ import { hex, bech32 } from "@scure/base";
 export const P2PFIAT_CURATOR_NPUB =
   "npub1p2ppegcr9j875e2d76vzn9za9s3rd6npgvde8d5cwjza8c80en3sj72l43";
 export const NOSTRACLE_LIST_D_TAG = "p2pfiat-nostracles";
+export const WATCHTOWER_LIST_D_TAG = "p2pfiat-watchtowers";
 
 const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
 const enc = new TextEncoder();
@@ -180,12 +181,9 @@ export function scoreNostracleReputation(_rep) {
   return null;
 }
 
-/**
- * Fetch and cryptographically verify the live NIP-51 `kind: 30000` (`d: "p2pfiat-nostracles"`)
- * curated Nostracle directory published by `curatorNpubOrHex`.
- * Returns `null` if no signed directory event is found yet (caller falls back to local pool).
- */
-export async function fetchCuratedNostracleList(
+async function fetchCuratedNip51List(
+  dTag,
+  defaultPrefix,
   relays,
   curatorNpubOrHex = P2PFIAT_CURATOR_NPUB,
   timeoutMs = 3500
@@ -221,7 +219,7 @@ export async function fetchCuratedNostracleList(
                 JSON.stringify([
                   "REQ",
                   subId,
-                  { kinds: [30000], authors: [curatorHex], "#d": [NOSTRACLE_LIST_D_TAG], limit: 1 },
+                  { kinds: [30000], authors: [curatorHex], "#d": [dTag], limit: 1 },
                 ])
               );
             };
@@ -261,10 +259,34 @@ export async function fetchCuratedNostracleList(
     if (seen.has(pk)) continue;
     seen.add(pk);
     list.push({
-      name: (t[3] || `Nostracle-${list.length + 1}`).trim(),
+      name: (t[3] || `${defaultPrefix}-${list.length + 1}`).trim(),
       pubkey: pk,
       npub: bech32.encode("npub", bech32.toWords(hex.decode(pk))),
     });
   }
   return list.length > 0 ? list : null;
+}
+
+/**
+ * Fetch and cryptographically verify the live NIP-51 `kind: 30000` (`d: "p2pfiat-nostracles"`)
+ * curated Nostracle directory published by `curatorNpubOrHex`.
+ */
+export async function fetchCuratedNostracleList(
+  relays,
+  curatorNpubOrHex = P2PFIAT_CURATOR_NPUB,
+  timeoutMs = 3500
+) {
+  return fetchCuratedNip51List(NOSTRACLE_LIST_D_TAG, "Nostracle", relays, curatorNpubOrHex, timeoutMs);
+}
+
+/**
+ * Fetch and cryptographically verify the live NIP-51 `kind: 30000` (`d: "p2pfiat-watchtowers"`)
+ * curated Watchtower directory (entry 0 = Primary, entries 1..n = Backups for tiered bounties).
+ */
+export async function fetchCuratedWatchtowerList(
+  relays,
+  curatorNpubOrHex = P2PFIAT_CURATOR_NPUB,
+  timeoutMs = 3500
+) {
+  return fetchCuratedNip51List(WATCHTOWER_LIST_D_TAG, "Watchtower", relays, curatorNpubOrHex, timeoutMs);
 }
