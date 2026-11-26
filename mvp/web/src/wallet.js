@@ -67,6 +67,50 @@ const LS_CUSTOM_NOSTRACLES = "p2pfiat_custom_nostracles";
 const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
 const G = schnorr.Point.BASE;
 const enc = new TextEncoder();
+const NUMS_INTERNAL_KEY_HEX =
+  "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+
+function buildNostracleDisputeLeaf(oraclePubsHex, threshold, exitDelaySecs) {
+  if (!Array.isArray(oraclePubsHex) || oraclePubsHex.length < 2) return null;
+  const k = Number(threshold);
+  if (!Number.isInteger(k) || k < 2 || k > oraclePubsHex.length) return null;
+  const csvVal = (1 << 22) | Number(BigInt(exitDelaySecs) / 512n);
+  const ops = [csvVal, "CHECKSEQUENCEVERIFY", "DROP"];
+  oraclePubsHex.forEach((pubHex, idx) => {
+    ops.push(hex.decode(pubHex.trim()));
+    ops.push(idx === 0 ? "CHECKSIG" : "CHECKSIGADD");
+  });
+  ops.push(k, "GREATERTHANOREQUAL");
+  const script = btc.Script.encode(ops);
+  return {
+    script,
+    scriptHex: hex.encode(script),
+    oraclePubsHex: oraclePubsHex.map((p) => p.trim().toLowerCase()),
+    threshold: k,
+    csvSequence: csvVal,
+  };
+}
+
+function buildWatchtowerBountyScript(bountySpec) {
+  const numsXOnly = hex.decode(NUMS_INTERNAL_KEY_HEX);
+  const primaryLeaf = btc.Script.encode([hex.decode(bountySpec.primary_pubkey), "CHECKSIG"]);
+  const backupPubs = bountySpec.backup_pubkeys || [];
+  const backupCsv = Number(bountySpec.backup_csv || 4);
+  let tree;
+  if (backupPubs.length === 0) {
+    tree = { script: primaryLeaf };
+  } else {
+    const leaves = [
+      { script: primaryLeaf },
+      ...backupPubs.map((pk) => ({
+        script: btc.Script.encode([backupCsv, "CHECKSEQUENCEVERIFY", "DROP", hex.decode(pk), "CHECKSIG"]),
+      })),
+    ];
+    tree = leaves.reduce((acc, leaf) => [acc, leaf]);
+  }
+  const p2tr = btc.p2tr(numsXOnly, tree, btc.TEST_NETWORK, true);
+  return { pkScript: p2tr.script, pkScriptHex: hex.encode(p2tr.script) };
+}
 
 function concatBytes(...arrays) {
   const len = arrays.reduce((s, a) => s + a.length, 0);
@@ -981,7 +1025,25 @@ export class BrowserP2pFiatWallet {
         timelock: { type: "seconds", value: BigInt(this.exitDelaySecs) },
         pubkeys: [takerPubXOnly, this.userKey.pubXOnly],
       });
-      const contractScript = new VtxoScript([settleClosure.script, exitClosure.script]);
+      const posQuorum = quote.oracleQuorum || ord.oracleQuorum;
+      const disputeClosure =
+        posQuorum?.oracles?.length >= 2 && Number(posQuorum.threshold) >= 2
+          ? buildNostracleDisputeLeaf(
+              posQuorum.oracles.map((o) => o.pubkey),
+              posQuorum.threshold,
+              this.exitDelaySecs
+            )
+          : null;
+      const contractLeaves = [settleClosure.script, exitClosure.script];
+      if (disputeClosure) contractLeaves.push(disputeClosure.script);
+      const contractScript = new VtxoScript(contractLeaves);
+      const disputeControlBlockHex = disputeClosure
+        ? hex.encode(
+            btc.TaprootControlBlock.encode(
+              contractScript.findLeaf(disputeClosure.scriptHex)[0]
+            )
+          )
+        : null;
 
       const myVtxos = await this.wallet.getVtxos();
       const myVtxo = myVtxos
@@ -1042,16 +1104,111 @@ export class BrowserP2pFiatWallet {
       attachTapscriptSig(makerCkSigned, 0, this.userKey.pubXOnly, myDefaultLeafHash, schnorrSign(this.userKey, makerCkHash));
 
       const positionId = `p2p-${hex.encode(crypto.getRandomValues(new Uint8Array(6)))}`;
+      const openedAt = Math.floor(Date.now() / 1000);
       const takerCkUnsignedB64 = base64.encode(takerCk.toPSBT());
+
+      // Build 2-party signed Contract Manifest + lean Leaf 2 Watchtower exitSuite for P2P matches
+      let disputeManifest = null;
+      let exitSuite = null;
+      if (disputeClosure) {
+        const userPayoutScriptHex = hex.encode(
+          btc.p2tr(takerPubXOnly, undefined, btc.TEST_NETWORK).script
+        );
+        const lpPayoutScriptHex = hex.encode(
+          btc.p2tr(this.userKey.pubXOnly, undefined, btc.TEST_NETWORK).script
+        );
+        const manifestFields = {
+          contract_id: positionId,
+          vtxo_outpoint: `${arkTx.id}:0`,
+          currency: (quote.currency || "USD").toUpperCase(),
+          side: quote.side || "short",
+          total_collateral_sats: Number(quote.totalCollateralSats),
+          notional_fiat: Number(quote.notional ?? quote.notionalUsd),
+          opened_at: openedAt,
+          funding_rate_bps_per_day: Number(quote.fundingRateBpsPerDay),
+          user_pubkey_hex: params.userPubHex.toLowerCase(),
+          lp_pubkey_hex: this.userKey.pubHex.toLowerCase(),
+          vtxo_pk_script_hex: hex.encode(contractScript.pkScript),
+          dispute_script_hex: disputeClosure.scriptHex,
+          user_payout_script_hex: userPayoutScriptHex,
+          lp_payout_script_hex: lpPayoutScriptHex,
+        };
+        const mHash = computeDisputeManifestHash(manifestFields);
+        disputeManifest = {
+          ...manifestFields,
+          lp_manifest_sig_hex: hex.encode(schnorrSign(this.userKey, mHash)),
+        };
+
+        const total = BigInt(quote.totalCollateralSats);
+        const bountyAmt = total >= 4_000n ? 1_000n : total >= 2_500n ? 600n : 0n;
+        const distributable = total - bountyAmt;
+        const primaryWt = params.watchtowerPubHex || getWatchtowerPubkey() || this.userKey.pubHex;
+        const bountySpec = {
+          amount_sats: Number(bountyAmt > 0n ? bountyAmt : 1_000n),
+          vout: 2,
+          primary_pubkey: primaryWt,
+          backup_pubkeys: [],
+          backup_csv: 4,
+        };
+        const bountyScript = buildWatchtowerBountyScript(bountySpec);
+        const [exitCtrlObj] = contractScript.findLeaf(hex.encode(exitClosure.script));
+        const exitCtrlHex = hex.encode(btc.TaprootControlBlock.encode(exitCtrlObj));
+        const csvSequence = (1 << 22) | Number(BigInt(this.exitDelaySecs) / 512n);
+        const refundLockTime = openedAt + 7 * 86_400;
+        const halfAmt = distributable / 2n;
+        const refundTx = new btc.Transaction({ version: 2, lockTime: refundLockTime });
+        refundTx.addInput({ txid: arkTx.id, index: 0, sequence: csvSequence });
+        refundTx.addOutput({ script: hex.decode(userPayoutScriptHex), amount: halfAmt });
+        refundTx.addOutput({ script: hex.decode(lpPayoutScriptHex), amount: distributable - halfAmt });
+        if (bountyAmt > 0n) {
+          refundTx.addOutput({ script: bountyScript.pkScript, amount: bountyAmt });
+        }
+        const refundTxHex = hex.encode(refundTx.toBytes(true, false));
+        const refundHash = exitTxSighash(
+          refundTxHex,
+          contractScript.pkScript,
+          Number(total),
+          exitClosure.script
+        );
+        const primaryOracle = posQuorum?.oracles?.[0];
+        exitSuite = {
+          oracle_pubkey: primaryOracle?.pubkey || null,
+          oracle_event_id: `btc${(quote.currency || "USD").toLowerCase()}-${openedAt + Number(quote.termSecs || 86_400)}`,
+          exit_control_block: exitCtrlHex,
+          exit_csv: 0,
+          exit_csv_seconds: Number(this.exitDelaySecs),
+          bounty: bountySpec,
+          payouts: [],
+          refund: {
+            tx_hex: refundTxHex,
+            refund_height: refundLockTime,
+            user_sig: null,
+            lp_sig: hex.encode(schnorrSign(this.userKey, refundHash)),
+          },
+          dispute: {
+            script_hex: disputeClosure.scriptHex,
+            control_block_hex: disputeControlBlockHex,
+            csv_sequence: disputeClosure.csvSequence,
+            oracle_quorum: posQuorum,
+          },
+        };
+      }
+
       this._p2pPendingOpens.set(positionId, {
         quote,
         ord,
+        openedAt,
         senderPubkey,
         takerPubHex: params.userPubHex,
         contractPkScriptHex: hex.encode(contractScript.pkScript),
         contractTapTreeHex: hex.encode(contractScript.encode()),
         settleScriptHex: hex.encode(settleClosure.script),
         exitScriptHex: hex.encode(exitClosure.script),
+        disputeScriptHex: disputeClosure?.scriptHex || null,
+        disputeControlBlockHex,
+        disputeCsvSequence: disputeClosure?.csvSequence || null,
+        disputeManifest,
+        exitSuite,
         takerCkUnsignedB64,
         makerCkUnsignedB64,
         makerCkSignedB64: base64.encode(makerCkSigned.toPSBT()),
@@ -1066,7 +1223,8 @@ export class BrowserP2pFiatWallet {
         exitScriptHex: hex.encode(exitClosure.script),
         arkTxB64: base64.encode(arkTx.toPSBT()),
         userCkB64: takerCkUnsignedB64,
-        exitSuite: null,
+        exitSuite,
+        disputeManifest,
       };
     }
 
@@ -1092,7 +1250,22 @@ export class BrowserP2pFiatWallet {
       ]);
 
       this._p2pPendingOpens.delete(params.positionId);
-      const nowSecs = Math.floor(Date.now() / 1000);
+      let completedManifest = pend.disputeManifest;
+      if (completedManifest && params.userManifestSigHex) {
+        const mHash = computeDisputeManifestHash(completedManifest);
+        const takerOk = schnorr.verify(
+          hex.decode(params.userManifestSigHex),
+          mHash,
+          hex.decode(completedManifest.user_pubkey_hex)
+        );
+        if (takerOk) {
+          completedManifest = {
+            ...completedManifest,
+            user_manifest_sig_hex: params.userManifestSigHex,
+          };
+        }
+      }
+      const nowSecs = pend.openedAt || Math.floor(Date.now() / 1000);
       const takerPos = {
         positionId: params.positionId,
         status: "open",
@@ -1120,12 +1293,25 @@ export class BrowserP2pFiatWallet {
         contractTapTreeHex: pend.contractTapTreeHex,
         settleScriptHex: pend.settleScriptHex,
         exitScriptHex: pend.exitScriptHex,
+        disputeScriptHex: pend.disputeScriptHex,
+        disputeControlBlockHex: pend.disputeControlBlockHex,
+        disputeCsvSequence: pend.disputeCsvSequence,
+        disputeManifest: completedManifest,
         exitDelaySecs: Number(this.exitDelaySecs),
       };
 
-      // Save Maker's mirror position locally
+      // Save Maker's mirror position locally (including Leaf 2 disputeManifest & exitSuite)
+      const makerExitSuite = pend.exitSuite
+        ? {
+            ...pend.exitSuite,
+            refund: pend.exitSuite.refund
+              ? { ...pend.exitSuite.refund, user_sig: params.userRefundSigHex || pend.exitSuite.refund.user_sig }
+              : null,
+          }
+        : null;
       const makerPos = {
         ...takerPos,
+        exitSuite: makerExitSuite,
         side: pend.ord.makerSide,
         leverage: pend.ord.makerSide === "long" ? 2 : 1,
         liquidationPrice: pend.ord.makerSide === "long" ? Math.round(pend.quote.spotPrice * 0.5) : 0,
@@ -1138,6 +1324,12 @@ export class BrowserP2pFiatWallet {
       const map = loadPositions();
       map[makerPos.positionId] = makerPos;
       savePositions(map);
+
+      // Auto-register Maker's mirror position with Watchtower if configured
+      const makerWt = getWatchtowerPubkey();
+      if (makerWt && makerPos.disputeManifest?.user_manifest_sig_hex) {
+        this.registerWithWatchtower(makerPos.positionId, makerWt).catch(() => {});
+      }
 
       const cb = pend.ord.onOrderFilled;
       await this.cancelP2pOrder().catch(() => {});
@@ -1250,10 +1442,39 @@ export class BrowserP2pFiatWallet {
     attachTapscriptSig(arkTx, 0, this.userKey.pubXOnly, defaultLeafHash, schnorrSign(this.userKey, arkHash));
     attachTapscriptSig(userCk, 0, this.userKey.pubXOnly, defaultLeafHash, schnorrSign(this.userKey, ckHash));
 
+    // Pre-verify & co-sign LP/Maker's Contract Manifest + refund sig before finalize
+    // so P2P Makers also receive the complete 2-party signed manifest & refund tx.
+    let preSignedManifest = null;
+    if (prop.disputeManifest?.lp_manifest_sig_hex) {
+      const mHash = computeDisputeManifestHash(prop.disputeManifest);
+      const lpOk = schnorr.verify(
+        hex.decode(prop.disputeManifest.lp_manifest_sig_hex),
+        mHash,
+        hex.decode(prop.disputeManifest.lp_pubkey_hex)
+      );
+      if (!lpOk) throw new Error("LP/Maker dispute manifest signature invalid! Refusing position.");
+      preSignedManifest = {
+        ...prop.disputeManifest,
+        user_manifest_sig_hex: hex.encode(schnorrSign(this.userKey, mHash)),
+      };
+    }
+    let preSignedRefundSigHex = null;
+    if (prop.exitSuite?.refund?.tx_hex && prop.exitScriptHex) {
+      const refHash = exitTxSighash(
+        prop.exitSuite.refund.tx_hex,
+        hex.decode(prop.contractPkScriptHex),
+        q.totalCollateralSats,
+        hex.decode(prop.exitScriptHex)
+      );
+      preSignedRefundSigHex = hex.encode(schnorrSign(this.userKey, refHash));
+    }
+
     const pos = await this.callLp(t, "open/finalize", {
       positionId: prop.positionId,
       signedArkTxB64: base64.encode(arkTx.toPSBT()),
       signedUserCkB64: base64.encode(userCk.toPSBT()),
+      userManifestSigHex: preSignedManifest?.user_manifest_sig_hex || undefined,
+      userRefundSigHex: preSignedRefundSigHex || undefined,
     });
     pos.lpUrl = t.url || "";
     pos.lpPubkey = t.pubkey || q.lpPubkey || pos.lpPubHex || null;
@@ -1296,19 +1517,19 @@ export class BrowserP2pFiatWallet {
       };
     }
 
-    // Verify LP's Contract Manifest signature and attach User's BIP-340 signature
-    // (cryptographically binds both payout addresses and contract terms for Leaf 2 disputes).
-    const manifestSrc = prop.disputeManifest || pos.disputeManifest;
-    if (manifestSrc?.lp_manifest_sig_hex) {
-      const mHash = computeDisputeManifestHash(manifestSrc);
+    // Attach verified 2-party signed Contract Manifest (from pre-finalize or finalize response)
+    if (preSignedManifest) {
+      pos.disputeManifest = preSignedManifest;
+    } else if (pos.disputeManifest?.lp_manifest_sig_hex) {
+      const mHash = computeDisputeManifestHash(pos.disputeManifest);
       const lpOk = schnorr.verify(
-        hex.decode(manifestSrc.lp_manifest_sig_hex),
+        hex.decode(pos.disputeManifest.lp_manifest_sig_hex),
         mHash,
-        hex.decode(manifestSrc.lp_pubkey_hex)
+        hex.decode(pos.disputeManifest.lp_pubkey_hex)
       );
       if (!lpOk) throw new Error("LP dispute manifest signature invalid! Refusing position.");
       pos.disputeManifest = {
-        ...manifestSrc,
+        ...pos.disputeManifest,
         user_manifest_sig_hex: hex.encode(schnorrSign(this.userKey, mHash)),
       };
     }
@@ -1635,14 +1856,20 @@ export class BrowserP2pFiatWallet {
       throw new Error("This position was opened before Leaf 2 On-Demand Dispute was enabled");
     }
 
-    const cur = (pos.currency || "USD").toUpperCase();
-    const side = pos.side === "long" ? "long" : "short";
-    const total = BigInt(pos.totalCollateralSats);
+    const manifest = pos.disputeManifest;
+    if (!manifest?.user_manifest_sig_hex || !manifest?.lp_manifest_sig_hex) {
+      throw new Error("This position lacks a 2-party signed dispute manifest (re-open or roll to enable)");
+    }
+
+    // Always derive dispute tx fields from the 2-party signed manifest so BOTH Taker (User)
+    // and Maker (LP) in a P2P match construct the exact same canonical dispute transaction.
+    const side = String(manifest.side || pos.side || "short").toLowerCase() === "long" ? "long" : "short";
+    const total = BigInt(manifest.total_collateral_sats);
     const dust = 350n;
-    const notional = Number(pos.notional ?? pos.notionalUsd ?? 0);
-    const openedAt = Number(pos.lastRolledAt || pos.openedAt || Math.floor(Date.now() / 1000));
+    const notional = Number(manifest.notional_fiat);
+    const openedAt = Number(manifest.opened_at);
     const disputeTimestamp = Math.floor(Date.now() / 1000);
-    const fundingBps = Number(pos.fundingRateBpsPerDay ?? (side === "long" ? -3 : 3));
+    const fundingBps = Number(manifest.funding_rate_bps_per_day);
     const liveSpot = Number(spotPrice || pos.openSpotPrice || pos.openSpotUsd);
     if (!Number.isFinite(liveSpot) || liveSpot <= 0) {
       throw new Error("Live BTC spot price unavailable for dispute calculation");
@@ -1664,19 +1891,20 @@ export class BrowserP2pFiatWallet {
         : clampSats(Math.max(0.01, notional + accruedFiat));
     const lpAmt = distributable - userAmt;
 
-    const uDest = btc.p2tr(this.userKey.pubXOnly, undefined, btc.TEST_NETWORK).script;
-    const lDest = btc.p2tr(hex.decode(pos.lpPubHex), undefined, btc.TEST_NETWORK).script;
+    const uDest = hex.decode(manifest.user_payout_script_hex);
+    const lDest = hex.decode(manifest.lp_payout_script_hex);
     const csvSeq =
       Number(pos.disputeCsvSequence) ||
       ((1 << 22) | Math.floor(Number(pos.exitDelaySecs || 512) / 512));
 
+    const [vtxoTxid, vtxoVoutStr] = String(manifest.vtxo_outpoint).split(":");
     const tx = new btc.Transaction({ version: 2, lockTime: 0 });
-    tx.addInput({ txid: pos.vtxoTxid, index: Number(pos.vtxoVout || 0), sequence: csvSeq });
+    tx.addInput({ txid: vtxoTxid, index: Number(vtxoVoutStr || 0), sequence: csvSeq });
     tx.addOutput({ script: uDest, amount: userAmt });
     tx.addOutput({ script: lDest, amount: lpAmt });
 
-    const disputeScript = hex.decode(pos.disputeScriptHex);
-    const contractPkScript = hex.decode(pos.contractPkScriptHex);
+    const disputeScript = hex.decode(manifest.dispute_script_hex);
+    const contractPkScript = hex.decode(manifest.vtxo_pk_script_hex);
     const sighash = tx.preimageWitnessV1(
       0,
       [contractPkScript],
@@ -1692,11 +1920,6 @@ export class BrowserP2pFiatWallet {
     if (peer.sockets.size === 0) {
       const ok = await peer.connect();
       if (ok === 0) throw new Error("Could not connect to Nostr relays for dispute RPC");
-    }
-
-    const manifest = pos.disputeManifest;
-    if (!manifest?.user_manifest_sig_hex || !manifest?.lp_manifest_sig_hex) {
-      throw new Error("This position lacks a 2-party signed dispute manifest (re-open or roll to enable)");
     }
 
     const reqParams = {
