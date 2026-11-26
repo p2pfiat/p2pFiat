@@ -1,14 +1,19 @@
 /**
- * p2pFiat M4 LP Service (HTTP) on live Arkade Mutinynet.
+ * p2pFiat M4/M5 LP Service (HTTP + Serverless NIP-17 P2P) on live Arkade Mutinynet.
  *
- * Endpoints:
- *   GET  /health          - LP status, pubkey, live BTC/USD spot, Arkade balance
- *   POST /quote           - Request a BTC-collateralized USD-peg quote
- *   POST /open/propose    - Atomic 2-input Arkade funding tx proposal (User + LP -> DLC VTXO)
- *   POST /open/finalize   - Submit & finalize 2-party DLC funding tx on Arkade
- *   POST /close/propose   - Collaborative early close at live BTC/USD spot price
- *   POST /close/finalize  - Submit & finalize early close on Arkade
- *   GET  /positions       - List LP positions
+ * Transports:
+ *   - HTTP (optional, disable with `LP_NO_HTTP=1` or `enableHttp: false`)
+ *   - NIP-17 encrypted Gift-Wrapped Nostr DMs (`kind: 1059`) over Nostr relays
+ *
+ * RPC Methods (identical over HTTP and NIP-17):
+ *   health          (GET  /health)
+ *   quote           (POST /quote)
+ *   open/propose    (POST /open/propose)
+ *   open/finalize   (POST /open/finalize)
+ *   close/propose   (POST /close/propose)
+ *   close/finalize  (POST /close/finalize)
+ *   positions       (GET  /positions)
+ *   offer           (GET  /offer)
  */
 
 import http from "node:http";
@@ -37,11 +42,23 @@ import {
   tapLeafHash,
   tapscriptSighash,
   attachTapscriptSig,
+  fetchBtcSpot,
   fetchBtcUsdSpot,
+  computeFiatPayoutSats,
   computeUsdPayoutSats,
 } from "./crypto.mjs";
-import { buildDlcContractScript, buildDefaultArkScript } from "./contract.mjs";
+import { buildDlcContractScript, buildDefaultArkScript, buildLpExitSuite } from "./contract.mjs";
 import { JsonStore } from "./store.mjs";
+import {
+  DEFAULT_RELAYS,
+  DEFAULT_NOSTRACLE_QUORUM,
+  pubkeyHexToNpub,
+  npubToPubkeyHex,
+  createSignedOfferEvent,
+  publishOfferToRelays,
+} from "./offerbook.mjs";
+import { Nip17Peer } from "./nip17.mjs";
+import { fetchLatestNostracleAnnouncement } from "./nostracle-client.mjs";
 
 const ARK_URL = process.env.ARK_URL || "https://mutinynet.arkade.sh";
 const ESPLORA_URL = process.env.ESPLORA_URL || "https://mutinynet.com/api";
@@ -54,7 +71,7 @@ function readJsonBody(req) {
     req.on("end", () => {
       try {
         resolve(buf ? JSON.parse(buf) : {});
-      } catch (e) {
+      } catch {
         reject(new Error("Invalid JSON body"));
       }
     });
@@ -73,10 +90,39 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
+class RpcError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function parseNostracleQuorumEnv() {
+  const raw = process.env.NOSTRACLE_NPUBS;
+  if (!raw) return DEFAULT_NOSTRACLE_QUORUM;
+  const items = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  if (items.length === 0) return DEFAULT_NOSTRACLE_QUORUM;
+  const oracles = items.map((item, idx) => {
+    const pubkey = item.startsWith("npub1") ? npubToPubkeyHex(item) : item;
+    const npub = item.startsWith("npub1") ? item : pubkeyHexToNpub(item);
+    return { name: `Nostracle-${idx + 1}`, pubkey, npub };
+  });
+  return { threshold: Math.min(2, oracles.length), oracles };
+}
+
 export async function createLpServer({
   port = 3456,
+  enableHttp = true,
   dataDir = path.resolve(import.meta.dirname, "../data"),
   lpKeyHex,
+  lpName = process.env.LP_NAME || "p2pFiat-LP",
+  pairs = ["BTC-USD", "BTC-EUR"],
+  spreadBps = Number(process.env.LP_SPREAD_BPS || 10),
+  fundingRateBpsPerDay = Number(process.env.LP_FUNDING_BPS || 3),
+  oracleQuorum = parseNostracleQuorumEnv(),
+  relays = [],
+  publicUrl,
+  publishIntervalMs = 45_000,
 } = {}) {
   const store = new JsonStore(path.join(dataDir, "lp.json"), {
     lpKeyHex: null,
@@ -114,330 +160,748 @@ export async function createLpServer({
   const lpDefaultLeafScript = lpDefaultSettleLeaf[1].slice(0, -1); // strip 0xc0 leaf version byte
   const lpDefaultLeafHash = tapLeafHash(lpDefaultLeafScript);
 
-  // In-memory pending proposals (open/close) keyed by positionId
   const pendingOpen = new Map();
+  const pendingRoll = new Map();
   const pendingClose = new Map();
+  let latestOfferEvents = {};
+  let actualPort = enableHttp ? port : 0;
 
-  const server = http.createServer(async (req, res) => {
-    try {
-      if (req.method === "OPTIONS") {
-        res.writeHead(204, {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
-        });
-        return res.end();
+  async function buildAndPublishOffer() {
+    const [spotUsd, spotEur, bal] = await Promise.all([
+      fetchBtcSpot("USD"),
+      fetchBtcSpot("EUR"),
+      wallet.getBalance(),
+    ]);
+    const spotsByCur = { USD: spotUsd.price, EUR: spotEur.price };
+    const endpointUrl = enableHttp ? publicUrl || `http://127.0.0.1:${actualPort}` : "";
+    const transports = [];
+    if (enableHttp) transports.push("http");
+    if (relays.length > 0) transports.push("nostr-nip17");
+
+    const events = [];
+    const okRelaySet = new Set();
+    const failedRelays = [];
+
+    for (const pair of pairs) {
+      const currency = pair.includes("-") ? pair.split("-")[1].toUpperCase() : "USD";
+      const spotPrice = spotsByCur[currency] || spotUsd.price;
+      const bidPrice = Math.round(spotPrice * (1 - spreadBps / 10_000));
+      const askPrice = Math.round(spotPrice * (1 + spreadBps / 10_000));
+      const event = createSignedOfferEvent(lpKey, {
+        lpName,
+        pair,
+        currency,
+        spotPrice,
+        spotUsd: spotPrice,
+        bidPrice,
+        askPrice,
+        bidUsd: bidPrice,
+        askUsd: askPrice,
+        spreadBps,
+        fundingRateBpsPerDay,
+        minNotionalUsd: 1,
+        maxNotionalUsd: 100,
+        availableLiquiditySats: Number(bal.available || 0),
+        termSecs: 86_400,
+        endpointUrl,
+        transports,
+        oracleQuorum,
+      });
+      latestOfferEvents[pair] = event;
+      events.push(event);
+      if (relays.length > 0) {
+        const res = await publishOfferToRelays(event, relays);
+        for (const r of res.okRelays) okRelaySet.add(r);
+        failedRelays.push(...res.failedRelays);
       }
-      const url = new URL(req.url, `http://127.0.0.1:${port}`);
+    }
+    return {
+      event: events[0] || null,
+      events,
+      relayResult: { okRelays: [...okRelaySet], failedRelays },
+    };
+  }
 
-      if (req.method === "GET" && url.pathname === "/health") {
-        const spot = await fetchBtcUsdSpot();
-        const bal = await wallet.getBalance();
-        const arkAddress = await wallet.getAddress();
-        return sendJson(res, 200, {
-          ok: true,
-          network: info.network,
-          arkUrl: ARK_URL,
-          lpPubkey: lpKey.pubHex,
-          lpArkAddress: arkAddress,
-          spotUsd: spot.price,
-          spotSources: spot.sources,
-          arkBalance: { available: bal.available, settled: bal.settled, preconfirmed: bal.preconfirmed },
-          openPositions: Object.values(store.read().positions).filter((p) => p.status === "open").length,
-        });
+  // Transport-agnostic LP RPC dispatcher (shared by HTTP and NIP-17 encrypted DMs)
+  async function handleRpc(method, body = {}) {
+    if (method === "health") {
+      const [spotUsd, spotEur, bal, arkAddress] = await Promise.all([
+        fetchBtcSpot("USD"),
+        fetchBtcSpot("EUR"),
+        wallet.getBalance(),
+        wallet.getAddress(),
+      ]);
+      return {
+        ok: true,
+        lpName,
+        pairs,
+        spreadBps,
+        fundingRateBpsPerDay,
+        oracleQuorum,
+        relays,
+        transports: [
+          ...(enableHttp ? ["http"] : []),
+          ...(relays.length > 0 ? ["nostr-nip17"] : []),
+        ],
+        network: info.network,
+        arkUrl: ARK_URL,
+        lpPubkey: lpKey.pubHex,
+        lpArkAddress: arkAddress,
+        spotUsd: spotUsd.price,
+        spotEur: spotEur.price,
+        spots: { USD: spotUsd.price, EUR: spotEur.price },
+        spotSources: spotUsd.sources,
+        arkBalance: { available: bal.available, settled: bal.settled, preconfirmed: bal.preconfirmed },
+        openPositions: Object.values(store.read().positions).filter((p) => p.status === "open").length,
+      };
+    }
+
+    if (method === "offer") {
+      if (Object.keys(latestOfferEvents).length === 0) await buildAndPublishOffer();
+      const pair = body.pair || "BTC-USD";
+      return latestOfferEvents[pair] || Object.values(latestOfferEvents)[0];
+    }
+
+    if (method === "positions") {
+      return { positions: Object.values(store.read().positions) };
+    }
+
+    if (method === "quote") {
+      const currency = String(body.currency || "USD").toUpperCase();
+      if (currency !== "USD" && currency !== "EUR") {
+        throw new RpcError(400, `unsupported currency: ${currency}`);
+      }
+      const side = String(body.side || "short").toLowerCase() === "long" ? "long" : "short";
+      const pair = `BTC-${currency}`;
+      const notional = Number(body.notional ?? body.notionalUsd);
+      const termSecs = Number(body.termSecs || 86_400);
+      if (!Number.isFinite(notional) || notional <= 0) {
+        throw new RpcError(400, "notional must be > 0");
+      }
+      const spot = await fetchBtcSpot(currency);
+      const effectiveSpot =
+        side === "long"
+          ? Math.round(spot.price * (1 + spreadBps / 10_000))
+          : Math.round(spot.price * (1 - spreadBps / 10_000));
+      const sideFundingBps = side === "long" ? -fundingRateBpsPerDay : fundingRateBpsPerDay;
+      const userCollateralSats = Math.max(1_000, Math.round((notional / effectiveSpot) * 1e8));
+      const lpCollateralSats = userCollateralSats;
+      const quote = {
+        quoteId: `q-${crypto.randomBytes(6).toString("hex")}`,
+        lpName,
+        side,
+        leverage: side === "long" ? 2 : 1,
+        liquidationPrice: side === "long" ? Math.round(effectiveSpot * 0.5) : 0,
+        currency,
+        pair,
+        notional,
+        notionalUsd: notional,
+        spotPrice: spot.price,
+        spotUsd: spot.price,
+        effectiveSpotUsd: effectiveSpot,
+        spreadBps,
+        termSecs,
+        fundingRateBpsPerDay: sideFundingBps,
+        userCollateralSats,
+        lpCollateralSats,
+        totalCollateralSats: userCollateralSats + lpCollateralSats,
+        lpPubkey: lpKey.pubHex,
+        oracleQuorum,
+        expiresAt: Math.floor(Date.now() / 1000) + 120,
+      };
+      store.update((d) => {
+        d.quotes[quote.quoteId] = quote;
+      });
+      return quote;
+    }
+
+    if (method === "open/propose") {
+      const d = store.read();
+      const quote = d.quotes[body.quoteId];
+      if (!quote) throw new RpcError(404, "unknown quoteId");
+      if (Math.floor(Date.now() / 1000) > quote.expiresAt) {
+        throw new RpcError(400, "quote expired");
       }
 
-      if (req.method === "GET" && url.pathname === "/positions") {
-        return sendJson(res, 200, { positions: Object.values(store.read().positions) });
+      const userPubXOnly = hex.decode(body.userPubHex);
+      const { vtxoScript: contractScript, settleClosure, exitClosure } = buildDlcContractScript(
+        userPubXOnly,
+        lpKey.pubXOnly,
+        serverXOnly,
+        exitDelaySecs
+      );
+
+      const lpVtxos = await wallet.getVtxos();
+      const lpVtxo = lpVtxos
+        .filter((v) => Number(v.value) >= quote.lpCollateralSats)
+        .sort((a, b) => Number(b.value) - Number(a.value))[0];
+      if (!lpVtxo) {
+        throw new RpcError(503, `LP lacks a VTXO >= ${quote.lpCollateralSats} sats`);
       }
 
-      if (req.method === "POST" && url.pathname === "/quote") {
-        const body = await readJsonBody(req);
-        const notionalUsd = Number(body.notionalUsd);
-        const termSecs = Number(body.termSecs || 86_400);
-        if (!Number.isFinite(notionalUsd) || notionalUsd <= 0) {
-          return sendJson(res, 400, { error: "notionalUsd must be > 0" });
-        }
-        const spot = await fetchBtcUsdSpot();
-        const userCollateralSats = Math.max(1_000, Math.round((notionalUsd / spot.price) * 1e8));
-        const lpCollateralSats = userCollateralSats; // 1:1 matching collateral (±50% / ±25% peg)
-        const quote = {
-          quoteId: `q-${crypto.randomBytes(6).toString("hex")}`,
-          notionalUsd,
-          spotUsd: spot.price,
-          termSecs,
-          fundingRateBpsPerDay: 10,
-          userCollateralSats,
-          lpCollateralSats,
-          totalCollateralSats: userCollateralSats + lpCollateralSats,
-          lpPubkey: lpKey.pubHex,
-          expiresAt: Math.floor(Date.now() / 1000) + 120,
-        };
-        store.update((d) => {
-          d.quotes[quote.quoteId] = quote;
-        });
-        return sendJson(res, 200, quote);
+      const userVtxoScript = VtxoScript.decode(hex.decode(body.userInput.tapTreeHex));
+      const userTapLeaf = userVtxoScript.findLeaf(body.userInput.leafScriptHex);
+      const userArkInput = {
+        txid: body.userInput.txid,
+        vout: Number(body.userInput.vout),
+        value: Number(body.userInput.value),
+        tapLeafScript: userTapLeaf,
+        tapTree: userVtxoScript.encode(),
+      };
+      const lpArkInput = {
+        txid: lpVtxo.txid,
+        vout: lpVtxo.vout,
+        value: Number(lpVtxo.value),
+        tapLeafScript: lpDefaultSettleLeaf,
+        tapTree: lpArkScript.encode(),
+      };
+
+      const outputs = [
+        { script: contractScript.pkScript, amount: BigInt(quote.totalCollateralSats) },
+      ];
+      const userChange = BigInt(userArkInput.value) - BigInt(quote.userCollateralSats);
+      if (userChange < 0n) throw new RpcError(400, "userInput smaller than userCollateralSats");
+      if (userChange >= DUST) {
+        outputs.push({ script: hex.decode(body.userChangeScriptHex), amount: userChange });
+      }
+      const lpChange = BigInt(lpArkInput.value) - BigInt(quote.lpCollateralSats);
+      if (lpChange >= DUST) {
+        outputs.push({ script: lpArkScript.pkScript, amount: lpChange });
       }
 
-      if (req.method === "POST" && url.pathname === "/open/propose") {
-        const body = await readJsonBody(req);
-        const d = store.read();
-        const quote = d.quotes[body.quoteId];
-        if (!quote) return sendJson(res, 404, { error: "unknown quoteId" });
-        if (Math.floor(Date.now() / 1000) > quote.expiresAt) {
-          return sendJson(res, 400, { error: "quote expired" });
-        }
+      const { arkTx, checkpoints } = buildOffchainTx([userArkInput, lpArkInput], outputs, checkpointTapscript);
+      const [userCk, lpCk] = checkpoints;
 
-        const userPubXOnly = hex.decode(body.userPubHex);
-        const { vtxoScript: contractScript, settleClosure, exitClosure } = buildDlcContractScript(
-          userPubXOnly,
-          lpKey.pubXOnly,
-          serverXOnly,
-          exitDelaySecs
+      const prevScripts = [userCk.getOutput(0).script, lpCk.getOutput(0).script];
+      const prevAmounts = [userCk.getOutput(0).amount, lpCk.getOutput(0).amount];
+      const lpArkHash = tapscriptSighash(arkTx, 1, prevScripts, prevAmounts, lpDefaultLeafScript);
+      const lpCkHash = tapscriptSighash(lpCk, 0, [lpArkScript.pkScript], [BigInt(lpArkInput.value)], lpDefaultLeafScript);
+
+      attachTapscriptSig(arkTx, 1, lpKey.pubXOnly, lpDefaultLeafHash, schnorrSign(lpKey, lpArkHash));
+      const lpCkUnsignedB64 = base64.encode(lpCk.toPSBT());
+      const lpCkSigned = Transaction.fromPSBT(base64.decode(lpCkUnsignedB64));
+      attachTapscriptSig(lpCkSigned, 0, lpKey.pubXOnly, lpDefaultLeafHash, schnorrSign(lpKey, lpCkHash));
+
+      const positionId = `pos-${crypto.randomBytes(6).toString("hex")}`;
+      const primaryOracle = (quote.oracleQuorum || oracleQuorum)?.oracles?.[0];
+      const cur = (quote.currency || "USD").toUpperCase();
+      const maturityEpoch = Math.floor(Date.now() / 1000) + Number(quote.termSecs || 86_400);
+      const oracleEventId = `btc${cur.toLowerCase()}-${maturityEpoch}`;
+      const refundLockTime = Math.floor(Date.now() / 1000) + 7 * 86_400;
+      const liveAnn =
+        primaryOracle && relays.length > 0
+          ? await fetchLatestNostracleAnnouncement({
+              oraclePubkeyHex: primaryOracle.pubkey,
+              unit: cur,
+              relays,
+              timeoutMs: 2500,
+            }).catch(() => null)
+          : null;
+      const exitSuite = primaryOracle
+        ? buildLpExitSuite({
+            vtxoTxid: arkTx.id,
+            vtxoVout: 0,
+            totalCollateralSats: quote.totalCollateralSats,
+            notionalUsd: quote.notional ?? quote.notionalUsd,
+            openSpotUsd: quote.spotPrice ?? quote.spotUsd,
+            side: quote.side || "short",
+            contractScript,
+            exitClosure,
+            exitDelaySecs,
+            userPubXOnly,
+            lpKey,
+            oraclePubHex: primaryOracle.pubkey,
+            oracleEventId,
+            announcement: liveAnn,
+            watchtowerPubHex: body.watchtowerPubHex || lpKey.pubHex,
+            refundLockTime,
+          })
+        : null;
+
+      pendingOpen.set(positionId, {
+        quote,
+        userPubHex: body.userPubHex,
+        contractScriptHex: hex.encode(contractScript.pkScript),
+        contractTapTreeHex: hex.encode(contractScript.encode()),
+        settleScriptHex: hex.encode(settleClosure.script),
+        exitScriptHex: hex.encode(exitClosure.script),
+        userCkUnsignedB64: base64.encode(userCk.toPSBT()),
+        lpCkUnsignedB64,
+        lpCkSigned,
+        exitSuite,
+      });
+
+      return {
+        positionId,
+        contractAddress: contractScript.address("tark", serverXOnly).encode(),
+        contractPkScriptHex: hex.encode(contractScript.pkScript),
+        arkTxB64: base64.encode(arkTx.toPSBT()),
+        userCkB64: base64.encode(userCk.toPSBT()),
+        exitSuite,
+      };
+    }
+
+    if (method === "open/finalize") {
+      const pend = pendingOpen.get(body.positionId);
+      if (!pend) throw new RpcError(404, "unknown pending positionId");
+
+      const sub = await arkProvider.submitTx(body.signedArkTxB64, [
+        pend.userCkUnsignedB64,
+        pend.lpCkUnsignedB64,
+      ]);
+
+      const serverCk0 = Transaction.fromPSBT(base64.decode(sub.signedCheckpointTxs[0]));
+      const serverCk1 = Transaction.fromPSBT(base64.decode(sub.signedCheckpointTxs[1]));
+      const userCkSigned = Transaction.fromPSBT(base64.decode(body.signedUserCkB64));
+
+      const finalCk0 = combineTapscriptSigs(userCkSigned, serverCk0);
+      const finalCk1 = combineTapscriptSigs(pend.lpCkSigned, serverCk1);
+      await arkProvider.finalizeTx(sub.arkTxid, [
+        base64.encode(finalCk0.toPSBT()),
+        base64.encode(finalCk1.toPSBT()),
+      ]);
+
+      pendingOpen.delete(body.positionId);
+      const position = {
+        positionId: body.positionId,
+        status: "open",
+        side: pend.quote.side || "short",
+        leverage: pend.quote.leverage || (pend.quote.side === "long" ? 2 : 1),
+        liquidationPrice: pend.quote.liquidationPrice || 0,
+        currency: pend.quote.currency || "USD",
+        pair: pend.quote.pair || `BTC-${pend.quote.currency || "USD"}`,
+        openedAt: Math.floor(Date.now() / 1000),
+        vtxoTxid: sub.arkTxid,
+        vtxoVout: 0,
+        notional: pend.quote.notional ?? pend.quote.notionalUsd,
+        notionalUsd: pend.quote.notional ?? pend.quote.notionalUsd,
+        openSpotPrice: pend.quote.spotPrice ?? pend.quote.spotUsd,
+        openSpotUsd: pend.quote.spotPrice ?? pend.quote.spotUsd,
+        spreadBps: pend.quote.spreadBps,
+        fundingRateBpsPerDay: pend.quote.fundingRateBpsPerDay,
+        oracleQuorum: pend.quote.oracleQuorum || oracleQuorum,
+        userCollateralSats: pend.quote.userCollateralSats,
+        lpCollateralSats: pend.quote.lpCollateralSats,
+        totalCollateralSats: pend.quote.totalCollateralSats,
+        userPubHex: pend.userPubHex,
+        lpPubHex: lpKey.pubHex,
+        contractPkScriptHex: pend.contractScriptHex,
+        contractTapTreeHex: pend.contractTapTreeHex,
+        settleScriptHex: pend.settleScriptHex,
+        exitScriptHex: pend.exitScriptHex,
+        exitDelaySecs: Number(exitDelaySecs),
+      };
+      store.update((d) => {
+        d.positions[position.positionId] = position;
+      });
+      return position;
+    }
+
+    if (method === "roll/propose") {
+      const pos = store.read().positions[body.positionId];
+      if (!pos) throw new RpcError(404, "unknown positionId");
+      if (pos.status !== "open") throw new RpcError(400, `position is ${pos.status}`);
+
+      const cur = (pos.currency || "USD").toUpperCase();
+      const side = pos.side === "long" ? "long" : "short";
+      const notional = Number(pos.notional ?? pos.notionalUsd);
+      const spot = await fetchBtcSpot(cur, pos.openSpotPrice ?? pos.openSpotUsd);
+      const rollSpotUsd = body.overrideSpotUsd ? Number(body.overrideSpotUsd) : spot.price;
+      const elapsedSecs = Math.max(0, Math.floor(Date.now() / 1000) - Number(pos.lastRolledAt || pos.openedAt || 0));
+      const defaultSideFunding = side === "long" ? -fundingRateBpsPerDay : fundingRateBpsPerDay;
+      const prevFundingBps = Number(pos.fundingRateBpsPerDay ?? defaultSideFunding);
+      const prevCarriedInterestUsd = Number(pos.carriedInterestUsd || 0);
+      const periodInterestUsd = notional * (prevFundingBps / 10_000) * (elapsedSecs / 86_400);
+      const accruedInterestUsd = prevCarriedInterestUsd + periodInterestUsd;
+      const total = BigInt(pos.totalCollateralSats);
+      let userEquity;
+      let lpEquity;
+      if (side === "long") {
+        lpEquity = computeFiatPayoutSats(
+          Math.max(0.01, notional - accruedInterestUsd),
+          rollSpotUsd,
+          total,
+          DUST
         );
-
-        // Select a spendable LP VTXO covering lpCollateralSats.
-        const lpVtxos = await wallet.getVtxos();
-        const lpVtxo = lpVtxos
-          .filter((v) => Number(v.value) >= quote.lpCollateralSats)
-          .sort((a, b) => Number(b.value) - Number(a.value))[0];
-        if (!lpVtxo) {
-          return sendJson(res, 503, { error: `LP lacks a VTXO >= ${quote.lpCollateralSats} sats` });
-        }
-
-        // Reconstruct User's input VtxoScript & tapLeafScript.
-        const userVtxoScript = VtxoScript.decode(hex.decode(body.userInput.tapTreeHex));
-        const userTapLeaf = userVtxoScript.findLeaf(body.userInput.leafScriptHex);
-        const userArkInput = {
-          txid: body.userInput.txid,
-          vout: Number(body.userInput.vout),
-          value: Number(body.userInput.value),
-          tapLeafScript: userTapLeaf,
-          tapTree: userVtxoScript.encode(),
-        };
-        const lpArkInput = {
-          txid: lpVtxo.txid,
-          vout: lpVtxo.vout,
-          value: Number(lpVtxo.value),
-          tapLeafScript: lpDefaultSettleLeaf,
-          tapTree: lpArkScript.encode(),
-        };
-
-        const outputs = [
-          { script: contractScript.pkScript, amount: BigInt(quote.totalCollateralSats) },
-        ];
-        const userChange = BigInt(userArkInput.value) - BigInt(quote.userCollateralSats);
-        if (userChange < 0n) return sendJson(res, 400, { error: "userInput smaller than userCollateralSats" });
-        if (userChange >= DUST) {
-          outputs.push({ script: hex.decode(body.userChangeScriptHex), amount: userChange });
-        }
-        const lpChange = BigInt(lpArkInput.value) - BigInt(quote.lpCollateralSats);
-        if (lpChange >= DUST) {
-          outputs.push({ script: lpArkScript.pkScript, amount: lpChange });
-        }
-
-        const { arkTx, checkpoints } = buildOffchainTx([userArkInput, lpArkInput], outputs, checkpointTapscript);
-        const [userCk, lpCk] = checkpoints;
-
-        // LP signs input 1 on arkTx and input 0 on lpCk.
-        const prevScripts = [userCk.getOutput(0).script, lpCk.getOutput(0).script];
-        const prevAmounts = [userCk.getOutput(0).amount, lpCk.getOutput(0).amount];
-        const lpArkHash = tapscriptSighash(arkTx, 1, prevScripts, prevAmounts, lpDefaultLeafScript);
-        const lpCkHash = tapscriptSighash(lpCk, 0, [lpArkScript.pkScript], [BigInt(lpArkInput.value)], lpDefaultLeafScript);
-
-        attachTapscriptSig(arkTx, 1, lpKey.pubXOnly, lpDefaultLeafHash, schnorrSign(lpKey, lpArkHash));
-        const lpCkUnsignedB64 = base64.encode(lpCk.toPSBT());
-        const lpCkSigned = Transaction.fromPSBT(base64.decode(lpCkUnsignedB64));
-        attachTapscriptSig(lpCkSigned, 0, lpKey.pubXOnly, lpDefaultLeafHash, schnorrSign(lpKey, lpCkHash));
-
-        const positionId = `pos-${crypto.randomBytes(6).toString("hex")}`;
-        pendingOpen.set(positionId, {
-          quote,
-          userPubHex: body.userPubHex,
-          contractScriptHex: hex.encode(contractScript.pkScript),
-          contractTapTreeHex: hex.encode(contractScript.encode()),
-          settleScriptHex: hex.encode(settleClosure.script),
-          exitScriptHex: hex.encode(exitClosure.script),
-          userCkUnsignedB64: base64.encode(userCk.toPSBT()),
-          lpCkUnsignedB64,
-          lpCkSigned,
-        });
-
-        return sendJson(res, 200, {
-          positionId,
-          contractAddress: contractScript.address("tark", serverXOnly).encode(),
-          contractPkScriptHex: hex.encode(contractScript.pkScript),
-          arkTxB64: base64.encode(arkTx.toPSBT()),
-          userCkB64: base64.encode(userCk.toPSBT()),
-        });
+        userEquity = total - lpEquity;
+      } else {
+        userEquity = computeFiatPayoutSats(
+          Math.max(0.01, notional + accruedInterestUsd),
+          rollSpotUsd,
+          total,
+          DUST
+        );
+        lpEquity = total - userEquity;
       }
 
-      if (req.method === "POST" && url.pathname === "/open/finalize") {
-        const body = await readJsonBody(req);
-        const pend = pendingOpen.get(body.positionId);
-        if (!pend) return sendJson(res, 404, { error: "unknown pending positionId" });
-
-        const sub = await arkProvider.submitTx(body.signedArkTxB64, [
-          pend.userCkUnsignedB64,
-          pend.lpCkUnsignedB64,
-        ]);
-
-        const serverCk0 = Transaction.fromPSBT(base64.decode(sub.signedCheckpointTxs[0]));
-        const serverCk1 = Transaction.fromPSBT(base64.decode(sub.signedCheckpointTxs[1]));
-        const userCkSigned = Transaction.fromPSBT(base64.decode(body.signedUserCkB64));
-
-        const finalCk0 = combineTapscriptSigs(userCkSigned, serverCk0);
-        const finalCk1 = combineTapscriptSigs(pend.lpCkSigned, serverCk1);
-        await arkProvider.finalizeTx(sub.arkTxid, [
-          base64.encode(finalCk0.toPSBT()),
-          base64.encode(finalCk1.toPSBT()),
-        ]);
-
-        pendingOpen.delete(body.positionId);
-        const position = {
-          positionId: body.positionId,
-          status: "open",
-          openedAt: Math.floor(Date.now() / 1000),
-          vtxoTxid: sub.arkTxid,
-          vtxoVout: 0,
-          notionalUsd: pend.quote.notionalUsd,
-          openSpotUsd: pend.quote.spotUsd,
-          userCollateralSats: pend.quote.userCollateralSats,
-          lpCollateralSats: pend.quote.lpCollateralSats,
-          totalCollateralSats: pend.quote.totalCollateralSats,
-          userPubHex: pend.userPubHex,
-          lpPubHex: lpKey.pubHex,
-          contractPkScriptHex: pend.contractScriptHex,
-          contractTapTreeHex: pend.contractTapTreeHex,
-          settleScriptHex: pend.settleScriptHex,
-          exitScriptHex: pend.exitScriptHex,
-          exitDelaySecs: Number(exitDelaySecs),
-        };
-        store.update((d) => {
-          d.positions[position.positionId] = position;
-        });
-        return sendJson(res, 200, position);
+      const targetPerSide = BigInt(Math.max(1_000, Math.round((notional / rollSpotUsd) * 1e8)));
+      let newTotal = total;
+      let userSurplus = 0n;
+      let lpSurplus = 0n;
+      if (userEquity >= targetPerSide && lpEquity >= targetPerSide) {
+        const candidateUserSurplus = userEquity - targetPerSide;
+        const candidateLpSurplus = lpEquity - targetPerSide;
+        userSurplus = candidateUserSurplus >= DUST ? candidateUserSurplus : 0n;
+        lpSurplus = candidateLpSurplus >= DUST ? candidateLpSurplus : 0n;
+        newTotal = total - userSurplus - lpSurplus;
       }
+      // If surplus is below Arkade dust (330 sats), carry the accrued yield forward so nothing is lost.
+      const newCarriedInterestUsd = userSurplus >= DUST ? 0 : accruedInterestUsd;
 
-      if (req.method === "POST" && url.pathname === "/close/propose") {
-        const body = await readJsonBody(req);
-        const pos = store.read().positions[body.positionId];
-        if (!pos) return sendJson(res, 404, { error: "unknown positionId" });
-        if (pos.status !== "open") return sendJson(res, 400, { error: `position is ${pos.status}` });
+      const contractScript = VtxoScript.decode(hex.decode(pos.contractTapTreeHex));
+      const settleScript = hex.decode(pos.settleScriptHex);
+      const settleLeaf = contractScript.findLeaf(pos.settleScriptHex);
+      const settleLeafHash = tapLeafHash(settleScript);
+      const userPubXOnly = hex.decode(pos.userPubHex);
+      const userArkScript = buildDefaultArkScript(userPubXOnly, serverXOnly, exitDelaySecs);
+      const { exitClosure } = buildDlcContractScript(userPubXOnly, lpKey.pubXOnly, serverXOnly, exitDelaySecs);
 
-        const spot = await fetchBtcUsdSpot(pos.openSpotUsd);
-        const closeSpotUsd = body.overrideSpotUsd ? Number(body.overrideSpotUsd) : spot.price;
-        const userPayout = computeUsdPayoutSats(
-          pos.notionalUsd,
+      const outputs = [{ script: contractScript.pkScript, amount: newTotal }];
+      if (userSurplus >= DUST) outputs.push({ script: userArkScript.pkScript, amount: userSurplus });
+      if (lpSurplus >= DUST) outputs.push({ script: lpArkScript.pkScript, amount: lpSurplus });
+
+      const { arkTx, checkpoints } = buildOffchainTx(
+        [
+          {
+            txid: pos.vtxoTxid,
+            vout: pos.vtxoVout,
+            value: pos.totalCollateralSats,
+            tapLeafScript: settleLeaf,
+            tapTree: contractScript.encode(),
+          },
+        ],
+        outputs,
+        checkpointTapscript
+      );
+      const ck = checkpoints[0];
+      const ckHash = tapscriptSighash(ck, 0, [contractScript.pkScript], [total], settleScript);
+      const arkHash = tapscriptSighash(arkTx, 0, [ck.getOutput(0).script], [ck.getOutput(0).amount], settleScript);
+
+      attachTapscriptSig(arkTx, 0, lpKey.pubXOnly, settleLeafHash, schnorrSign(lpKey, arkHash));
+      const ckUnsignedB64 = base64.encode(ck.toPSBT());
+      const lpCkSig = schnorrSign(lpKey, ckHash);
+
+      const termSecs = Number(body.termSecs || 86_400);
+      const primaryOracle = (pos.oracleQuorum || oracleQuorum)?.oracles?.[0];
+      const oracleEventId = `btc${cur.toLowerCase()}-${Math.floor(Date.now() / 1000) + termSecs}`;
+      const refundLockTime = Math.floor(Date.now() / 1000) + 7 * 86_400;
+      const exitSuite = primaryOracle
+        ? buildLpExitSuite({
+            vtxoTxid: arkTx.id,
+            vtxoVout: 0,
+            totalCollateralSats: Number(newTotal),
+            notionalUsd: notional,
+            openSpotUsd: rollSpotUsd,
+            side,
+            contractScript,
+            exitClosure,
+            exitDelaySecs,
+            userPubXOnly,
+            lpKey,
+            oraclePubHex: primaryOracle.pubkey,
+            oracleEventId,
+            watchtowerPubHex: body.watchtowerPubHex || lpKey.pubHex,
+            refundLockTime,
+          })
+        : null;
+
+      pendingRoll.set(pos.positionId, {
+        pos,
+        rollSpotUsd,
+        accruedInterestUsd,
+        newCarriedInterestUsd,
+        newTotalCollateralSats: Number(newTotal),
+        userSurplusSats: Number(userSurplus),
+        lpSurplusSats: Number(lpSurplus),
+        newFundingRateBpsPerDay: side === "long" ? -fundingRateBpsPerDay : fundingRateBpsPerDay,
+        ckUnsignedB64,
+        lpCkSig,
+        settleLeafHash,
+        exitSuite,
+      });
+
+      return {
+        positionId: pos.positionId,
+        rollSpotUsd,
+        accruedInterestUsd,
+        carriedInterestUsd: newCarriedInterestUsd,
+        newTotalCollateralSats: Number(newTotal),
+        userSurplusSats: Number(userSurplus),
+        lpSurplusSats: Number(lpSurplus),
+        fundingRateBpsPerDay,
+        arkTxB64: base64.encode(arkTx.toPSBT()),
+        ckB64: ckUnsignedB64,
+        exitSuite,
+      };
+    }
+
+    if (method === "roll/finalize") {
+      const pend = pendingRoll.get(body.positionId);
+      if (!pend) throw new RpcError(404, "unknown pending roll");
+
+      const sub = await arkProvider.submitTx(body.signedArkTxB64, [pend.ckUnsignedB64]);
+      const serverCk = Transaction.fromPSBT(base64.decode(sub.signedCheckpointTxs[0]));
+      const userCkSigned = Transaction.fromPSBT(base64.decode(body.signedCkB64));
+      attachTapscriptSig(userCkSigned, 0, lpKey.pubXOnly, pend.settleLeafHash, pend.lpCkSig);
+      const finalCk = combineTapscriptSigs(userCkSigned, serverCk);
+      await arkProvider.finalizeTx(sub.arkTxid, [base64.encode(finalCk.toPSBT())]);
+
+      pendingRoll.delete(body.positionId);
+      return store.update((d) => {
+        const p = d.positions[body.positionId];
+        p.prevVtxoTxid = p.vtxoTxid;
+        p.vtxoTxid = sub.arkTxid;
+        p.vtxoVout = 0;
+        p.openSpotUsd = pend.rollSpotUsd;
+        p.openSpotPrice = pend.rollSpotUsd;
+        p.totalCollateralSats = pend.newTotalCollateralSats;
+        p.fundingRateBpsPerDay = pend.newFundingRateBpsPerDay;
+        p.lastRolledAt = Math.floor(Date.now() / 1000);
+        p.rollCount = Number(p.rollCount || 0) + 1;
+        p.lastRollInterestUsd = pend.accruedInterestUsd;
+        p.carriedInterestUsd = pend.newCarriedInterestUsd;
+        p.lastRollUserSurplusSats = pend.userSurplusSats;
+        p.totalPaidInterestSats = Number(p.totalPaidInterestSats || 0) + Number(pend.userSurplusSats || 0);
+        return p;
+      });
+    }
+
+    if (method === "close/propose") {
+      const pos = store.read().positions[body.positionId];
+      if (!pos) throw new RpcError(404, "unknown positionId");
+      if (pos.status !== "open") throw new RpcError(400, `position is ${pos.status}`);
+
+      const cur = (pos.currency || "USD").toUpperCase();
+      const side = pos.side === "long" ? "long" : "short";
+      const notional = Number(pos.notional ?? pos.notionalUsd);
+      const spot = await fetchBtcSpot(cur, pos.openSpotPrice ?? pos.openSpotUsd);
+      const closeSpotUsd = body.overrideSpotUsd ? Number(body.overrideSpotUsd) : spot.price;
+      const elapsedSecs = Math.max(0, Math.floor(Date.now() / 1000) - Number(pos.lastRolledAt || pos.openedAt || 0));
+      const defaultSideFunding = side === "long" ? -fundingRateBpsPerDay : fundingRateBpsPerDay;
+      const fundingBps = Number(pos.fundingRateBpsPerDay ?? defaultSideFunding);
+      const prevCarriedInterestUsd = Number(pos.carriedInterestUsd || 0);
+      const accruedInterestUsd =
+        prevCarriedInterestUsd + notional * (fundingBps / 10_000) * (elapsedSecs / 86_400);
+      let userPayout;
+      let lpPayout;
+      if (side === "long") {
+        const lpEffectiveNotional = Math.max(0.01, notional - accruedInterestUsd);
+        lpPayout = computeFiatPayoutSats(
+          lpEffectiveNotional,
           closeSpotUsd,
           BigInt(pos.totalCollateralSats),
           DUST
         );
-        const lpPayout = BigInt(pos.totalCollateralSats) - userPayout;
-
-        const contractScript = VtxoScript.decode(hex.decode(pos.contractTapTreeHex));
-        const settleScript = hex.decode(pos.settleScriptHex);
-        const settleLeaf = contractScript.findLeaf(pos.settleScriptHex);
-        const settleLeafHash = tapLeafHash(settleScript);
-        const userArkScript = buildDefaultArkScript(hex.decode(pos.userPubHex), serverXOnly, exitDelaySecs);
-
-        const { arkTx, checkpoints } = buildOffchainTx(
-          [
-            {
-              txid: pos.vtxoTxid,
-              vout: pos.vtxoVout,
-              value: pos.totalCollateralSats,
-              tapLeafScript: settleLeaf,
-              tapTree: contractScript.encode(),
-            },
-          ],
-          [
-            { script: userArkScript.pkScript, amount: userPayout },
-            { script: lpArkScript.pkScript, amount: lpPayout },
-          ],
-          checkpointTapscript
+        userPayout = BigInt(pos.totalCollateralSats) - lpPayout;
+      } else {
+        const effectiveNotionalUsd = Math.max(0.01, notional + accruedInterestUsd);
+        userPayout = computeFiatPayoutSats(
+          effectiveNotionalUsd,
+          closeSpotUsd,
+          BigInt(pos.totalCollateralSats),
+          DUST
         );
-        const ck = checkpoints[0];
-        const ckHash = tapscriptSighash(ck, 0, [contractScript.pkScript], [BigInt(pos.totalCollateralSats)], settleScript);
-        const arkHash = tapscriptSighash(arkTx, 0, [ck.getOutput(0).script], [ck.getOutput(0).amount], settleScript);
-
-        attachTapscriptSig(arkTx, 0, lpKey.pubXOnly, settleLeafHash, schnorrSign(lpKey, arkHash));
-        const ckUnsignedB64 = base64.encode(ck.toPSBT());
-        const lpCkSig = schnorrSign(lpKey, ckHash);
-
-        pendingClose.set(pos.positionId, {
-          pos,
-          closeSpotUsd,
-          userPayoutSats: Number(userPayout),
-          lpPayoutSats: Number(lpPayout),
-          ckUnsignedB64,
-          lpCkSig,
-          settleLeafHash,
-        });
-
-        return sendJson(res, 200, {
-          positionId: pos.positionId,
-          closeSpotUsd,
-          userPayoutSats: Number(userPayout),
-          lpPayoutSats: Number(lpPayout),
-          arkTxB64: base64.encode(arkTx.toPSBT()),
-          ckB64: ckUnsignedB64,
-        });
+        lpPayout = BigInt(pos.totalCollateralSats) - userPayout;
       }
 
-      if (req.method === "POST" && url.pathname === "/close/finalize") {
-        const body = await readJsonBody(req);
-        const pend = pendingClose.get(body.positionId);
-        if (!pend) return sendJson(res, 404, { error: "unknown pending close" });
+      const contractScript = VtxoScript.decode(hex.decode(pos.contractTapTreeHex));
+      const settleScript = hex.decode(pos.settleScriptHex);
+      const settleLeaf = contractScript.findLeaf(pos.settleScriptHex);
+      const settleLeafHash = tapLeafHash(settleScript);
+      const userArkScript = buildDefaultArkScript(hex.decode(pos.userPubHex), serverXOnly, exitDelaySecs);
 
-        const sub = await arkProvider.submitTx(body.signedArkTxB64, [pend.ckUnsignedB64]);
-        const serverCk = Transaction.fromPSBT(base64.decode(sub.signedCheckpointTxs[0]));
-        const userCkSigned = Transaction.fromPSBT(base64.decode(body.signedCkB64));
-        attachTapscriptSig(userCkSigned, 0, lpKey.pubXOnly, pend.settleLeafHash, pend.lpCkSig);
-        const finalCk = combineTapscriptSigs(userCkSigned, serverCk);
-        await arkProvider.finalizeTx(sub.arkTxid, [base64.encode(finalCk.toPSBT())]);
+      const { arkTx, checkpoints } = buildOffchainTx(
+        [
+          {
+            txid: pos.vtxoTxid,
+            vout: pos.vtxoVout,
+            value: pos.totalCollateralSats,
+            tapLeafScript: settleLeaf,
+            tapTree: contractScript.encode(),
+          },
+        ],
+        [
+          { script: userArkScript.pkScript, amount: userPayout },
+          { script: lpArkScript.pkScript, amount: lpPayout },
+        ],
+        checkpointTapscript
+      );
+      const ck = checkpoints[0];
+      const ckHash = tapscriptSighash(ck, 0, [contractScript.pkScript], [BigInt(pos.totalCollateralSats)], settleScript);
+      const arkHash = tapscriptSighash(arkTx, 0, [ck.getOutput(0).script], [ck.getOutput(0).amount], settleScript);
 
-        pendingClose.delete(body.positionId);
-        const closed = store.update((d) => {
-          const p = d.positions[body.positionId];
-          p.status = "closed";
-          p.closedAt = Math.floor(Date.now() / 1000);
-          p.closeSpotUsd = pend.closeSpotUsd;
-          p.closeTxid = sub.arkTxid;
-          p.userPayoutSats = pend.userPayoutSats;
-          p.lpPayoutSats = pend.lpPayoutSats;
-          return p;
-        });
-        return sendJson(res, 200, closed);
-      }
+      attachTapscriptSig(arkTx, 0, lpKey.pubXOnly, settleLeafHash, schnorrSign(lpKey, arkHash));
+      const ckUnsignedB64 = base64.encode(ck.toPSBT());
+      const lpCkSig = schnorrSign(lpKey, ckHash);
 
-      sendJson(res, 404, { error: "not found" });
-    } catch (err) {
-      sendJson(res, 500, { error: err?.message || String(err) });
+      pendingClose.set(pos.positionId, {
+        pos,
+        closeSpotUsd,
+        accruedInterestUsd,
+        userPayoutSats: Number(userPayout),
+        lpPayoutSats: Number(lpPayout),
+        ckUnsignedB64,
+        lpCkSig,
+        settleLeafHash,
+      });
+
+      return {
+        positionId: pos.positionId,
+        closeSpotUsd,
+        accruedInterestUsd,
+        userPayoutSats: Number(userPayout),
+        lpPayoutSats: Number(lpPayout),
+        arkTxB64: base64.encode(arkTx.toPSBT()),
+        ckB64: ckUnsignedB64,
+      };
     }
-  });
 
-  await new Promise((resolve) => server.listen(port, "127.0.0.1", resolve));
+    if (method === "close/finalize") {
+      const pend = pendingClose.get(body.positionId);
+      if (!pend) throw new RpcError(404, "unknown pending close");
+
+      const sub = await arkProvider.submitTx(body.signedArkTxB64, [pend.ckUnsignedB64]);
+      const serverCk = Transaction.fromPSBT(base64.decode(sub.signedCheckpointTxs[0]));
+      const userCkSigned = Transaction.fromPSBT(base64.decode(body.signedCkB64));
+      attachTapscriptSig(userCkSigned, 0, lpKey.pubXOnly, pend.settleLeafHash, pend.lpCkSig);
+      const finalCk = combineTapscriptSigs(userCkSigned, serverCk);
+      await arkProvider.finalizeTx(sub.arkTxid, [base64.encode(finalCk.toPSBT())]);
+
+      pendingClose.delete(body.positionId);
+      return store.update((d) => {
+        const p = d.positions[body.positionId];
+        p.status = "closed";
+        p.closedAt = Math.floor(Date.now() / 1000);
+        p.closeSpotUsd = pend.closeSpotUsd;
+        p.accruedInterestUsd = pend.accruedInterestUsd;
+        p.closeTxid = sub.arkTxid;
+        p.userPayoutSats = pend.userPayoutSats;
+        p.lpPayoutSats = pend.lpPayoutSats;
+        return p;
+      });
+    }
+
+    throw new RpcError(404, `unknown method: ${method}`);
+  }
+
+  let server = null;
+  if (enableHttp) {
+    server = http.createServer(async (req, res) => {
+      try {
+        if (req.method === "OPTIONS") {
+          res.writeHead(204, {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+          });
+          return res.end();
+        }
+        const url = new URL(req.url, `http://127.0.0.1:${actualPort}`);
+        const routeKey = `${req.method} ${url.pathname}`;
+        const routeMap = {
+          "GET /health": "health",
+          "GET /offer": "offer",
+          "GET /positions": "positions",
+          "POST /quote": "quote",
+          "POST /open/propose": "open/propose",
+          "POST /open/finalize": "open/finalize",
+          "POST /roll/propose": "roll/propose",
+          "POST /roll/finalize": "roll/finalize",
+          "POST /close/propose": "close/propose",
+          "POST /close/finalize": "close/finalize",
+        };
+        const method = routeMap[routeKey];
+        if (!method) return sendJson(res, 404, { error: "not found" });
+        const body = req.method === "POST" ? await readJsonBody(req) : {};
+        const result = await handleRpc(method, body);
+        return sendJson(res, 200, result);
+      } catch (err) {
+        const status = err instanceof RpcError ? err.status : 500;
+        sendJson(res, status, { error: err?.message || String(err) });
+      }
+    });
+    await new Promise((resolve) => server.listen(port, "127.0.0.1", resolve));
+    actualPort = server.address().port;
+  }
+
+  // Start NIP-17 encrypted P2P listener on Nostr relays whenever relays are configured
+  let nip17Peer = null;
+  let nip17Connected = 0;
+  let publishTimer = null;
+  let initialPublish = null;
+  if (relays.length > 0) {
+    nip17Peer = new Nip17Peer(lpKey, relays, {
+      onRequest: (method, params) => handleRpc(method, params),
+    });
+    nip17Connected = await nip17Peer.connect();
+    initialPublish = await buildAndPublishOffer().catch((err) => ({
+      error: err?.message || String(err),
+      relayResult: { okRelays: [], failedRelays: [] },
+    }));
+    publishTimer = setInterval(() => {
+      buildAndPublishOffer().catch(() => {});
+    }, publishIntervalMs);
+    publishTimer.unref?.();
+  }
+
   return {
     server,
-    port,
-    url: `http://127.0.0.1:${port}`,
+    port: actualPort,
+    url: enableHttp ? `http://127.0.0.1:${actualPort}` : null,
     lpKey,
+    lpName,
     wallet,
     store,
+    nip17Peer,
+    nip17Connected,
+    initialPublish,
+    publishOffer: buildAndPublishOffer,
+    handleRpc,
     close: async () => {
+      if (publishTimer) clearInterval(publishTimer);
+      nip17Peer?.close();
       await wallet.dispose?.();
-      await new Promise((resolve) => server.close(resolve));
+      if (server) await new Promise((resolve) => server.close(resolve));
     },
   };
 }
 
 // Run standalone if invoked directly (`node src/lp.mjs`)
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.meta.filename)) {
+  const enableHttp = process.env.LP_NO_HTTP !== "1" && process.env.LP_NO_HTTP !== "true";
   const port = Number(process.env.LP_PORT || 3456);
-  const lp = await createLpServer({ port });
-  console.log(`p2pFiat LP listening on ${lp.url}`);
+  const lpName = process.env.LP_NAME || "p2pFiat-LP";
+  const spreadBps = Number(process.env.LP_SPREAD_BPS || 10);
+  const fundingRateBpsPerDay = Number(process.env.LP_FUNDING_BPS || 3);
+  const publicUrl = process.env.LP_PUBLIC_URL || undefined;
+  const dataDir = process.env.LP_DATA_DIR ? path.resolve(process.env.LP_DATA_DIR) : undefined;
+  const relays =
+    process.env.NOSTR_RELAYS === "none"
+      ? []
+      : process.env.NOSTR_RELAYS
+      ? process.env.NOSTR_RELAYS.split(",").map((s) => s.trim()).filter(Boolean)
+      : DEFAULT_RELAYS;
+
+  const lp = await createLpServer({
+    port,
+    enableHttp,
+    dataDir,
+    lpName,
+    spreadBps,
+    fundingRateBpsPerDay,
+    publicUrl,
+    relays,
+  });
+  console.log(
+    `p2pFiat LP ready (${lp.lpName}, spread=${spreadBps}bps, yield=${fundingRateBpsPerDay}bps/day)`
+  );
+  console.log(`  HTTP endpoint  : ${lp.url || "DISABLED (serverless NIP-17 P2P mode)"}`);
   console.log(`  LP pubkey      : ${lp.lpKey.pubHex}`);
   console.log(`  LP Ark address : ${await lp.wallet.getAddress()}`);
   console.log(`  LP boarding    : ${await lp.wallet.getBoardingAddress()}`);
+  if (relays.length > 0) {
+    const ok = lp.initialPublish?.relayResult?.okRelays || [];
+    console.log(`  Nostr offer    : published to ${ok.length}/${relays.length} relays (${ok.join(", ") || "none"})`);
+    console.log(`  NIP-17 P2P RPC : listening on ${lp.nip17Connected}/${relays.length} relays`);
+  }
 }

@@ -1,96 +1,223 @@
-# p2p fiat peg - btc collateralised fiat peg 
-p2p fiat aims to build trustless btc collateralised fiat peg over the Lightning Network. 
+# p2pFiat — Trustless, Self-Custody Synthetic USD & EUR on Bitcoin (Arkade + DLCs + Nostr)
 
-Humanity deserves a trustless permissionless technology with fiat peg. 
+> **Humanity deserves a trustless, permissionless technology with a fiat peg.**
 
-While prices are set in fiat terms, many people cannot afford the sort term volatility of bitcoin.  A few solutions are emerging to enable stability in fiat terms - on the basis of perpetual swaps with trusted counterparties - see at the bottom of this page for examples.  Ultimate decentralisation would envision a fully decentralised exchange on which people can take derivative positions to achieve a peg with fiat or other assets. Potentially a p2p protocol such as [Holepunch](https://holepunch.to/) could help here or (with the risk of swearing in church) a type of lightning network gossip. Any wallet would offer fiatcoin conversion and on the other hand the ability to take leveraged long bitcoin positions. Through a p2p protocol (such as [Holepunch](https://holepunch.to/) or lightning network gossip), someone looking to buy bitcoin backed fiatcoin, would issue an offer to sell a short swap. Others, or liquidity providers, for example [LN Markets](https://lnmarkets.com/), would make make bids to lock in bitcoin at a certain fiat price.  
+**p2pFiat** is a self-custody, Bitcoin-collateralized synthetic fiat (USD / EUR) and 2× leveraged BTC protocol built on **[Arkade](https://arkadeos.com/)** (Bitcoin L2 VTXOs), **Discreet Log Contracts (DLCs)**, and **Nostr**.
 
-![architecture](https://user-images.githubusercontent.com/67538415/204137859-ec64d73a-b66e-44e3-9908-4b10f83f99a9.svg)
+- **Zero custody:** Neither the Liquidity Provider (LP), the Arkade server, the price oracles (**Nostracles**), nor the **Watchtower** ever holds user keys or can steal funds.
+- **100% browser-native PWA:** Live Mutinynet demo at **[https://p2pfiat.github.io/](https://p2pfiat.github.io/)** — runs completely client-side with a single `nsec1…` backup key.
+- **Serverless P2P discovery & RPC:** LPs and peer-to-peer makers publish quotes via Nostr (`kind: 30078`) and negotiate contracts over encrypted **NIP-17** Gift Wraps (`kind: 1059`).
+- **Offline safety net:** A **keyless Rust `ark-watchtower`** monitors contracts and executes pre-signed TRUC (v3) CPFP unilateral exits for a tiered onchain bounty if a counterparty disappears.
 
-Sellers and buyers would be matched on the basis of local book building. Once a seller and a buyer agree on a certain exchange rate, both parties would enter into a fully collateralised swap smart contract - in which one party has effectively bought the ‘fiatcoin’ value and the other party has a leveraged long bitcoin position - the respective satoschis of both parties would be locked up - very similar to a lightning channel. Most likely, [Discrete Log Contracts](https://adiabat.github.io/dlc.pdf) can help to establish these fully collateralised swap smart contracts. An essential input is the exchange rate, which is an input to the smart contract. The established swap can ensure stable fiat value up to half the original exchange rate.  Swap rollover logic can help to automatically roll over the positions to protect the position at all time, e.g. after a 25% drop versus the locked in exchange rate. 
+---
 
-This project requires three building blocks - the exchange rate 'oracle' can work based on a simple api call for the MVP - only needs development for robust production deployment: 
+## Visual Architecture Overview
 
-# p2p messaging protocol
+### 1. System Components & Data Flows
 
-Messages to exchange offers and bids: 
-- Node x offers short at exchange rate y for volume z satoshis
-- Node a buys short at exchange rate b for volume c satoshis
+```mermaid
+flowchart TB
+    subgraph Client["User Browser / Mobile PWA (mvp/web)"]
+        UI["3-Tier Wallet UI<br/>Stable USD/EUR · Spending BTC · Vault L1"]
+        Key["1-String Backup Key (nsec1...)<br/>HKDF-SHA256 Domain Separation"]
+        P2PMaker["Browser P2P Maker<br/>(Optional Peer Orders)"]
+    end
 
-![p2p2](https://user-images.githubusercontent.com/67538415/201062363-06678e6a-4e64-431c-9a3c-c89f1d77f650.svg)
+    subgraph Nostr["Nostr Relay Network (Serverless Control Plane)"]
+        OB["Order Book (kind: 30078)<br/>LP & P2P Quotes"]
+        RPC["Encrypted RPC (NIP-17 / kind: 1059)<br/>quote · open · roll · close · watchtower"]
+        OraclesEv["Nostracle Feeds (kind: 88 / 89)<br/>Announcements · Attestations · NIP-51 List"]
+    end
 
-# Fully collateralised smart contract swaps on the lightning network
+    subgraph Settlement["Bitcoin & Arkade Settlement Layer"]
+        ASP["Arkade Server (ASP)<br/>Instant Offchain VTXOs & Rounds"]
+        Boltz["Boltz Swap (VHTLC)<br/>Lightning Send & Receive"]
+        L1["Bitcoin L1 (Mutinynet / Mainnet)<br/>Pure P2TR Vault & Unilateral Exits"]
+    end
 
-Locks up agreed satoshi volume of both parties
+    subgraph Operators["Permissionless Network Operators"]
+        LP["Liquidity Providers (mvp/src/lp.mjs)<br/>1× Short Fiat ↔ 2× Long BTC"]
+        Nostracles["Nostracle Quorum (k-of-n)<br/>BTC/USD & BTC/EUR Price Oracles<br/>+ On-Demand BIP-342 Dispute Signer"]
+        WT["Keyless Rust Watchtower (watchtower/)<br/>Monitors VTXOs · Unrolls TRUC CPFP<br/>Earns Tiered Onchain Bounty"]
+    end
 
-Describes position closing dynamics, e.g. 
-- At agreed exchange rate (buy / sell prices communicated between parties)
-- Fallback based on external oracle
+    UI <--> Key
+    UI <-->|"Instant VTXOs & Co-signed DLCs"| ASP
+    UI <-->|"Lightning Invoices"| Boltz
+    UI <-->|"0-Timelock L1 Vault"| L1
+    Boltz <--> ASP
+    ASP <-->|"Rounds & Unilateral Exits"| L1
 
-![contract4](https://user-images.githubusercontent.com/67538415/209436496-dc3e5f56-8d9c-4dcb-8d18-71d5cc732827.svg)
+    UI <-->|"Discover Offers"| OB
+    UI <-->|"Encrypted Trade & Dispute RPC"| RPC
+    P2PMaker <--> OB
+    P2PMaker <--> RPC
 
-[Juraj Bednár and René Pickardt described Discreet Log Contracts embedded in Lightning channels in 2019](https://hackmd.io/@lpQxZaCeTG6OJZI3awxQPQ/LN-DLC).
+    LP <--> OB
+    LP <--> RPC
+    LP <-->|"Atomic 2-Input Co-Funding"| ASP
 
-[Ben Carman](https://github.com/benthecarman) got closest to describing [Discreet Log Contracts on the Lightning Network](https://suredbits.com/author/ben-carman/). 
+    Nostracles -->|"kind: 88/89 + NIP-57 Zaps"| OraclesEv
+    UI -->|"Verify Nonces & Quorum"| OraclesEv
+    WT -->|"Read Attestations"| OraclesEv
+    UI -->|"Register Exit Package (NIP-17)"| WT
+    WT -->|"Broadcast CPFP + CET / Dispute"| L1
+    WT -.->|"Stale-Exit Check"| ASP
+```
 
-[TenTenOne](https://github.com/itchysats/10101) seems to be the most advanced implementation of DLC contracts on the lightning network. 
+---
 
-On November 28, 2022, Crypto Garage announced the [first lightning channel embedding a DLC](https://medium.com/crypto-garage/dlc-on-lightning-cb5d191f6e64). 
+### 2. Three-Tier Self-Custody & Single-Key (`nsec1…`) Derivation
 
-This project previously mentioned a potential role of [RGB](https://www.youtube.com/watch?v=Uy-JH7eOkk4) or [Taro](https://lightning.engineering/posts/2022-9-28-taro-launch/) - the ability to leverage any of these wonderful protocols will depend on the ability to trustlessly mint DLC assets - to potentially allow them to travel more easily over the LN - alternatively, in an MVP, a fiat stability holder who wants to make a payment, would settle part of their DLC and make the payment in the equivalent satoshi value. The receiver has the opportunity to establish fiat stability if they want using the same DLC mechanism. 
+One single Nostr secret key (`nsec1…`) deterministically derives all wallet keys offline via **HKDF-SHA256** (`salt = "p2pfiat/v1"`) with strict domain separation, so your Nostr identity (`npub`), Arkade spending key, and onchain Bitcoin Vault key are **cryptographically unlinkable**.
 
-# Decentralised oracles
+```mermaid
+flowchart LR
+    Master["Master Backup Key<br/>nsec1... (32 bytes)"]
 
-Oracles are the remaining trust element.  
-Bitcoin is secured and considered trustless on the basis that 51% of miners can be trusted. [Trustless is trustverymany](https://considera.substack.com/p/trustless-is-trustverymany).  
-The values transacted are on L1 large and hence require verymany untrusted counterparties for trust. 
+    Master -->|"Identity (NIP-01 / NIP-17)"| NostrKey["Nostr Identity (npub1...)<br/>Encrypted RPC · Profile · P2P Orders"]
+    Master -->|"HKDF info='arkade-spending-key'"| ArkKey["Arkade Spending Key<br/>Instant BTC & DLC VTXOs<br/>(Stable USD/EUR + Spending BTC)"]
+    Master -->|"HKDF info='btc-l1-vault'"| VaultKey["Bitcoin L1 Vault Key (P2TR)<br/>Pure Single-Key Onchain Self-Custody<br/>(0 Timelock · Never Expires)"]
+```
 
-Users looking for fiat stability, will probably peg for a small value, so most probably the number of counterparties can be smaller. So instead of trustverymany, one may be ok with trustmany.  
+In the mobile-first Web Wallet, funds flow vertically between the 3 custody tiers:
 
-For simplicity, we will use here the example of 3 oracles - the oracle outcome can then be structured as a 2 of 3 key. Scaling to larger numbers of oracles is likely relatively trivial.  
-A team of researchers has already described this as verifiable witness encryption based on threshold signatures (VweTS) in the [Paper 2022/499 - Practical Decentralized Oracle Contracts](https://eprint.iacr.org/2022/499). 
+1. **🛡 Stable USD / EUR (Top):** Synthetic fiat balance backed 1:1 by BTC inside a 2-party Arkade DLC VTXO, accruing daily carry yield (`APR`). Supports instant `Receive` (auto-stabilize incoming sats) and `Send` (auto-liquidate soonest-expiring positions + optional change re-lock).
+2. **⚡ Spending BTC (Middle):** Instant, zero-fee Arkade VTXOs + Boltz Lightning VHTLC swaps. Connected to Stable via `↑ To USD/EUR` / `↓ To Sats`.
+3. **🏦 Bitcoin Vault (Bottom):** Pure onchain Taproot (`tb1p…` / `bc1p…`) with **0 timelock** and zero Arkade ASP dependency. Connected to Spending via `↑ To Spending` / `↓ To Vault`.
 
-Multiple approaches can be used - one possible approach may be that people who exchange satoshis for fiat stability (typically in the background of the app) - also serve themselves as oracle. 
+---
 
-As inputs for the various oracles a stream of agreed exchanges / unwindings of swaps can be sent on the p2p signaling layers - effectively transmitting to the network the exchange rates approved by users - a decentralised price oracle.  This introduces a new challenge - how can we link a certain price signal to a specific asset, e.g. USD - a correlation with historic price signals will likely be a way for a node to assign reputation to an untrusted price signal. 
+### 3. Arkade DLC Taproot Script Tree (3 Spending Leaves)
 
-# Possible MVP architecture
+Every locked position (`Stable USD/EUR` or `2× Long BTC`) is a 2-party custom Tapscript VTXO (`User + LP`) with an unspendable BIP-341 NUMS internal key and three spending paths:
 
-![arch5](https://user-images.githubusercontent.com/67538415/205261524-91a1e2aa-409d-4d70-bc9c-92baf3612880.svg)
+```mermaid
+flowchart TD
+    Root["DLC VTXO Output (P2TR · Unspendable NUMS Internal Key)"]
 
-![arch7](https://user-images.githubusercontent.com/67538415/205513341-5747c084-d437-4b4a-ad1a-8950a6408e79.svg)
+    Root --> L0["Leaf 0: Collaborative Path (Happy Path)<br/>3-of-3: User + LP + Arkade ASP<br/>Instant offchain close, partial spend, or rollover at live spot"]
+    Root --> L1["Leaf 1: Unilateral Exit Path (DLC CET / Refund)<br/>CSV(exitDelay) + 2-of-2: User + LP<br/>Pre-signed BIP-340 adaptor CETs locked to Nostracle kind:88 nonces<br/>+ Timelocked refund if oracle is absent<br/>Includes tiered Watchtower bounty output"]
+    Root --> L2["Leaf 2: On-Demand Dispute Path (Anytime Exit / Liquidation)<br/>CSV(exitDelay) + BIP-342 k-of-n Nostracle Quorum<br/>(OP_CHECKSIG / OP_CHECKSIGADD >= k)<br/>Allows mid-term exit on 7d/30d/90d contracts or early -50% liquidation<br/>with zero cherry-picking risk"]
+```
 
+---
 
-# Local order book building and swap rollover logic
+### 4. End-to-End Trade, Rollover & Watchtower Lifecycle
 
-- Can be custom built for each wallet
-- Provides for wallet competitive advantage
-- Builds local order book, based on information from p2p messaging protocol
-- Continuously looks to improve swap position
-- Ensures timely rollover to manage rollover risk
-- Building requires little protocol knowledge, but significant financial understanding
+```mermaid
+sequenceDiagram
+    actor User as Web Wallet (User)
+    participant Relays as Nostr Relays
+    participant LP as Liquidity Provider (LP)
+    participant ASP as Arkade Server (ASP)
+    participant WT as Keyless Watchtower
+    participant Oracles as Nostracle Quorum
 
-![logic](https://user-images.githubusercontent.com/67538415/201326940-2588e171-d300-4e72-80b3-1afe38962320.svg)
+    LP->>Relays: Publish offer (kind: 30078)
+    Oracles->>Relays: Publish price announcements (kind: 88)
+    User->>Relays: NIP-17 RPC "quote" (encrypted kind: 1059)
+    Relays-->>LP: Forward quote request
+    LP-->>User: Signed quote (spot, spread, APR, quorum)
 
-# MVP
+    User->>LP: NIP-17 RPC "open" (funding VTXOs + adaptor CETs)
+    Note over User,LP: Both verify DLC Tapscript, CET payouts & Watchtower bounty
+    User->>ASP: Submit co-signed 2-input offchain DLC tx
+    LP->>ASP: Co-sign & checkpoint VTXO
+    ASP-->>User: Confirmed DLC VTXO (instant)
 
-The MVP can compromise on the permissionless nature of p2p Fiat: an MVP can build on a centralised exchange book building - and focus on establishing the fully collaterlised smart contract swaps.  [10101](https://10101.finance/) have built a product that most closely achieves trustless fiat stability. 
+    User->>WT: Register exit package via NIP-17 (unroll chain + adaptor CETs + refund)
+    WT-->>User: Registered (holds zero private keys)
 
-# The future risk free rate
+    alt Happy Path (99% of trades)
+        User->>LP: NIP-17 RPC "close" or "roll" at live spot
+        Note over User,LP: Instant 3-of-3 Leaf 0 settlement (yield credited, sub-dust carried forward)
+    else Unilateral Exit (LP offline / unresponsive)
+        Oracles->>Relays: Publish kind: 89 attestation (or k-of-n Leaf 2 dispute sigs)
+        WT->>ASP: Check if VTXO already settled offchain
+        WT->>WT: Verify profitability (bounty > CPFP + sweep fees)
+        WT->>ASP: Broadcast TRUC (v3) CPFP unroll chain on Bitcoin L1
+        WT->>WT: Complete BIP-340 adaptor CET & claim tiered bounty
+    end
+```
 
-As the expectation value for the btc price in usd or other fiat terms is higher in most market circumstances, the market expects the long position to pay a carry fee.  That carry fee will result in the longer term in a new definition for risk free rate - yield without counterparty risk - replacing the current risk free rate, for which the counterparty risk is the US government for US bonds - although in many situations there is intermediary risk. 
+---
 
-# Complementarity
+## Repository Structure
 
-p2p fiat is complementary to several digital fiat stability alternatives. p2p fiat is the only truely trustless and permissionless solution. 
+| Directory / Repo | Description | Documentation |
+|---|---|---|
+| [`mvp/web/`](mvp/web/) | Browser-native Self-Custody Web Wallet PWA (Vite + `@arkade-os/sdk` + `@arkade-os/boltz-swap`) | [mvp/web/README.md](mvp/web/README.md) |
+| [`mvp/`](mvp/) | Liquidity Provider daemon (`lp.mjs`), DLC contract builder (`contract.mjs`), NIP-17 RPC (`nip17.mjs`), Order Book (`offerbook.mjs`), CLI & E2E tests | [mvp/README.md](mvp/README.md), [mvp/OFFERBOOK_PROTOCOL.md](mvp/OFFERBOOK_PROTOCOL.md) |
+| [`watchtower/`](watchtower/) | Keyless Rust `ark-watchtower` with tiered P2TR bounties, TRUC CPFP unrolling, and NIP-17 intake | [watchtower/README.md](watchtower/README.md), [watchtower/ORACLE_INCENTIVES.md](watchtower/ORACLE_INCENTIVES.md) |
+| [`nostracle`](https://github.com/p2pfiat/nostracle) *(sibling repo)* | Rust DLC price oracle (kinds 88/89, paid NIP-57 zaps, On-Demand BIP-342 Dispute Signer) | `nostracle/README.md` |
+| [`experiments/`](experiments/) | 19 incremental protocol & live Mutinynet experiments (offline settlement, threshold oracles, watchtower bounties, unilateral exits, perpetual rolls) | [experiments/19-mutinynet-perpetual-and-failed-rolls/README.md](experiments/19-mutinynet-perpetual-and-failed-rolls/README.md) |
+| [`docs/`](docs/) | Deep-dive protocol specifications and Arkade architecture notes | [`docs/`](docs/) |
 
-Below, you find what is probably the most complete fiat stability / stablecoin overview in the world - please feel free to comment or provide links to other resources. 
-![fiat-2024-03-21](https://github.com/michbx/p2pFiat/assets/67538415/91195d67-8f21-40ae-a22d-4f4babb02dae)
+---
 
+## Quick Start (Local Mutinynet Stack)
 
+### 1. Run the Web Wallet locally
+```bash
+npm --prefix mvp/web install
+npm --prefix mvp/web run dev
+# Open http://localhost:5173
+```
 
-# Thank you - inspiration
+### 2. Run a Liquidity Provider (LP)
+```bash
+npm --prefix mvp install
 
-This project is inspired by [Galoy](https://galoy.io/) [Stablesats](https://stablesats.com/).  You can test that project in the [Bitcoin Beach Wallet](https://www.bbw.sv/).  p2p Fait aims to make the swaps fully p2p trustless and permissionless, whereas [Stablesats](https://stablesats.com/) depends on perpetual swaps by their [Dealer](https://github.com/GaloyMoney/dealer) through the [CryptoCurrency eXchange Trading Library](https://github.com/ccxt/ccxt) with [OKX](https://www.okx.com/) at this stage - albeit with an ambition to diversify and partner with [Kollider](https://kollider.xyz/), who are building a (custodial) [browser plugin wallet](https://kollider.xyz/wallet). 
+# LP-Alpha (HTTP + NIP-17 P2P, 10 bps spread, +2 bps/day yield)
+LP_PORT=3456 LP_NAME=LP-Alpha LP_SPREAD_BPS=10 LP_FUNDING_BPS=2 LP_DATA_DIR=mvp/data/lp-alpha node mvp/src/lp.mjs
 
-It seems the [Human Rights Foundation](https://hrf.org/) and [Strike](https://strike.me/) have launched a [bounty challenge](https://hrf.org/strike-hrf-bounty) on December 20, 2021 with exactly the challenge as described above.  This is an open call for anyone to team up.  
+# LP-Beta (Pure serverless NIP-17 P2P, 5 bps spread, +3.5 bps/day yield)
+LP_NO_HTTP=1 LP_NAME=LP-Beta LP_SPREAD_BPS=5 LP_FUNDING_BPS=3.5 LP_DATA_DIR=mvp/data/lp-beta node mvp/src/lp.mjs
+```
+
+### 3. Run the Keyless Rust Watchtower
+```bash
+cd watchtower
+cp config.example.toml config.toml
+cargo run -- init   # generates watchtower key & prints P2TR funding address
+cargo run -- run    # listens for NIP-17 exit packages & monitors Nostracles
+```
+
+### 4. Run Tests
+```bash
+# Protocol unit & compatibility tests (contract, NIP-17, orderbook, on-demand dispute, watchtower compat)
+node --test mvp/test/nip17.test.mjs mvp/test/offerbook.test.mjs mvp/test/nostracle-kind88.test.mjs mvp/test/ondemand-dispute.test.mjs mvp/test/watchtower-compat.test.mjs
+
+# Watchtower Rust tests (including paid oracle dispute flow)
+cd watchtower && cargo test
+```
+
+---
+
+## Security & Trust Model
+
+| Component | Holds User Funds? | What if it goes offline or turns malicious? |
+|---|---|---|
+| **Liquidity Provider (LP)** | No | User (or Watchtower) unrolls VTXO onchain via Leaf 1 (adaptor CET) or Leaf 2 (k-of-n Nostracle dispute). |
+| **Arkade Server (ASP)** | No | Every VTXO has a pre-signed onchain exit path; L1 Bitcoin Vault has 0 timelock and zero ASP involvement. |
+| **Watchtower** | No (zero user/LP keys) | Cannot steal funds; can only broadcast pre-signed exits to earn its tiered bounty. Backup watchtowers step in after `backup_csv` blocks. |
+| **Nostracles (k-of-n)** | No | Threshold quorum (`k-of-n`, e.g. 3-of-5) prevents any single oracle from manipulating price; if quorum fails, timelocked refund returns collateral. |
+| **Nostr Relays** | No | Multi-relay broadcast (5 default relays) + end-to-end NIP-44 / NIP-17 encryption; users can configure custom relays at any time. |
+
+---
+
+## Vision: The Future Risk-Free Rate
+
+Because the expected long-term return of BTC priced in fiat is positive in most market regimes, leveraged long counterparties pay a carry fee (funding rate) to synthetic fiat holders. Over time, fully collateralized, trustless BTC-backed fiat stability establishes a **native Bitcoin risk-free rate** — yield without sovereign or intermediary counterparty risk.
+
+## Inspiration & Prior Art
+
+- [Discreet Log Contracts (DLCs)](https://adiabat.github.io/dlc.pdf) — Tadge Dryja
+- [Ark Protocol / Arkade](https://arkadeos.com/) — Offchain Bitcoin VTXOs with unilateral exits
+- [Galoy Stablesats](https://stablesats.com/) — Original inspiration for BTC-backed synthetic USD in Bitcoin wallets
+- [10101](https://10101.finance/), [Ben Carman](https://github.com/benthecarman), [Juraj Bednár & René Pickardt (LN-DLC)](https://hackmd.io/@lpQxZaCeTG6OJZI3awxQPQ/LN-DLC), [kormir](https://crates.io/crates/kormir), and [VweTS (ePrint 2022/499)](https://eprint.iacr.org/2022/499)
+
+---
+
+*Follow updates on [X (@p2pfiat)](https://x.com/p2pfiat) and [Nostr](https://primal.net/p/npub1p2ppegcr9j875e2d76vzn9za9s3rd6npgvde8d5cwjza8c80en3sj72l43).*

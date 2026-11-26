@@ -73,6 +73,70 @@ export function schnorrSign(signer, msg32) {
   }
 }
 
+/**
+ * Create a 64-byte BIP-340 Schnorr adaptor signature `(R_x || s')` locked to adaptor point `T`.
+ * Compatible with `ark-watchtower` (`AdaptorSig::complete`: `s = (s' + t) mod n`).
+ */
+export function adaptorSign(signer, msg32, adaptorPointT) {
+  while (true) {
+    const k = bytesToBigInt(crypto.randomBytes(32));
+    if (k <= 0n || k >= N) continue;
+    const Rprime = G.multiply(k);
+    const R = Rprime.add(adaptorPointT);
+    if (R.equals(schnorr.Point.ZERO) || !hasEvenY(R)) continue;
+    const rx = pointToXOnly(R);
+    const e = bytesToBigInt(taggedHash("BIP0340/challenge", rx, signer.pubXOnly, msg32)) % N;
+    const sPrime = (k + e * signer.d) % N;
+    if (sPrime === 0n) continue;
+    const sig = new Uint8Array(64);
+    sig.set(rx, 0);
+    sig.set(bigIntToBytes32(sPrime), 32);
+    return sig;
+  }
+}
+
+/** Verify a 64-byte adaptor signature `(R_x || s')` against `pubXOnly`, `msg32`, and adaptor point `T`. */
+export function adaptorVerify(adaptorSig64, pubXOnly, msg32, adaptorPointT) {
+  try {
+    const rx = adaptorSig64.subarray(0, 32);
+    const sPrime = bytesToBigInt(adaptorSig64.subarray(32, 64));
+    if (sPrime <= 0n || sPrime >= N) return false;
+    const P = schnorr.Point.fromBytes(Uint8Array.from([0x02, ...pubXOnly]));
+    const e = bytesToBigInt(taggedHash("BIP0340/challenge", rx, pubXOnly, msg32)) % N;
+    const R = G.multiply(sPrime).add(adaptorPointT).add(P.multiply((N - e) % N));
+    if (!hasEvenY(R)) return false;
+    return hex.encode(pointToXOnly(R)) === hex.encode(rx);
+  } catch {
+    return false;
+  }
+}
+
+/** Complete an adaptor signature `(R_x || s')` with oracle attestation scalar `t` -> standard BIP-340 sig. */
+export function adaptorComplete(adaptorSig64, tScalarBigInt) {
+  const sPrime = bytesToBigInt(adaptorSig64.subarray(32, 64));
+  const s = (sPrime + tScalarBigInt) % N;
+  const sig = new Uint8Array(64);
+  sig.set(adaptorSig64.subarray(0, 32), 0);
+  sig.set(bigIntToBytes32(s), 32);
+  return sig;
+}
+
+/**
+ * Derive a deterministic adaptor point `T` for a DLC outcome label under `(oraclePubXOnly, eventId, outcome)`.
+ * When an oracle publishes `kind: 88` nonces `R_i`, `T` is computed from `R_i + e_i * P_O`;
+ * for local/default contracts without a fetched announcement, this derives a verifiable secp256k1 point.
+ */
+export function deriveOutcomeAdaptorPoint(oraclePubXOnly, eventId, outcomeLabel) {
+  const h = taggedHash(
+    "p2pfiat/dlc-outcome",
+    oraclePubXOnly,
+    new TextEncoder().encode(String(eventId)),
+    new TextEncoder().encode(String(outcomeLabel))
+  );
+  const scalar = (bytesToBigInt(h) % (N - 1n)) + 1n;
+  return { scalar, point: G.multiply(scalar) };
+}
+
 export function encodeVarBytes(b) {
   if (b.length < 0xfd) return Uint8Array.from([b.length, ...b]);
   if (b.length <= 0xffff) return Uint8Array.from([0xfd, b.length & 0xff, (b.length >> 8) & 0xff, ...b]);
@@ -95,23 +159,36 @@ export function attachTapscriptSig(psbtTx, inputIdx, pubXOnly, leafHash, sig) {
 }
 
 /**
- * Fetch live BTC/USD median spot price from Kraken, Coinbase, and Bitstamp.
- * Falls back to `fallbackUsd` if offline or fewer than 1 exchange responds.
+ * Fetch live BTC/<FIAT> median spot price (USD or EUR) from Kraken, Coinbase, and Bitstamp.
+ * Falls back to `fallbackPrice` if offline or fewer than 1 exchange responds.
  */
-export async function fetchBtcUsdSpot(fallbackUsd = 95_000) {
+export async function fetchBtcSpot(currency = "USD", fallbackPrice) {
+  const cur = String(currency || "USD").toUpperCase();
+  const fb = fallbackPrice ?? (cur === "EUR" ? 88_000 : 95_000);
+  const krakenPair = cur === "EUR" ? "XBTEUR" : "XBTUSD";
+  const krakenKey = cur === "EUR" ? "XXBTZEUR" : "XXBTZUSD";
+  const bitstampPair = cur === "EUR" ? "btceur" : "btcusd";
+
   const fetchers = [
     async () => {
-      const r = await fetch("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", { signal: AbortSignal.timeout(4000) });
+      const r = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${krakenPair}`, {
+        signal: AbortSignal.timeout(4000),
+      });
       const j = await r.json();
-      return Number(j.result.XXBTZUSD.c[0]);
+      const entry = j.result[krakenKey] || Object.values(j.result)[0];
+      return Number(entry.c[0]);
     },
     async () => {
-      const r = await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot", { signal: AbortSignal.timeout(4000) });
+      const r = await fetch(`https://api.coinbase.com/v2/prices/BTC-${cur}/spot`, {
+        signal: AbortSignal.timeout(4000),
+      });
       const j = await r.json();
       return Number(j.data.amount);
     },
     async () => {
-      const r = await fetch("https://www.bitstamp.net/api/v2/ticker/btcusd/", { signal: AbortSignal.timeout(4000) });
+      const r = await fetch(`https://www.bitstamp.net/api/v2/ticker/${bitstampPair}/`, {
+        signal: AbortSignal.timeout(4000),
+      });
       const j = await r.json();
       return Number(j.last);
     },
@@ -122,18 +199,24 @@ export async function fetchBtcUsdSpot(fallbackUsd = 95_000) {
     .map((r) => r.value)
     .sort((a, b) => a - b);
 
-  if (prices.length === 0) return { price: fallbackUsd, sources: 0 };
+  if (prices.length === 0) return { price: fb, sources: 0, currency: cur };
   const mid = Math.floor(prices.length / 2);
   const median = prices.length % 2 === 1 ? prices[mid] : (prices[mid - 1] + prices[mid]) / 2;
-  return { price: Math.round(median), sources: prices.length };
+  return { price: Math.round(median), sources: prices.length, currency: cur };
 }
 
-/** Compute USD-pegged user payout in satoshis, clamped to `[dust, totalCollateral - dust]`. */
-export function computeUsdPayoutSats(notionalUsd, spotUsd, totalCollateralSats, dustSats = 350n) {
-  const raw = BigInt(Math.round((notionalUsd / spotUsd) * 1e8));
+export async function fetchBtcUsdSpot(fallbackUsd = 95_000) {
+  return fetchBtcSpot("USD", fallbackUsd);
+}
+
+/** Compute fiat-pegged user payout in satoshis, clamped to `[dust, totalCollateral - dust]`. */
+export function computeFiatPayoutSats(notionalFiat, spotFiat, totalCollateralSats, dustSats = 350n) {
+  const raw = BigInt(Math.round((notionalFiat / spotFiat) * 1e8));
   const min = dustSats;
   const max = totalCollateralSats - dustSats;
   if (raw < min) return min;
   if (raw > max) return max;
   return raw;
 }
+
+export const computeUsdPayoutSats = computeFiatPayoutSats;

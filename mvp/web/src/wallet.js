@@ -14,18 +14,47 @@ import {
   VtxoScript,
   Transaction,
   toXOnly,
+  buildOffchainTx,
+  MultisigTapscript,
+  CSVMultisigTapscript,
 } from "@arkade-os/sdk";
+import {
+  ArkadeSwaps,
+  decodeInvoice,
+  getInvoiceSatoshis,
+} from "@arkade-os/boltz-swap";
 import * as btc from "@scure/btc-signer";
-import { hex, base64 } from "@scure/base";
+import { hex, base64, bech32 } from "@scure/base";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 
+import {
+  DEFAULT_RELAYS,
+  buildQuorumForPreset,
+  buildP2pOrderEvent,
+  publishOfferEvent,
+} from "./offerbook.js";
+import { Nip17Peer } from "./nip17.js";
+import { computeKormirOutcomePoint } from "./nostracle-client.js";
+import {
+  getOrCreateNostrAccount,
+  importNostrAccount,
+  deriveArkadePrivKeyHexFromNsec,
+  deriveVaultPrivKeyHexFromNsec,
+} from "./nostr-account.js";
+
 export const ARK_URL = "https://mutinynet.arkade.sh";
 export const ESPLORA_URL = "https://mutinynet.com/api";
+export const DEFAULT_WATCHTOWER_PUBKEY =
+  "08d19fed75e500fa6763db118b951a906c3ad7dfa98ace6d1c2c5bebde6e282d";
 
 const LS_KEY = "p2pfiat_user_privkey_hex";
 const LS_POSITIONS = "p2pfiat_user_positions";
 const LS_LP_URL = "p2pfiat_lp_url";
+const LS_RELAYS = "p2pfiat_nostr_relays";
+const LS_WT_PUBKEY = "p2pfiat_watchtower_pubkey";
+const LS_QUORUM_PRESET = "p2pfiat_quorum_preset";
+const LS_CUSTOM_NOSTRACLES = "p2pfiat_custom_nostracles";
 
 const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
 const G = schnorr.Point.BASE;
@@ -108,6 +137,49 @@ function schnorrSign(signer, msg32) {
   }
 }
 
+function adaptorSign(signer, msg32, adaptorPointT) {
+  while (true) {
+    const kBytes = new Uint8Array(32);
+    crypto.getRandomValues(kBytes);
+    const k = bytesToBigInt(kBytes);
+    if (k <= 0n || k >= N) continue;
+    const R = G.multiply(k).add(adaptorPointT);
+    if (!hasEvenY(R)) continue;
+    const rx = pointToXOnly(R);
+    const e = bytesToBigInt(taggedHash("BIP0340/challenge", rx, signer.pubXOnly, msg32)) % N;
+    const sPrime = (k + e * signer.d) % N;
+    if (sPrime === 0n) continue;
+    const sig = new Uint8Array(64);
+    sig.set(rx, 0);
+    sig.set(bigIntToBytes32(sPrime), 32);
+    return sig;
+  }
+}
+
+function deriveOutcomeAdaptorPoint(oraclePubXOnly, eventId, outcomeLabel) {
+  const h = taggedHash(
+    "p2pfiat/dlc-outcome",
+    oraclePubXOnly,
+    enc.encode(String(eventId)),
+    enc.encode(String(outcomeLabel))
+  );
+  const scalar = (bytesToBigInt(h) % (N - 1n)) + 1n;
+  return { scalar, point: G.multiply(scalar) };
+}
+
+function exitTxSighash(rawTxHex, contractPkScript, totalCollateralSats, exitScript) {
+  const tx = btc.Transaction.fromRaw(hex.decode(rawTxHex), { allowUnknownInputs: true, allowUnknownOutputs: true });
+  return tx.preimageWitnessV1(
+    0,
+    [contractPkScript],
+    btc.SigHash.DEFAULT,
+    [BigInt(totalCollateralSats)],
+    -1,
+    exitScript,
+    0xc0
+  );
+}
+
 function encodeVarBytes(b) {
   if (b.length < 0xfd) return Uint8Array.from([b.length, ...b]);
   if (b.length <= 0xffff) return Uint8Array.from([0xfd, b.length & 0xff, (b.length >> 8) & 0xff, ...b]);
@@ -129,12 +201,128 @@ function attachTapscriptSig(psbtTx, inputIdx, pubXOnly, leafHash, sig) {
   psbtTx.updateInput(inputIdx, { tapScriptSig: existing });
 }
 
+function combineTapscriptSigs(baseTx, otherTx) {
+  const out = Transaction.fromPSBT(baseTx.toPSBT());
+  for (let i = 0; i < out.inputsLength; i++) {
+    const a = out.getInput(i).tapScriptSig || [];
+    const b = otherTx.getInput(i).tapScriptSig || [];
+    const seen = new Set(a.map(([k]) => `${hex.encode(k.pubKey)}:${hex.encode(k.leafHash)}`));
+    const merged = [...a];
+    for (const entry of b) {
+      const id = `${hex.encode(entry[0].pubKey)}:${hex.encode(entry[0].leafHash)}`;
+      if (!seen.has(id)) {
+        merged.push(entry);
+        seen.add(id);
+      }
+    }
+    if (merged.length) out.updateInput(i, { tapScriptSig: merged });
+  }
+  return out;
+}
+
 export function getLpUrl() {
   return localStorage.getItem(LS_LP_URL) || "http://127.0.0.1:3456";
 }
 
 export function setLpUrl(url) {
   localStorage.setItem(LS_LP_URL, url.trim().replace(/\/+$/, ""));
+}
+
+export function getNostrRelays() {
+  const raw = localStorage.getItem(LS_RELAYS);
+  if (!raw) return [...DEFAULT_RELAYS];
+  const parsed = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.startsWith("wss://") || s.startsWith("ws://"));
+  return parsed.length > 0 ? parsed : [...DEFAULT_RELAYS];
+}
+
+export function setNostrRelays(relaysOrStr) {
+  const list = Array.isArray(relaysOrStr)
+    ? relaysOrStr
+    : String(relaysOrStr || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.startsWith("wss://") || s.startsWith("ws://"));
+  if (list.length === 0) throw new Error("Provide at least one wss:// relay URL");
+  localStorage.setItem(LS_RELAYS, list.join(","));
+  return list;
+}
+
+export function getWatchtowerPubkey() {
+  const stored = localStorage.getItem(LS_WT_PUBKEY);
+  if (stored === null) return DEFAULT_WATCHTOWER_PUBKEY;
+  return stored;
+}
+
+export function setWatchtowerPubkey(val) {
+  const cleaned = String(val || "").trim();
+  if (!cleaned) {
+    localStorage.setItem(LS_WT_PUBKEY, "");
+    return "";
+  }
+  if (!/^[0-9a-fA-F]{64}$/.test(cleaned)) {
+    throw new Error("Watchtower pubkey must be 64-char hex x-only pubkey");
+  }
+  const lower = cleaned.toLowerCase();
+  localStorage.setItem(LS_WT_PUBKEY, lower);
+  return lower;
+}
+
+export function getQuorumPreset() {
+  return localStorage.getItem(LS_QUORUM_PRESET) || "3-of-5";
+}
+
+export function setQuorumPreset(preset) {
+  const valid = ["2-of-3", "3-of-5", "4-of-7"];
+  const chosen = valid.includes(preset) ? preset : "3-of-5";
+  localStorage.setItem(LS_QUORUM_PRESET, chosen);
+  return chosen;
+}
+
+export function getCustomNostracles() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(LS_CUSTOM_NOSTRACLES) || "[]");
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+export function addCustomNostracle(npubOrHex, name = "") {
+  const raw = String(npubOrHex || "").trim();
+  if (!raw) throw new Error("Enter a Nostracle npub1… or 64-char hex pubkey");
+  let pubHex = "";
+  if (raw.toLowerCase().startsWith("npub1")) {
+    const dec = bech32.decode(raw.toLowerCase());
+    if (dec.prefix !== "npub") throw new Error("Expected npub1… prefix");
+    const bytes = new Uint8Array(bech32.fromWords(dec.words));
+    if (bytes.length !== 32) throw new Error("Invalid npub length");
+    pubHex = hex.encode(bytes);
+  } else if (/^[0-9a-fA-F]{64}$/.test(raw)) {
+    pubHex = raw.toLowerCase();
+  } else {
+    throw new Error("Invalid Nostracle key (expected npub1… or 64-char hex)");
+  }
+  const npub = bech32.encode("npub", bech32.toWords(hex.decode(pubHex)));
+  const list = getCustomNostracles().filter((o) => o.pubkey !== pubHex);
+  const entry = {
+    name: String(name || "").trim() || `Custom-${pubHex.slice(0, 6)}`,
+    pubkey: pubHex,
+    npub,
+    custom: true,
+  };
+  list.unshift(entry);
+  localStorage.setItem(LS_CUSTOM_NOSTRACLES, JSON.stringify(list));
+  return entry;
+}
+
+export function removeCustomNostracle(pubHex) {
+  const target = String(pubHex || "").trim().toLowerCase();
+  const next = getCustomNostracles().filter((o) => o.pubkey !== target);
+  localStorage.setItem(LS_CUSTOM_NOSTRACLES, JSON.stringify(next));
+  return next;
 }
 
 export function loadPositions() {
@@ -149,10 +337,11 @@ export function savePositions(map) {
   localStorage.setItem(LS_POSITIONS, JSON.stringify(map));
 }
 
-export function getOrCreatePrivKeyHex() {
+export function getOrCreatePrivKeyHex(nostrAccount = null) {
   let k = localStorage.getItem(LS_KEY);
   if (!k) {
-    k = randomEvenKeyHex();
+    const acct = nostrAccount || getOrCreateNostrAccount();
+    k = deriveArkadePrivKeyHexFromNsec(acct.privHex);
     localStorage.setItem(LS_KEY, k);
   }
   return k;
@@ -162,6 +351,17 @@ export function importPrivKeyHex(privHex) {
   const normalized = keyFromHex(privHex).privHex;
   localStorage.setItem(LS_KEY, normalized);
   return normalized;
+}
+
+/**
+ * Restore the entire wallet (both Nostr identity and derived Arkade spending key)
+ * from a single `nsec1...` (or 64-char hex) backup string.
+ */
+export function restoreFromBackupKey(nsecOrHex) {
+  const nostrAccount = importNostrAccount(nsecOrHex);
+  const derivedArkHex = deriveArkadePrivKeyHexFromNsec(nostrAccount.privHex);
+  localStorage.setItem(LS_KEY, derivedArkHex);
+  return { nostrAccount, arkPrivHex: derivedArkHex };
 }
 
 async function postJson(url, body) {
@@ -177,8 +377,13 @@ async function postJson(url, body) {
 
 export class BrowserP2pFiatWallet {
   static async create() {
-    const privHex = getOrCreatePrivKeyHex();
+    const nostrKey = getOrCreateNostrAccount();
+    const privHex = getOrCreatePrivKeyHex(nostrKey);
+    const derivedArkHex = deriveArkadePrivKeyHexFromNsec(nostrKey.privHex);
+    const isLegacySeparateKey = privHex.toLowerCase() !== derivedArkHex.toLowerCase();
     const userKey = keyFromHex(privHex);
+    const vaultKey = keyFromHex(deriveVaultPrivKeyHexFromNsec(nostrKey.privHex));
+    const vaultPayment = btc.p2tr(vaultKey.pubXOnly, undefined, btc.TEST_NETWORK);
     const arkProvider = new RestArkProvider(ARK_URL);
     const indexerProvider = new RestIndexerProvider(ARK_URL);
     const onchainProvider = new EsploraProvider(ESPLORA_URL);
@@ -200,6 +405,10 @@ export class BrowserP2pFiatWallet {
     });
     return new BrowserP2pFiatWallet({
       userKey,
+      vaultKey,
+      vaultPayment,
+      nostrKey,
+      isLegacySeparateKey,
       wallet,
       arkProvider,
       indexerProvider,
@@ -218,7 +427,105 @@ export class BrowserP2pFiatWallet {
     return {
       arkAddress: await this.wallet.getAddress(),
       boardingAddress: await this.wallet.getBoardingAddress(),
+      vaultAddress: this.vaultPayment.address,
     };
+  }
+
+  async getVaultBalance() {
+    const address = this.vaultPayment.address;
+    try {
+      const r = await fetch(`${ESPLORA_URL}/address/${address}/utxo`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const utxos = await r.json();
+      let confirmed = 0;
+      let unconfirmed = 0;
+      for (const u of utxos) {
+        const val = Number(u.value || 0);
+        if (u.status?.confirmed) confirmed += val;
+        else unconfirmed += val;
+      }
+      return { address, confirmed, unconfirmed, total: confirmed + unconfirmed, utxos };
+    } catch {
+      return { address, confirmed: 0, unconfirmed: 0, total: 0, utxos: [] };
+    }
+  }
+
+  /**
+   * Spend directly from the single-key P2TR Bitcoin L1 Vault (0 timelock, no Arkade server needed).
+   * Pass `amountSats = null` (or `'max'`) to sweep the full vault balance minus fee.
+   */
+  async sendFromVault(destAddress, amountSats = null, feeRateSatVb = 2) {
+    const vb = await this.getVaultBalance();
+    const utxos = (vb.utxos || []).slice().sort((a, b) => Number(b.value) - Number(a.value));
+    if (utxos.length === 0) throw new Error("Bitcoin Vault (L1) is empty");
+
+    const DUST = 546;
+    const isMax = amountSats === null || amountSats === "max";
+    const target = isMax ? 0 : Math.floor(Number(amountSats));
+    if (!isMax && (!Number.isFinite(target) || target < DUST)) {
+      throw new Error(`Amount must be at least ${DUST} sats`);
+    }
+
+    const selected = [];
+    let totalIn = 0;
+    let fee = 0;
+    for (const u of utxos) {
+      selected.push(u);
+      totalIn += Number(u.value);
+      const estVbytes = Math.ceil(11 + selected.length * 58 + (isMax ? 43 : 86));
+      fee = Math.max(200, estVbytes * feeRateSatVb);
+      if (!isMax && totalIn >= target + fee) break;
+    }
+
+    const sendAmt = isMax ? totalIn - fee : target;
+    if (sendAmt < DUST) {
+      throw new Error(`Vault balance (${totalIn} sats) too small after ~${fee} sat L1 fee`);
+    }
+    if (!isMax && totalIn < target + fee) {
+      throw new Error(`Insufficient Vault balance (${totalIn} sats < ${target + fee} sats incl. fee)`);
+    }
+
+    const tx = new btc.Transaction();
+    for (const u of selected) {
+      tx.addInput({
+        txid: u.txid,
+        index: Number(u.vout),
+        witnessUtxo: {
+          script: this.vaultPayment.script,
+          amount: BigInt(u.value),
+        },
+        tapInternalKey: this.vaultKey.pubXOnly,
+      });
+    }
+    tx.addOutputAddress(destAddress.trim(), BigInt(sendAmt), btc.TEST_NETWORK);
+    const change = totalIn - sendAmt - fee;
+    if (!isMax && change >= DUST) {
+      tx.addOutputAddress(this.vaultPayment.address, BigInt(change), btc.TEST_NETWORK);
+    }
+
+    tx.sign(hex.decode(this.vaultKey.privHex));
+    tx.finalize();
+    const rawHex = hex.encode(tx.extract());
+
+    const res = await fetch(`${ESPLORA_URL}/tx`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: rawHex,
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`Broadcast failed: ${text || res.status}`);
+    return { txid: text.trim(), amountSats: sendAmt, feeSats: fee };
+  }
+
+  /** Move a chosen amount (or 'max') from Bitcoin L1 Vault into Arkade Spending (auto-onboards after 1 conf). */
+  async moveVaultToArkade(amountSats = null) {
+    const boardingAddr = await this.wallet.getBoardingAddress();
+    return this.sendFromVault(boardingAddr, amountSats);
+  }
+
+  /** Move a chosen amount from Arkade Spending into the pure L1 Bitcoin Vault (0 timelock). */
+  async moveArkadeToVault(amountSats, onEvent) {
+    return this.offboardToL1(this.vaultPayment.address, amountSats, onEvent);
   }
 
   async getBalance() {
@@ -229,18 +536,504 @@ export class BrowserP2pFiatWallet {
     return new Ramps(this.wallet).onboard(this.info.fees, undefined, undefined, onEvent);
   }
 
-  async fetchLpHealth() {
-    const r = await fetch(`${getLpUrl()}/health`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json();
+  /** Instant offchain Arkade payment to a `tark1...` / `ark1...` address. */
+  async sendArk(address, amountSats) {
+    const sats = Math.floor(Number(amountSats));
+    if (!Number.isFinite(sats) || sats <= 0) throw new Error("Amount must be > 0 sats");
+    return this.wallet.send({ address: address.trim(), amount: sats });
   }
 
-  async requestQuote(notionalUsd) {
-    return postJson(`${getLpUrl()}/quote`, { notionalUsd });
+  /** Collaborative offboard from Arkade to a Mutinynet L1 `tb1...` address. */
+  async offboardToL1(destinationAddress, amountSats, onEvent) {
+    const sats = BigInt(Math.floor(Number(amountSats)));
+    if (sats <= 0n) throw new Error("Amount must be > 0 sats");
+    return new Ramps(this.wallet).offboard(
+      destinationAddress.trim(),
+      this.info.fees,
+      sats,
+      onEvent
+    );
   }
 
-  async openPosition(notionalUsd) {
-    const q = await this.requestQuote(notionalUsd);
+  async getTransactionHistory() {
+    try {
+      return (await this.wallet.getTransactionHistory()) || [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Lazily initialize Boltz Lightning swaps (VHTLC directly on Arkade). */
+  async getSwaps(onSwapCompleted) {
+    if (!this._swapsPromise) {
+      this._swapsPromise = ArkadeSwaps.create({ wallet: this.wallet })
+        .then((swaps) => {
+          this.swaps = swaps;
+          const mgr = swaps.getSwapManager?.();
+          if (mgr && onSwapCompleted) {
+            mgr.onSwapCompleted((swap) => onSwapCompleted(swap));
+          }
+          return swaps;
+        })
+        .catch((err) => {
+          this._swapsPromise = null;
+          throw err;
+        });
+    }
+    return this._swapsPromise;
+  }
+
+  async getLightningInfo() {
+    try {
+      const swaps = await this.getSwaps();
+      const [fees, limits] = await Promise.all([swaps.getFees(), swaps.getLimits()]);
+      return { available: true, fees, limits };
+    } catch (err) {
+      return { available: false, error: err?.message || "Boltz swap service unavailable" };
+    }
+  }
+
+  decodeLightningInvoice(invoice) {
+    const clean = String(invoice || "").trim().replace(/^lightning:/i, "");
+    const decoded = decodeInvoice(clean);
+    const amountSats = getInvoiceSatoshis(clean);
+    return { clean, decoded, amountSats };
+  }
+
+  /** Create a BOLT11 Lightning invoice that auto-claims directly into Arkade Available BTC. */
+  async createLightningInvoice(amountSats, description = "p2pFiat wallet deposit") {
+    const sats = Math.floor(Number(amountSats));
+    if (!Number.isFinite(sats) || sats <= 0) throw new Error("Amount must be > 0 sats");
+    const swaps = await this.getSwaps();
+    return swaps.createLightningInvoice({ amount: sats, description });
+  }
+
+  /** Pay a BOLT11 Lightning invoice directly from Arkade Available BTC via Boltz VHTLC. */
+  async payLightningInvoice(invoice) {
+    const clean = String(invoice || "").trim().replace(/^lightning:/i, "");
+    if (!clean) throw new Error("Empty Lightning invoice");
+    const swaps = await this.getSwaps();
+    return swaps.sendLightningPayment({ invoice: clean });
+  }
+
+  async verifyOrderBook(orderBook, opts = {}) {
+    return orderBook.verifyOffersOnArkade({
+      indexerProvider: this.indexerProvider,
+      serverXOnly: this.serverXOnly,
+      exitDelaySecs: this.exitDelaySecs,
+      DefaultVtxo,
+      ...opts,
+    });
+  }
+
+  setNostrAccount(nostrKey) {
+    this.nostrKey = nostrKey;
+    this.nip17Peer?.close();
+    this.nip17Peer = null;
+  }
+
+  getNip17Peer() {
+    const relays = getNostrRelays();
+    if (
+      !this.nip17Peer ||
+      this.nip17Peer.relays.join(",") !== relays.join(",") ||
+      this.nip17Peer.myKey?.pubHex !== this.nostrKey?.pubHex
+    ) {
+      this.nip17Peer?.close();
+      this.nip17Peer = new Nip17Peer(this.nostrKey, relays, {
+        onRequest: (method, params, senderPubkey) =>
+          this._handleP2pMakerRpc(method, params, senderPubkey),
+      });
+    }
+    return this.nip17Peer;
+  }
+
+  /**
+   * Publish a live P2P Maker Order (`kind: 38384`) from this browser wallet and
+   * listen over NIP-17 for a peer Taker to match it directly (0% LP spread).
+   */
+  async postP2pOrder({
+    side = "short",
+    currency = "USD",
+    notional = 5,
+    spotPrice = 60000,
+    fundingRateBpsPerDay = 3,
+    termSecs = 86_400,
+    expirySecs = 900,
+    displayName = "",
+    onOrderFilled = null,
+  }) {
+    const cur = String(currency || "USD").toUpperCase();
+    const pair = `BTC-${cur}`;
+    const makerSide = side === "long" ? "long" : "short";
+    const requiredSats = Math.max(1_000, Math.round((Number(notional) / Number(spotPrice)) * 1e8));
+    const vtxos = await this.wallet.getVtxos();
+    const spendable = vtxos.filter((v) => Number(v.value) >= requiredSats);
+    const totalAvail = vtxos.reduce((s, v) => s + Number(v.value || 0), 0);
+    if (spendable.length === 0) {
+      throw new Error(`Need a spendable Arkade VTXO >= ${requiredSats.toLocaleString()} sats to post this order`);
+    }
+
+    const quorum = buildQuorumForPreset(getQuorumPreset());
+    const lpName = displayName ? `${displayName} (P2P)` : "P2P Peer";
+    const event = buildP2pOrderEvent(this.nostrKey, {
+      pair,
+      currency: cur,
+      makerSide,
+      notional: Number(notional),
+      spotPrice: Number(spotPrice),
+      fundingRateBpsPerDay: Number(fundingRateBpsPerDay),
+      availableLiquiditySats: totalAvail,
+      arkPubkey: this.userKey.pubHex,
+      lpName,
+      termSecs: Number(termSecs || 86_400),
+      expirySecs,
+      oracleQuorum: quorum,
+    });
+
+    const peer = this.getNip17Peer();
+    await peer.connect();
+    const pub = await publishOfferEvent(event, getNostrRelays());
+    if (pub.accepted === 0) {
+      throw new Error("No Nostr relay accepted the P2P order event");
+    }
+
+    this._p2pQuotes = new Map();
+    this._p2pPendingOpens = new Map();
+    this.activeP2pOrder = {
+      pair,
+      currency: cur,
+      makerSide,
+      takerSide: makerSide === "long" ? "short" : "long",
+      notional: Number(notional),
+      spotPrice: Number(spotPrice),
+      makerFundingBps: Number(fundingRateBpsPerDay),
+      takerFundingBps: -Number(fundingRateBpsPerDay),
+      termSecs: Number(termSecs || 86_400),
+      lpName,
+      oracleQuorum: quorum,
+      expiresAt: Math.floor(Date.now() / 1000) + Number(expirySecs),
+      eventId: event.id,
+      onOrderFilled,
+    };
+    return { order: this.activeP2pOrder, event, ...pub };
+  }
+
+  async cancelP2pOrder() {
+    const ord = this.activeP2pOrder;
+    this.activeP2pOrder = null;
+    this._p2pQuotes?.clear();
+    this._p2pPendingOpens?.clear();
+    if (!ord) return null;
+    const cancelEv = buildP2pOrderEvent(this.nostrKey, {
+      pair: ord.pair,
+      currency: ord.currency,
+      makerSide: ord.makerSide,
+      notional: ord.notional,
+      spotPrice: ord.spotPrice,
+      fundingRateBpsPerDay: ord.makerFundingBps,
+      availableLiquiditySats: 0,
+      arkPubkey: this.userKey.pubHex,
+      lpName: ord.lpName,
+      cancel: true,
+    });
+    const res = await publishOfferEvent(cancelEv, getNostrRelays());
+    return { event: cancelEv, ...res };
+  }
+
+  async _handleP2pMakerRpc(method, params = {}, senderPubkey = "") {
+    const ord = this.activeP2pOrder;
+    if (!ord || Math.floor(Date.now() / 1000) > ord.expiresAt) {
+      throw new Error("No active P2P order");
+    }
+
+    if (method === "health") {
+      const bal = await this.getBalance();
+      return {
+        ok: true,
+        lpName: ord.lpName,
+        makerType: "p2p",
+        pairs: [ord.pair],
+        spreadBps: 0,
+        fundingRateBpsPerDay: ord.takerFundingBps,
+        oracleQuorum: ord.oracleQuorum,
+        spotUsd: ord.currency === "USD" ? ord.spotPrice : undefined,
+        spotEur: ord.currency === "EUR" ? ord.spotPrice : undefined,
+        arkBalance: { available: bal.available || 0 },
+      };
+    }
+
+    if (method === "quote") {
+      const reqSide = String(params.side || ord.takerSide).toLowerCase() === "long" ? "long" : "short";
+      if (reqSide !== ord.takerSide) {
+        throw new Error(`This P2P order matches ${ord.takerSide === "long" ? "2x Long BTC" : `Stable ${ord.currency}`} only`);
+      }
+      const notional = ord.notional;
+      const collatSats = Math.max(1_000, Math.round((notional / ord.spotPrice) * 1e8));
+      const quoteId = `p2pq-${hex.encode(crypto.getRandomValues(new Uint8Array(6)))}`;
+      const quote = {
+        quoteId,
+        lpName: ord.lpName,
+        makerType: "p2p",
+        side: ord.takerSide,
+        leverage: ord.takerSide === "long" ? 2 : 1,
+        liquidationPrice: ord.takerSide === "long" ? Math.round(ord.spotPrice * 0.5) : 0,
+        currency: ord.currency,
+        pair: ord.pair,
+        notional,
+        notionalUsd: notional,
+        spotPrice: ord.spotPrice,
+        spotUsd: ord.spotPrice,
+        effectiveSpotUsd: ord.spotPrice,
+        spreadBps: 0,
+        termSecs: ord.termSecs || 86_400,
+        fundingRateBpsPerDay: ord.takerFundingBps,
+        userCollateralSats: collatSats,
+        lpCollateralSats: collatSats,
+        totalCollateralSats: collatSats * 2,
+        lpPubkey: this.nostrKey.pubHex,
+        oracleQuorum: ord.oracleQuorum,
+        expiresAt: Math.min(ord.expiresAt, Math.floor(Date.now() / 1000) + 120),
+      };
+      this._p2pQuotes.set(quoteId, quote);
+      return quote;
+    }
+
+    if (method === "open/propose") {
+      const quote = this._p2pQuotes.get(params.quoteId);
+      if (!quote) throw new Error("Unknown or expired P2P quoteId");
+      if (Math.floor(Date.now() / 1000) > quote.expiresAt) throw new Error("P2P quote expired");
+
+      const takerPubXOnly = hex.decode(params.userPubHex);
+      const settleClosure = MultisigTapscript.encode({
+        pubkeys: [takerPubXOnly, this.userKey.pubXOnly, this.serverXOnly],
+      });
+      const exitClosure = CSVMultisigTapscript.encode({
+        timelock: { type: "seconds", value: BigInt(this.exitDelaySecs) },
+        pubkeys: [takerPubXOnly, this.userKey.pubXOnly],
+      });
+      const contractScript = new VtxoScript([settleClosure.script, exitClosure.script]);
+
+      const myVtxos = await this.wallet.getVtxos();
+      const myVtxo = myVtxos
+        .filter((v) => Number(v.value) >= quote.lpCollateralSats)
+        .sort((a, b) => Number(b.value) - Number(a.value))[0];
+      if (!myVtxo) throw new Error("Maker lacks sufficient spendable Arkade VTXO");
+
+      const takerVtxoScript = VtxoScript.decode(hex.decode(params.userInput.tapTreeHex));
+      const takerTapLeaf = takerVtxoScript.findLeaf(params.userInput.leafScriptHex);
+      const takerArkInput = {
+        txid: params.userInput.txid,
+        vout: Number(params.userInput.vout),
+        value: Number(params.userInput.value),
+        tapLeafScript: takerTapLeaf,
+        tapTree: takerVtxoScript.encode(),
+      };
+      const myDefaultLeaf = this.userArkScript.forfeit();
+      const myDefaultLeafScript = myDefaultLeaf[1].slice(0, -1);
+      const myDefaultLeafHash = tapLeafHash(myDefaultLeafScript);
+      const makerArkInput = {
+        txid: myVtxo.txid,
+        vout: myVtxo.vout,
+        value: Number(myVtxo.value),
+        tapLeafScript: myDefaultLeaf,
+        tapTree: this.userArkScript.encode(),
+      };
+
+      const DUST = 330n;
+      const outputs = [{ script: contractScript.pkScript, amount: BigInt(quote.totalCollateralSats) }];
+      const takerChange = BigInt(takerArkInput.value) - BigInt(quote.userCollateralSats);
+      if (takerChange < 0n) throw new Error("Taker input smaller than collateral");
+      if (takerChange >= DUST) {
+        outputs.push({ script: hex.decode(params.userChangeScriptHex), amount: takerChange });
+      }
+      const makerChange = BigInt(makerArkInput.value) - BigInt(quote.lpCollateralSats);
+      if (makerChange >= DUST) {
+        outputs.push({ script: this.userArkScript.pkScript, amount: makerChange });
+      }
+
+      const checkpointTapscript = CSVMultisigTapscript.decode(hex.decode(this.info.checkpointTapscript));
+      const { arkTx, checkpoints } = buildOffchainTx([takerArkInput, makerArkInput], outputs, checkpointTapscript);
+      const [takerCk, makerCk] = checkpoints;
+
+      const prevScripts = [takerCk.getOutput(0).script, makerCk.getOutput(0).script];
+      const prevAmounts = [takerCk.getOutput(0).amount, makerCk.getOutput(0).amount];
+      const makerArkHash = tapscriptSighash(arkTx, 1, prevScripts, prevAmounts, myDefaultLeafScript);
+      const makerCkHash = tapscriptSighash(
+        makerCk,
+        0,
+        [this.userArkScript.pkScript],
+        [BigInt(makerArkInput.value)],
+        myDefaultLeafScript
+      );
+
+      attachTapscriptSig(arkTx, 1, this.userKey.pubXOnly, myDefaultLeafHash, schnorrSign(this.userKey, makerArkHash));
+      const makerCkUnsignedB64 = base64.encode(makerCk.toPSBT());
+      const makerCkSigned = Transaction.fromPSBT(base64.decode(makerCkUnsignedB64));
+      attachTapscriptSig(makerCkSigned, 0, this.userKey.pubXOnly, myDefaultLeafHash, schnorrSign(this.userKey, makerCkHash));
+
+      const positionId = `p2p-${hex.encode(crypto.getRandomValues(new Uint8Array(6)))}`;
+      const takerCkUnsignedB64 = base64.encode(takerCk.toPSBT());
+      this._p2pPendingOpens.set(positionId, {
+        quote,
+        ord,
+        senderPubkey,
+        takerPubHex: params.userPubHex,
+        contractPkScriptHex: hex.encode(contractScript.pkScript),
+        contractTapTreeHex: hex.encode(contractScript.encode()),
+        settleScriptHex: hex.encode(settleClosure.script),
+        exitScriptHex: hex.encode(exitClosure.script),
+        takerCkUnsignedB64,
+        makerCkUnsignedB64,
+        makerCkSignedB64: base64.encode(makerCkSigned.toPSBT()),
+      });
+
+      return {
+        positionId,
+        quote,
+        contractPkScriptHex: hex.encode(contractScript.pkScript),
+        contractTapTreeHex: hex.encode(contractScript.encode()),
+        settleScriptHex: hex.encode(settleClosure.script),
+        exitScriptHex: hex.encode(exitClosure.script),
+        arkTxB64: base64.encode(arkTx.toPSBT()),
+        userCkB64: takerCkUnsignedB64,
+        exitSuite: null,
+      };
+    }
+
+    if (method === "open/finalize") {
+      const pend = this._p2pPendingOpens.get(params.positionId);
+      if (!pend) throw new Error("Unknown pending P2P open");
+
+      const sub = await this.arkProvider.submitTx(params.signedArkTxB64, [
+        pend.takerCkUnsignedB64,
+        pend.makerCkUnsignedB64,
+      ]);
+      const finalCk0 = combineTapscriptSigs(
+        Transaction.fromPSBT(base64.decode(params.signedUserCkB64)),
+        Transaction.fromPSBT(base64.decode(sub.signedCheckpointTxs[0]))
+      );
+      const finalCk1 = combineTapscriptSigs(
+        Transaction.fromPSBT(base64.decode(pend.makerCkSignedB64)),
+        Transaction.fromPSBT(base64.decode(sub.signedCheckpointTxs[1]))
+      );
+      await this.arkProvider.finalizeTx(sub.arkTxid, [
+        base64.encode(finalCk0.toPSBT()),
+        base64.encode(finalCk1.toPSBT()),
+      ]);
+
+      this._p2pPendingOpens.delete(params.positionId);
+      const nowSecs = Math.floor(Date.now() / 1000);
+      const takerPos = {
+        positionId: params.positionId,
+        status: "open",
+        side: pend.quote.side,
+        leverage: pend.quote.leverage,
+        liquidationPrice: pend.quote.liquidationPrice,
+        currency: pend.quote.currency,
+        pair: pend.quote.pair,
+        openedAt: nowSecs,
+        vtxoTxid: sub.arkTxid,
+        vtxoVout: 0,
+        notional: pend.quote.notional,
+        notionalUsd: pend.quote.notional,
+        openSpotPrice: pend.quote.spotPrice,
+        openSpotUsd: pend.quote.spotPrice,
+        spreadBps: 0,
+        fundingRateBpsPerDay: pend.quote.fundingRateBpsPerDay,
+        oracleQuorum: pend.quote.oracleQuorum,
+        userCollateralSats: pend.quote.userCollateralSats,
+        lpCollateralSats: pend.quote.lpCollateralSats,
+        totalCollateralSats: pend.quote.totalCollateralSats,
+        userPubHex: pend.takerPubHex,
+        lpPubHex: this.userKey.pubHex,
+        contractPkScriptHex: pend.contractPkScriptHex,
+        contractTapTreeHex: pend.contractTapTreeHex,
+        settleScriptHex: pend.settleScriptHex,
+        exitScriptHex: pend.exitScriptHex,
+        exitDelaySecs: Number(this.exitDelaySecs),
+      };
+
+      // Save Maker's mirror position locally
+      const makerPos = {
+        ...takerPos,
+        side: pend.ord.makerSide,
+        leverage: pend.ord.makerSide === "long" ? 2 : 1,
+        liquidationPrice: pend.ord.makerSide === "long" ? Math.round(pend.quote.spotPrice * 0.5) : 0,
+        fundingRateBpsPerDay: pend.ord.makerFundingBps,
+        lpName: "P2P Match",
+        lpPubkey: pend.senderPubkey,
+        lpUrl: "",
+        lpTransport: "nostr-nip17",
+      };
+      const map = loadPositions();
+      map[makerPos.positionId] = makerPos;
+      savePositions(map);
+
+      const cb = pend.ord.onOrderFilled;
+      await this.cancelP2pOrder().catch(() => {});
+      cb?.(makerPos);
+      return takerPos;
+    }
+
+    throw new Error(`Unsupported P2P method: ${method}`);
+  }
+
+  _normalizeTarget(targetOrUrl) {
+    if (typeof targetOrUrl === "string") {
+      return { url: targetOrUrl, pubkey: null, preferNip17: false };
+    }
+    if (targetOrUrl && typeof targetOrUrl === "object") {
+      return {
+        url: targetOrUrl.url || "",
+        pubkey: targetOrUrl.pubkey || null,
+        preferNip17: Boolean(targetOrUrl.preferNip17),
+        lpName: targetOrUrl.lpName || "",
+      };
+    }
+    return { url: getLpUrl(), pubkey: null, preferNip17: false };
+  }
+
+  async callLp(targetOrUrl, method, params = {}) {
+    const t = this._normalizeTarget(targetOrUrl);
+    const useNip17First = t.preferNip17 || (!t.url && Boolean(t.pubkey));
+    if (useNip17First) {
+      if (!t.pubkey) throw new Error("Missing LP pubkey for NIP-17 P2P transport");
+      return this.getNip17Peer().request(t.pubkey, method, params);
+    }
+    try {
+      if (method === "health" || method === "offer" || method === "positions") {
+        const r = await fetch(`${t.url}/${method}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return await r.json();
+      }
+      return await postJson(`${t.url}/${method}`, params);
+    } catch (httpErr) {
+      if (t.pubkey) {
+        return this.getNip17Peer().request(t.pubkey, method, params);
+      }
+      throw httpErr;
+    }
+  }
+
+  async fetchLpHealth(target = getLpUrl()) {
+    return this.callLp(target, "health");
+  }
+
+  async requestQuote(notional, target = getLpUrl(), currency = "USD", side = "short") {
+    return this.callLp(target, "quote", {
+      currency: String(currency || "USD").toUpperCase(),
+      side: side === "long" ? "long" : "short",
+      notional,
+      notionalUsd: notional,
+    });
+  }
+
+  async openPosition(notional, target = getLpUrl(), lpName = "", currency = "USD", side = "short") {
+    const cur = String(currency || "USD").toUpperCase();
+    const posSide = side === "long" ? "long" : "short";
+    const t = this._normalizeTarget(target);
+    const q = await this.requestQuote(notional, t, cur, posSide);
     const vtxos = await this.wallet.getVtxos();
     const userVtxo = vtxos
       .filter((v) => Number(v.value) >= q.userCollateralSats)
@@ -253,9 +1046,10 @@ export class BrowserP2pFiatWallet {
     const defaultLeafScript = defaultLeaf[1].slice(0, -1);
     const defaultLeafHash = tapLeafHash(defaultLeafScript);
 
-    const prop = await postJson(`${getLpUrl()}/open/propose`, {
+    const prop = await this.callLp(t, "open/propose", {
       quoteId: q.quoteId,
       userPubHex: this.userKey.pubHex,
+      watchtowerPubHex: getWatchtowerPubkey() || undefined,
       userInput: {
         txid: userVtxo.txid,
         vout: userVtxo.vout,
@@ -287,24 +1081,164 @@ export class BrowserP2pFiatWallet {
     attachTapscriptSig(arkTx, 0, this.userKey.pubXOnly, defaultLeafHash, schnorrSign(this.userKey, arkHash));
     attachTapscriptSig(userCk, 0, this.userKey.pubXOnly, defaultLeafHash, schnorrSign(this.userKey, ckHash));
 
-    const pos = await postJson(`${getLpUrl()}/open/finalize`, {
+    const pos = await this.callLp(t, "open/finalize", {
       positionId: prop.positionId,
       signedArkTxB64: base64.encode(arkTx.toPSBT()),
       signedUserCkB64: base64.encode(userCk.toPSBT()),
     });
+    pos.lpUrl = t.url || "";
+    pos.lpPubkey = t.pubkey || q.lpPubkey || pos.lpPubHex || null;
+    pos.lpName = lpName || t.lpName || q.lpName || "LP";
+    pos.lpTransport = !t.url || t.preferNip17 ? "nostr-nip17" : "http";
+
+    // Co-sign pre-built DLC exit payouts (adaptor sigs) + timelocked refund tx locally
+    if (prop.exitSuite) {
+      const contractPkScript = hex.decode(pos.contractPkScriptHex);
+      const exitScript = hex.decode(pos.exitScriptHex);
+      const oraclePubXOnly = hex.decode(prop.exitSuite.oracle_pubkey);
+      const signedPayouts = (prop.exitSuite.payouts || []).map((p) => {
+        const sighash = exitTxSighash(p.tx_hex, contractPkScript, pos.totalCollateralSats, exitScript);
+        const pointT =
+          prop.exitSuite.usesRealKind88Nonces && prop.exitSuite.announcementNoncesHex?.length
+            ? computeKormirOutcomePoint(oraclePubXOnly, prop.exitSuite.announcementNoncesHex, p.outcome)
+            : deriveOutcomeAdaptorPoint(oraclePubXOnly, prop.exitSuite.oracle_event_id, p.outcome).point;
+        return {
+          ...p,
+          user_adaptor_sig: hex.encode(adaptorSign(this.userKey, sighash, pointT)),
+        };
+      });
+      let signedRefund = prop.exitSuite.refund;
+      if (signedRefund) {
+        const refHash = exitTxSighash(
+          signedRefund.tx_hex,
+          contractPkScript,
+          pos.totalCollateralSats,
+          exitScript
+        );
+        signedRefund = {
+          ...signedRefund,
+          user_sig: hex.encode(schnorrSign(this.userKey, refHash)),
+        };
+      }
+      pos.exitSuite = {
+        ...prop.exitSuite,
+        payouts: signedPayouts,
+        refund: signedRefund,
+      };
+    }
 
     const map = loadPositions();
     map[pos.positionId] = pos;
     savePositions(map);
+
+    // Automatically register keyless Watchtower package via NIP-17 if configured in Settings
+    const wtPub = getWatchtowerPubkey();
+    if (wtPub) {
+      try {
+        await this.registerWithWatchtower(pos.positionId, wtPub);
+        pos.watchtowerRegistered = true;
+        pos.watchtowerPubkey = wtPub;
+        map[pos.positionId] = pos;
+        savePositions(map);
+      } catch {
+        pos.watchtowerRegistered = false;
+      }
+    }
     return pos;
+  }
+
+  async rollPosition(positionId) {
+    const map = loadPositions();
+    const pos = map[positionId];
+    if (!pos) throw new Error("Unknown position");
+    const target = {
+      url: pos.lpUrl || (pos.lpTransport === "nostr-nip17" ? "" : getLpUrl()),
+      pubkey: pos.lpPubkey || pos.lpPubHex || null,
+      preferNip17: pos.lpTransport === "nostr-nip17",
+    };
+
+    const prop = await this.callLp(target, "roll/propose", {
+      positionId,
+      watchtowerPubHex: getWatchtowerPubkey() || undefined,
+    });
+    const arkTx = Transaction.fromPSBT(base64.decode(prop.arkTxB64));
+    const ck = Transaction.fromPSBT(base64.decode(prop.ckB64));
+    const settleScript = hex.decode(pos.settleScriptHex);
+    const settleLeafHash = tapLeafHash(settleScript);
+    const contractPkScript = hex.decode(pos.contractPkScriptHex);
+
+    if (
+      hex.encode(arkTx.getOutput(0).script) !== pos.contractPkScriptHex ||
+      arkTx.getOutput(0).amount !== BigInt(prop.newTotalCollateralSats)
+    ) {
+      throw new Error("LP roll proposal output 0 mismatch! Refusing to sign.");
+    }
+
+    const ckHash = tapscriptSighash(ck, 0, [contractPkScript], [BigInt(pos.totalCollateralSats)], settleScript);
+    const arkHash = tapscriptSighash(arkTx, 0, [ck.getOutput(0).script], [ck.getOutput(0).amount], settleScript);
+    attachTapscriptSig(arkTx, 0, this.userKey.pubXOnly, settleLeafHash, schnorrSign(this.userKey, arkHash));
+    attachTapscriptSig(ck, 0, this.userKey.pubXOnly, settleLeafHash, schnorrSign(this.userKey, ckHash));
+
+    const rolled = await this.callLp(target, "roll/finalize", {
+      positionId,
+      signedArkTxB64: base64.encode(arkTx.toPSBT()),
+      signedCkB64: base64.encode(ck.toPSBT()),
+    });
+    rolled.lpUrl = pos.lpUrl || "";
+    rolled.lpPubkey = target.pubkey;
+    rolled.lpName = pos.lpName || "LP";
+    rolled.lpTransport = pos.lpTransport || "http";
+
+    // Co-sign fresh DLC exit payouts + refund tx for the rolled VTXO
+    if (prop.exitSuite) {
+      const exitScript = hex.decode(rolled.exitScriptHex);
+      const oraclePubXOnly = hex.decode(prop.exitSuite.oracle_pubkey);
+      const signedPayouts = (prop.exitSuite.payouts || []).map((p) => {
+        const sighash = exitTxSighash(p.tx_hex, contractPkScript, rolled.totalCollateralSats, exitScript);
+        const pointT =
+          prop.exitSuite.usesRealKind88Nonces && prop.exitSuite.announcementNoncesHex?.length
+            ? computeKormirOutcomePoint(oraclePubXOnly, prop.exitSuite.announcementNoncesHex, p.outcome)
+            : deriveOutcomeAdaptorPoint(oraclePubXOnly, prop.exitSuite.oracle_event_id, p.outcome).point;
+        return { ...p, user_adaptor_sig: hex.encode(adaptorSign(this.userKey, sighash, pointT)) };
+      });
+      let signedRefund = prop.exitSuite.refund;
+      if (signedRefund) {
+        const refHash = exitTxSighash(signedRefund.tx_hex, contractPkScript, rolled.totalCollateralSats, exitScript);
+        signedRefund = { ...signedRefund, user_sig: hex.encode(schnorrSign(this.userKey, refHash)) };
+      }
+      rolled.exitSuite = { ...prop.exitSuite, payouts: signedPayouts, refund: signedRefund };
+    }
+
+    map[positionId] = rolled;
+    savePositions(map);
+
+    // Automatically update keyless Watchtower package via NIP-17 after roll if configured
+    const wtPub = getWatchtowerPubkey();
+    if (wtPub) {
+      try {
+        await this.registerWithWatchtower(positionId, wtPub);
+        rolled.watchtowerRegistered = true;
+        rolled.watchtowerPubkey = wtPub;
+        map[positionId] = rolled;
+        savePositions(map);
+      } catch {
+        rolled.watchtowerRegistered = false;
+      }
+    }
+    return rolled;
   }
 
   async closePosition(positionId) {
     const map = loadPositions();
     const pos = map[positionId];
     if (!pos) throw new Error("Unknown position");
+    const target = {
+      url: pos.lpUrl || (pos.lpTransport === "nostr-nip17" ? "" : getLpUrl()),
+      pubkey: pos.lpPubkey || pos.lpPubHex || null,
+      preferNip17: pos.lpTransport === "nostr-nip17",
+    };
 
-    const prop = await postJson(`${getLpUrl()}/close/propose`, { positionId });
+    const prop = await this.callLp(target, "close/propose", { positionId });
     const arkTx = Transaction.fromPSBT(base64.decode(prop.arkTxB64));
     const ck = Transaction.fromPSBT(base64.decode(prop.ckB64));
     const settleScript = hex.decode(pos.settleScriptHex);
@@ -320,11 +1254,15 @@ export class BrowserP2pFiatWallet {
     attachTapscriptSig(arkTx, 0, this.userKey.pubXOnly, settleLeafHash, schnorrSign(this.userKey, arkHash));
     attachTapscriptSig(ck, 0, this.userKey.pubXOnly, settleLeafHash, schnorrSign(this.userKey, ckHash));
 
-    const closed = await postJson(`${getLpUrl()}/close/finalize`, {
+    const closed = await this.callLp(target, "close/finalize", {
       positionId,
       signedArkTxB64: base64.encode(arkTx.toPSBT()),
       signedCkB64: base64.encode(ck.toPSBT()),
     });
+    closed.lpUrl = pos.lpUrl || "";
+    closed.lpPubkey = target.pubkey;
+    closed.lpName = pos.lpName || "LP";
+    closed.lpTransport = pos.lpTransport || "http";
     map[positionId] = closed;
     savePositions(map);
     return closed;
@@ -371,17 +1309,59 @@ export class BrowserP2pFiatWallet {
     };
     for (const c of nonCommit) visit(c.txid);
 
+    const suite = pos.exitSuite || {};
     return {
-      positionId,
+      id: positionId,
       vtxo_outpoint: `${pos.vtxoTxid}:${pos.vtxoVout}`,
       vtxo_amount_sats: pos.totalCollateralSats,
       vtxo_pk_script: pos.contractPkScriptHex,
       ark_indexer_url: ARK_URL,
       unroll_txs: ordered.map((id) => rawByTxid.get(id)),
       exit_script: pos.exitScriptHex,
-      exit_csv_seconds: pos.exitDelaySecs,
+      exit_control_block: suite.exit_control_block || "",
       user_pubkey: pos.userPubHex,
       lp_pubkey: pos.lpPubHex,
+      exit_csv: suite.exit_csv ?? 0,
+      exit_csv_seconds: suite.exit_csv_seconds ?? pos.exitDelaySecs,
+      bounty: suite.bounty || null,
+      oracle_pubkey: suite.oracle_pubkey || null,
+      oracle_event_id: suite.oracle_event_id || null,
+      payouts: (suite.payouts || []).map((p) => ({
+        outcome: p.outcome,
+        tx_hex: p.tx_hex,
+        user_adaptor_sig: p.user_adaptor_sig,
+        lp_adaptor_sig: p.lp_adaptor_sig,
+        precompleted: Boolean(p.precompleted),
+      })),
+      refund: suite.refund || null,
+      trigger_height: 0,
     };
+  }
+
+  /**
+   * Send a complete `WatchtowerPackage` directly to an `ark-watchtower` over NIP-17 Gift Wrap.
+   */
+  async registerWithWatchtower(positionId, watchtowerPubHex = getWatchtowerPubkey()) {
+    const pkg = await this.exportWatchtowerPackage(positionId);
+    const targetPub = watchtowerPubHex || pkg.bounty?.primary_pubkey;
+    if (!targetPub) {
+      throw new Error("Configure a Watchtower 64-hex pubkey in Settings first");
+    }
+    const peer = this.getNip17Peer();
+    if (peer.sockets.size === 0) {
+      const ok = await peer.connect();
+      if (ok === 0) throw new Error("Could not connect to Nostr relays for watchtower NIP-17 send");
+    }
+    const wrapId = await peer.sendWrapped(
+      targetPub,
+      JSON.stringify({ type: "register_package", package: pkg })
+    );
+    const map = loadPositions();
+    if (map[positionId]) {
+      map[positionId].watchtowerRegistered = true;
+      map[positionId].watchtowerPubkey = targetPub;
+      savePositions(map);
+    }
+    return { wrapId, targetPub, unrollHops: pkg.unroll_txs.length, payouts: pkg.payouts.length };
   }
 }

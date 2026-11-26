@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0b0f17" />
-    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="manifest" href="./manifest.webmanifest" />
     <title>p2pFiat — Self-Custody USD on Arkade</title>
   </head>
   <body>
@@ -16,102 +16,446 @@
           <span class="badge">Mutinynet</span>
         </div>
         <div class="topbar-right">
+          <div class="cur-toggle" role="group" aria-label="Currency">
+            <button id="cur-usd" class="cur-btn active" data-cur="USD">$ USD</button>
+            <button id="cur-eur" class="cur-btn" data-cur="EUR">€ EUR</button>
+          </div>
           <span id="spot-pill" class="pill">BTC/USD —</span>
+          <button id="nostr-pill" class="pill nostr-pill hidden" title="Profile &amp; Settings"></button>
           <button id="refresh-btn" class="icon-btn" title="Refresh">↻</button>
-          <button id="settings-btn" class="icon-btn" title="Settings & Key Backup">⚙</button>
+          <button id="settings-btn" class="icon-btn" title="Settings &amp; Backup">⚙</button>
         </div>
       </header>
 
       <section class="balance-card">
-        <div class="balance-label">Total Balance (Self-Custody on Arkade)</div>
+        <div class="balance-label">Total Balance (Self-Custody)</div>
         <div id="total-usd" class="balance-main">$0.00</div>
-        <div class="balance-split">
-          <div class="split-item">
-            <span class="muted">Stable USD Peg</span>
-            <strong id="pegged-usd" class="accent-green">$0.00</strong>
+
+        <div class="tier-box tier-stable">
+          <div class="tier-info">
+            <div id="pegged-label" class="tier-label">🛡 Stable USD</div>
+            <span id="accrued-interest-total" class="interest-sub">+$0.00000 yield</span>
           </div>
-          <div class="split-item">
-            <span class="muted">Available BTC</span>
-            <strong id="avail-sats">0 sats</strong>
-          </div>
-          <div class="split-item">
-            <span class="muted">Boarding L1</span>
-            <strong id="boarding-sats">0 sats</strong>
+          <div class="tier-right">
+            <strong id="pegged-usd" class="tier-amount accent-green">$0.00</strong>
+            <div id="pegged-sats" class="muted tier-sub">≈ 0 sats</div>
+            <div class="mini-actions">
+              <button id="stable-recv-toggle" class="arrow-pill">Receive</button>
+              <button id="stable-send-toggle" class="arrow-pill">Send</button>
+            </div>
           </div>
         </div>
-        <div class="action-row">
-          <button id="deposit-toggle" class="btn secondary">Receive / Board</button>
-          <button id="onboard-btn" class="btn secondary" disabled>Onboard L1 → Ark</button>
+
+        <div id="stable-drawer-slot" class="drawer-slot"></div>
+
+        <div class="vault-bridge">
+          <button id="btn-to-fiat" class="arrow-pill vertical" title="Lock BTC into Stable USD/EUR">↑ To USD</button>
+          <button id="btn-to-sats" class="arrow-pill vertical" title="Close position back to BTC sats">↓ To Sats</button>
+        </div>
+
+        <div class="tier-box tier-spending">
+          <div class="tier-info">
+            <div class="tier-label">⚡ Spending BTC</div>
+            <span class="muted tier-sub">Instant · Arkade &amp; Lightning</span>
+          </div>
+          <div class="tier-right">
+            <strong id="avail-sats" class="tier-amount">0 sats</strong>
+            <div id="avail-fiat" class="muted tier-sub">≈ $0.00</div>
+            <div class="mini-actions">
+              <button id="deposit-toggle" class="arrow-pill">Receive</button>
+              <button id="send-toggle" class="arrow-pill">Send</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="spending-drawer-slot" class="drawer-slot"></div>
+
+        <div class="vault-bridge">
+          <button id="btn-vault-up" class="arrow-pill vertical" title="Move BTC from Vault (L1) to Spending">↑ To Spending</button>
+          <button id="btn-vault-down" class="arrow-pill vertical" title="Save BTC from Spending to Vault (L1)">↓ To Vault</button>
+        </div>
+
+        <div id="bridge-drawer-slot" class="drawer-slot"></div>
+
+        <div class="tier-box tier-vault">
+          <div class="tier-info">
+            <div class="tier-label">🏦 Bitcoin Vault (L1)</div>
+            <span id="vault-sub" class="muted tier-sub">0 timelock · Onchain</span>
+          </div>
+          <div class="tier-right">
+            <strong id="vault-sats" class="tier-amount">0 sats</strong>
+            <div id="vault-fiat" class="muted tier-sub">≈ $0.00</div>
+            <div class="mini-actions">
+              <button id="vault-recv-toggle" class="arrow-pill">Receive</button>
+              <button id="vault-send-toggle" class="arrow-pill">Send</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="vault-drawer-slot" class="drawer-slot"></div>
+
+        <div id="incoming-banner" class="incoming-banner hidden" style="margin-top:10px;margin-bottom:0"></div>
+      </section>
+
+      <section id="vault-panel" class="card hidden">
+        <div class="card-head">
+          <h2>Transfer: Vault (L1) ↔ Spending</h2>
+          <div class="head-right">
+            <span id="vault-dir-pill" class="pill ok">Vault → Spending</span>
+            <button class="close-x" data-close-panel="vault-panel" aria-label="Close">✕</button>
+          </div>
+        </div>
+        <div class="action-row" style="margin-bottom:12px">
+          <button id="vault-to-ark-btn" class="btn primary small">↑ Vault (L1) → Spending</button>
+          <button id="ark-to-vault-btn" class="btn secondary small">↓ Spending → Vault (L1)</button>
+        </div>
+        <div id="vault-dir-note" class="muted" style="margin-bottom:10px;font-size:0.78rem">
+          Moves a chosen amount from your pure onchain Bitcoin Vault (0 timelock) into Arkade Spending (auto-credited after 1 block).
+        </div>
+        <div class="field">
+          <label>Amount (sats) <span id="vault-fiat-est" class="muted"></span></label>
+          <div class="preset-row" style="margin-bottom:0">
+            <input id="vault-sats-input" type="number" min="600" step="500" placeholder="e.g. 5000" />
+            <button class="chip vault-pct" data-vpct="0.25">25%</button>
+            <button class="chip vault-pct" data-vpct="0.5">50%</button>
+            <button class="chip vault-pct" data-vpct="1">Max</button>
+          </div>
+        </div>
+        <div class="action-row" style="margin-top:12px">
+          <button id="vault-cancel-btn" class="btn secondary">Cancel</button>
+          <button id="vault-submit-btn" class="btn primary">Transfer Now</button>
+        </div>
+      </section>
+
+      <section id="send-panel" class="card hidden">
+        <div class="card-head">
+          <h2 id="send-heading">Send from Spending</h2>
+          <div class="head-right">
+            <span id="send-mode-pill" class="pill muted-pill">Enter address or invoice</span>
+            <button class="close-x" data-close-panel="send-panel" aria-label="Close">✕</button>
+          </div>
+        </div>
+        <div class="field">
+          <label id="send-addr-label">Recipient (<code>bitcoin:…</code> BIP-21, <code>lntbs…</code> Lightning, <code>tark1…</code> instant, or <code>tb1…</code> L1)</label>
+          <input id="send-addr-input" type="text" placeholder="bitcoin:…, lntbs…, tark1… or tb1…" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label><span id="send-amt-label">Amount (sats)</span> <span id="send-fiat-est" class="muted"></span></label>
+          <div class="preset-row" style="margin-bottom:0">
+            <input id="send-sats-input" type="number" min="350" step="100" placeholder="e.g. 2000" />
+            <button class="chip send-pct" data-pct="0.25">25%</button>
+            <button class="chip send-pct" data-pct="0.5">50%</button>
+            <button class="chip send-pct" data-pct="1">Max</button>
+          </div>
+        </div>
+        <div id="send-avail-bar" class="roll-hint" style="margin-top:8px"></div>
+        <label id="stable-relock-wrap" class="relock-check hidden">
+          <input id="stable-relock-check" type="checkbox" checked />
+          <span>Automatically re-lock leftover change (≥ $1) back into Stable fiat</span>
+        </label>
+        <div class="action-row" style="margin-top:12px">
+          <button id="send-cancel-btn" class="btn secondary">Cancel</button>
+          <button id="send-submit-btn" class="btn primary">Send Now</button>
         </div>
       </section>
 
       <section id="deposit-panel" class="card hidden">
-        <h2>Receive on Arkade or Board from Mutinynet L1</h2>
+        <div class="card-head">
+          <h2 id="recv-heading">Receive Bitcoin (Unified BIP-21 QR)</h2>
+          <button class="close-x" data-close-panel="deposit-panel" aria-label="Close">✕</button>
+        </div>
+        <div id="stable-recv-banner" class="roll-hint good hidden" style="margin-bottom:10px"></div>
+        <div class="qr-card">
+          <canvas id="recv-qr-canvas" class="qr-canvas"></canvas>
+          <div id="recv-qr-caption" class="muted" style="font-size:0.74rem;text-align:center">
+            1 Unified QR: works with Arkade, Lightning &amp; Bitcoin L1 wallets
+          </div>
+          <div class="copy-row" style="width:100%">
+            <code id="unified-uri">—</code>
+            <button class="btn small" data-copy="unified-uri">Copy URI</button>
+          </div>
+        </div>
+        <div id="recv-ln-section" class="ln-receive-box">
+          <div class="field" style="margin-bottom:8px">
+            <label>⚡ Add Lightning Invoice to QR (instant via Boltz VHTLC) <span id="ln-fee-hint" class="muted"></span></label>
+            <div class="preset-row" style="margin-bottom:6px">
+              <button class="chip ln-preset" data-ln-sats="1000">1k</button>
+              <button class="chip ln-preset" data-ln-sats="5000">5k</button>
+              <button class="chip ln-preset" data-ln-sats="10000">10k</button>
+              <input id="ln-amount-input" type="number" min="100" step="100" value="5000" placeholder="sats" />
+              <button id="ln-create-btn" class="btn primary small" style="flex:0 0 auto">Create Invoice</button>
+            </div>
+          </div>
+          <div id="ln-invoice-box" class="hidden">
+            <div class="copy-row">
+              <code id="ln-invoice-text">—</code>
+              <button class="btn small" data-copy="ln-invoice-text">Copy</button>
+            </div>
+            <div id="ln-invoice-status" class="muted" style="margin-top:6px;font-size:0.76rem"></div>
+          </div>
+        </div>
         <div class="field">
-          <label>Arkade Address (instant offchain)</label>
+          <label>🏦 Bitcoin Vault Address (pure onchain L1, 0 timelock — never expires)</label>
+          <div class="copy-row">
+            <code id="vault-addr">—</code>
+            <button class="btn small" data-copy="vault-addr">Copy</button>
+          </div>
+        </div>
+        <div id="recv-ark-section" class="field" style="margin-bottom:0">
+          <label>⚡ Instant Address (instant &amp; zero-fee → Spending on Arkade)</label>
           <div class="copy-row">
             <code id="ark-addr">—</code>
             <button class="btn small" data-copy="ark-addr">Copy</button>
           </div>
         </div>
-        <div class="field">
-          <label>Mutinynet Boarding Address (send from faucet.mutinynet.com, then click Onboard)</label>
-          <div class="copy-row">
-            <code id="board-addr">—</code>
-            <button class="btn small" data-copy="board-addr">Copy</button>
-          </div>
-        </div>
       </section>
 
-      <section class="card">
-        <div class="card-head">
-          <h2>Lock USD Value (Trustless DLC)</h2>
+      <section id="lock-card" class="card">
+        <div class="card-head collapsible-head" data-collapse="lock-body" role="button" tabindex="0">
+          <h2 id="lock-heading"><span class="caret">▸</span> Lock USD Value</h2>
           <span id="lp-status" class="pill muted-pill">LP: checking…</span>
+        </div>
+        <div id="lock-body" class="collapsible-body hidden">
+        <div class="side-toggle" role="group" aria-label="Position Side">
+          <button id="side-short" class="side-btn active" data-side="short">🛡 Stable USD</button>
+          <button id="side-long" class="side-btn" data-side="long">🚀 2× Long BTC</button>
         </div>
         <div class="preset-row">
           <button class="chip" data-usd="1">$1</button>
           <button class="chip active" data-usd="2">$2</button>
           <button class="chip" data-usd="5">$5</button>
           <button class="chip" data-usd="10">$10</button>
-          <input id="usd-input" type="number" min="1" step="1" value="2" aria-label="USD amount" />
+          <input id="usd-input" type="number" min="1" step="1" value="2" aria-label="Fiat amount" />
         </div>
         <div id="quote-box" class="quote-box">
           Enter an amount to fetch a live trustless quote from the LP.
         </div>
         <div class="action-row">
-          <button id="quote-btn" class="btn secondary">Get Quote</button>
           <button id="open-btn" class="btn primary">Lock USD Now</button>
+        </div>
+
+        <div class="ob-footer-bar">
+          <button id="ob-toggle-btn" class="link-btn">Compare Offers (loading…) ▾</button>
+          <button id="p2p-order-toggle" class="link-btn">+ Post Order</button>
+        </div>
+
+        <div id="my-p2p-order-banner" class="incoming-banner hidden" style="margin-top:8px;margin-bottom:0;border-color:rgba(34,197,94,0.45);background:rgba(34,197,94,0.08)"></div>
+
+        <div id="p2p-order-form" class="p2p-order-form hidden">
+          <div class="card-head" style="margin-bottom:8px">
+            <strong style="font-size:0.86rem">Post P2P Order</strong>
+            <button class="close-x" data-close-panel="p2p-order-form" aria-label="Close">✕</button>
+          </div>
+          <div class="side-toggle" role="group" aria-label="P2P Order Side" style="margin-bottom:8px">
+            <button id="p2p-side-short" class="side-btn active" data-p2p-side="short">🛡 Stable USD (1× Short BTC)</button>
+            <button id="p2p-side-long" class="side-btn" data-p2p-side="long">🚀 2× Long BTC (Leveraged)</button>
+          </div>
+          <div id="p2p-side-explain" class="muted" style="font-size:0.75rem;margin-bottom:8px">
+            <strong>Stable USD (Short BTC):</strong> Lock fixed fiat value &amp; earn yield. Matched with a 2× Long BTC peer.
+          </div>
+          <div id="p2p-market-ref" class="muted" style="font-size:0.76rem;margin-bottom:8px;line-height:1.4">
+            Loading best market price…
+          </div>
+          <div class="p2p-form-grid" style="margin-bottom:8px">
+            <div class="field" style="margin-bottom:0">
+              <label id="p2p-amt-label">Amount (USD)</label>
+              <input id="p2p-amt-input" type="number" min="1" step="1" value="5" />
+            </div>
+            <div class="field" style="margin-bottom:0">
+              <label>Contract Term</label>
+              <select id="p2p-term-select" class="select-input">
+                <option value="1" selected>1 day</option>
+                <option value="7">7 days</option>
+                <option value="30">30 days</option>
+              </select>
+            </div>
+          </div>
+          <div class="field" style="margin-bottom:8px">
+            <label id="p2p-price-label">Your Implied Entry Price (USD)</label>
+            <div class="preset-row" style="margin-bottom:6px">
+              <button class="chip p2p-preset" data-p2p-preset="beat">⚡ Fast Fill</button>
+              <button class="chip p2p-preset active" data-p2p-preset="match">⚖ Match Market</button>
+              <button class="chip p2p-preset" data-p2p-preset="better">💎 Better Price</button>
+            </div>
+            <div class="p2p-form-grid">
+              <input id="p2p-price-input" type="number" step="10" placeholder="Implied BTC entry price" />
+              <select id="p2p-expiry-select" class="select-input" title="Order Open For">
+                <option value="900" selected>Open 15m</option>
+                <option value="3600">Open 1h</option>
+                <option value="14400">Open 4h</option>
+              </select>
+            </div>
+          </div>
+          <div id="p2p-guidance" class="roll-hint" style="margin-bottom:10px"></div>
+          <div class="action-row">
+            <button id="p2p-publish-btn" class="btn primary small">Publish P2P Order</button>
+          </div>
+        </div>
+
+        <div id="orderbook-drawer" class="ob-drawer hidden">
+          <div class="card-head" style="margin-bottom:8px">
+            <strong style="font-size:0.84rem">Live Order Book</strong>
+            <div class="ob-pills">
+              <span id="relay-status" class="pill muted-pill">Network: connecting…</span>
+              <button id="ob-auto-btn" class="btn small secondary">Auto Best</button>
+              <button class="close-x" data-close-panel="orderbook-drawer" aria-label="Close">✕</button>
+            </div>
+          </div>
+          <div id="ob-oracle-bar" class="ob-oracle-bar">
+            Orderbook Price Oracle: <strong>—</strong> <span class="muted">(waiting for signed LP offers)</span>
+          </div>
+          <div id="orderbook-list" class="orderbook-list">
+            <div class="empty">Listening for live LP offers…</div>
+          </div>
+        </div>
+        </div>
+      </section>
+
+      <section id="positions-card" class="card">
+        <div class="card-head collapsible-head" data-collapse="positions-body" role="button" tabindex="0">
+          <h2><span class="caret">▸</span> Your Positions</h2>
+          <span id="pos-count" class="muted">0 open</span>
+        </div>
+        <div id="positions-body" class="collapsible-body hidden">
+          <div id="positions-list" class="positions-list">
+            <div class="empty">No positions yet. Board Mutinynet sats and lock USD above.</div>
+          </div>
         </div>
       </section>
 
       <section class="card">
         <div class="card-head">
-          <h2>Your USD Positions</h2>
-          <span id="pos-count" class="muted">0 open</span>
+          <h2>Recent Activity</h2>
+          <span id="tx-count" class="muted">0 txs</span>
         </div>
-        <div id="positions-list" class="positions-list">
-          <div class="empty">No positions yet. Board Mutinynet sats and lock USD above.</div>
+        <div id="tx-list" class="positions-list">
+          <div class="empty">No Arkade transactions yet.</div>
         </div>
       </section>
 
       <section id="settings-panel" class="card hidden">
-        <h2>Wallet Settings &amp; Self-Custody Backup</h2>
-        <div class="field">
-          <label>LP Service URL</label>
-          <div class="copy-row">
-            <input id="lp-url-input" type="text" value="http://127.0.0.1:3456" />
-            <button id="save-lp-btn" class="btn small">Save</button>
+        <div class="card-head">
+          <h2>Settings &amp; Wallet Backup</h2>
+          <button class="close-x" data-close-panel="settings-panel" aria-label="Close">✕</button>
+        </div>
+        <div class="backup-box">
+          <div class="field" style="margin-bottom:8px">
+            <label>Wallet Backup Key (single secret string — restores your entire wallet)</label>
+            <div class="copy-row">
+              <input id="backup-key-input" type="password" readonly />
+              <button id="reveal-backup-btn" class="btn small">Show</button>
+              <button id="copy-backup-btn" class="btn small">Copy</button>
+            </div>
+          </div>
+          <div class="muted" style="font-size:0.76rem;line-height:1.4;margin-bottom:10px">
+            Save this single backup key offline. It deterministically recovers your wallet on any device — keep it private and never paste it into untrusted apps.
+          </div>
+          <div id="legacy-key-warning" class="roll-hint hidden" style="margin-bottom:10px">
+            This browser has an older separate Arkade key with existing funds. Keep it backed up under <strong>Advanced → Raw Arkade Key</strong>, or restore a unified Backup Key below.
+          </div>
+          <div class="action-row">
+            <button id="restore-backup-btn" class="btn secondary">Restore from Backup Key</button>
           </div>
         </div>
-        <div class="field">
-          <label>Private Key (hex — stored only in your browser)</label>
-          <div class="copy-row">
-            <input id="privkey-input" type="password" readonly />
-            <button id="reveal-key-btn" class="btn small">Show</button>
-            <button id="import-key-btn" class="btn small">Import</button>
+
+        <details id="advanced-settings" class="advanced-details">
+          <summary>Advanced (Nostr, Oracles &amp; Network)</summary>
+          <div class="advanced-body">
+            <div class="nostr-account-box">
+              <div id="nostr-profile-header" class="nostr-account-head hidden">
+                <div class="nostr-profile-id">
+                  <div id="nostr-avatar" class="nostr-avatar"></div>
+                  <div>
+                    <div id="nostr-display-name" class="nostr-name"></div>
+                    <div id="nostr-nip05" class="muted" style="font-size:0.75rem"></div>
+                  </div>
+                </div>
+              </div>
+              <div class="field">
+                <label>Nostr Public Identity (<code>npub1…</code>)</label>
+                <div class="copy-row">
+                  <code id="nostr-npub">—</code>
+                  <button class="btn small" data-copy="nostr-npub">Copy</button>
+                </div>
+              </div>
+              <div class="field">
+                <label>Optional Profile (Display Name &amp; Photo URL — publishes <code>kind: 0</code>)</label>
+                <div class="copy-row" style="margin-bottom:6px">
+                  <input id="nostr-name-input" type="text" placeholder="Display name (optional)" />
+                </div>
+                <div class="copy-row">
+                  <input id="nostr-pic-input" type="text" placeholder="Photo URL https://… (optional)" />
+                  <button id="publish-profile-btn" class="btn small">Save</button>
+                </div>
+              </div>
+              <div class="action-row" style="margin-top:8px">
+                <button id="import-nostr-only-btn" class="btn secondary">Link Separate Nostr Key</button>
+                <button id="new-nostr-btn" class="btn secondary">Rotate Nostr Key</button>
+              </div>
+            </div>
+
+            <div class="field">
+              <label id="nostracles-label">Nostracle Dispute Quorum (wallet default — locked per position at open)</label>
+              <select id="quorum-select" class="select-input">
+                <option value="2-of-3">2-of-3 — Light / Low cost (tolerates 1 offline or 1 dishonest)</option>
+                <option value="3-of-5" selected>3-of-5 — Balanced ★ (tolerates 2 offline &amp; 2 dishonest; fee competition)</option>
+                <option value="4-of-7">4-of-7 — Max Security (tolerates 3 offline &amp; 3 dishonest)</option>
+              </select>
+              <div id="quorum-note" class="muted" style="margin:6px 0 8px"></div>
+              <div id="nostracles-box" class="nostracle-list"></div>
+              <div class="copy-row" style="margin-top:8px">
+                <input id="custom-nostracle-key" type="text" placeholder="Add Nostracle npub1… or 64-hex" />
+                <input id="custom-nostracle-name" type="text" placeholder="Name (optional)" style="max-width:120px" />
+                <button id="add-nostracle-btn" class="btn small">+ Add</button>
+              </div>
+            </div>
+
+            <div class="field">
+              <label>Nostr Order Book Relays (comma-separated wss://)</label>
+              <div class="copy-row">
+                <input id="relays-input" type="text" />
+                <button id="save-relays-btn" class="btn small">Save</button>
+              </div>
+            </div>
+
+            <div class="field">
+              <label>Watchtower Pubkey (64-hex x-only for NIP-17 registration)</label>
+              <div class="copy-row">
+                <input id="wt-pubkey-input" type="text" placeholder="optional 64-char hex pubkey" />
+                <button id="save-wt-btn" class="btn small">Save</button>
+              </div>
+            </div>
+
+            <div class="field">
+              <label>Fallback LP Service URL</label>
+              <div class="copy-row">
+                <input id="lp-url-input" type="text" value="http://127.0.0.1:3456" />
+                <button id="save-lp-btn" class="btn small">Save</button>
+              </div>
+            </div>
+
+            <div class="field" style="margin-bottom:0">
+              <label>Raw Arkade Spending Key (hex — derived from Backup Key unless legacy)</label>
+              <div class="copy-row">
+                <input id="privkey-input" type="password" readonly />
+                <button id="reveal-key-btn" class="btn small">Show</button>
+                <button id="import-key-btn" class="btn small">Import</button>
+              </div>
+            </div>
           </div>
-        </div>
+        </details>
       </section>
+
+      <footer class="app-footer">
+        <span class="muted">p2pFiat · Self-Custody on Arkade</span>
+        <div class="footer-links">
+          <a href="https://github.com/p2pfiat" target="_blank" rel="noopener noreferrer">GitHub</a>
+          <span class="muted">·</span>
+          <a href="https://x.com/p2pfiat" target="_blank" rel="noopener noreferrer">𝕏 @p2pfiat</a>
+          <span class="muted">·</span>
+          <a href="https://primal.net/p/npub1p2ppegcr9j875e2d76vzn9za9s3rd6npgvde8d5cwjza8c80en3sj72l43" target="_blank" rel="noopener noreferrer">🟣 p2pFiat on Nostr</a>
+        </div>
+      </footer>
 
       <div id="toast" class="toast hidden"></div>
     </div>

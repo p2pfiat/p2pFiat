@@ -45,3 +45,8 @@ cargo run -- bounty-script --primary <hex> --backup <hex> --backup-csv 4 --amoun
 Fund the P2TR address printed by `init` with **confirmed** UTXOs before running
 (Bitcoin Core v30 TRUC rules reject v3 CPFP children that spend unconfirmed v2
 UTXOs).
+
+## Configuration & Oracle Incentives
+
+- Ensure `min_bounty_sats` exceeds `sweep_fee_sats + dust` (e.g. `sweep_fee_sats = 350`, `min_bounty_sats = 1000` on Mutinynet).
+- For paid oracle attestations (NIP-57 zaps) and dispute-triggered exits, see [`ORACLE_INCENTIVES.md`](ORACLE_INCENTIVES.md) and the integration test in [`tests/paid_oracle_dispute.rs`](tests/paid_oracle_dispute.rs).
