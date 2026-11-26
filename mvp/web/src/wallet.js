@@ -44,7 +44,10 @@ import {
 import { computeKormirOutcomePoint } from "./nostracle-client.js";
 import {
   getOrCreateNostrAccount,
+  getActiveIdentity,
   importNostrAccount,
+  logoutNip07Extension,
+  tryDecryptCloudWalletSeedWithNsec,
   deriveArkadePrivKeyHexFromNsec,
   deriveVaultPrivKeyHexFromNsec,
 } from "./nostr-account.js";
@@ -439,7 +442,8 @@ export function savePositions(map, { skipNostrBackup = false } = {}) {
  * device recovers all open DLC contracts (including Leaf 2 dispute scripts & oracle quorum).
  */
 export async function backupPositionsToNostr(map = loadPositions()) {
-  const acct = getOrCreateNostrAccount();
+  const identity = getActiveIdentity();
+  const acct = identity?.rpcKey;
   if (!acct?.privHex || !acct?.pubHex) return null;
   const entries = Object.values(map || {});
   const open = entries.filter((p) => p?.status === "open");
@@ -473,7 +477,8 @@ export async function backupPositionsToNostr(map = loadPositions()) {
  * merging any missing or newer positions into `localStorage`.
  */
 export async function restorePositionsFromNostr(timeoutMs = 4000) {
-  const acct = getOrCreateNostrAccount();
+  const identity = getActiveIdentity();
+  const acct = identity?.rpcKey;
   if (!acct?.privHex || !acct?.pubHex) return { restoredCount: 0, totalCount: 0 };
   const relays = getNostrRelays();
   let latest = null;
@@ -567,14 +572,19 @@ export function importPrivKeyHex(privHex) {
 }
 
 /**
- * Restore the entire wallet (both Nostr identity and derived Arkade spending key)
+ * Restore the entire wallet (both Nostr identity and derived Arkade/Vault keys)
  * from a single `nsec1...` (or 64-char hex) backup string.
+ * Also checks Nostr relays for a NIP-44 encrypted portable wallet seed (`p2pfiat-wallet-seed-v1`)
+ * in case the wallet was originally created via a NIP-07 browser extension.
  */
-export function restoreFromBackupKey(nsecOrHex) {
+export async function restoreFromBackupKey(nsecOrHex) {
+  logoutNip07Extension();
   const nostrAccount = importNostrAccount(nsecOrHex);
-  const derivedArkHex = deriveArkadePrivKeyHexFromNsec(nostrAccount.privHex);
+  const cloudSeed = await tryDecryptCloudWalletSeedWithNsec(nostrAccount, getNostrRelays());
+  const effectiveSeed = cloudSeed || nostrAccount.privHex;
+  const derivedArkHex = deriveArkadePrivKeyHexFromNsec(effectiveSeed);
   localStorage.setItem(LS_KEY, derivedArkHex);
-  return { nostrAccount, arkPrivHex: derivedArkHex };
+  return { nostrAccount, arkPrivHex: derivedArkHex, restoredCloudSeed: Boolean(cloudSeed) };
 }
 
 async function postJson(url, body) {
@@ -590,12 +600,16 @@ async function postJson(url, body) {
 
 export class BrowserP2pFiatWallet {
   static async create() {
-    const nostrKey = getOrCreateNostrAccount();
-    const privHex = getOrCreatePrivKeyHex(nostrKey);
-    const derivedArkHex = deriveArkadePrivKeyHexFromNsec(nostrKey.privHex);
-    const isLegacySeparateKey = privHex.toLowerCase() !== derivedArkHex.toLowerCase();
+    const identity = getActiveIdentity();
+    const seedHex = identity.walletSeedHex;
+    const derivedArkHex = deriveArkadePrivKeyHexFromNsec(seedHex);
+    const privHex =
+      identity.mode === "nip07" ? derivedArkHex : getOrCreatePrivKeyHex(identity);
+    const isLegacySeparateKey =
+      identity.mode !== "nip07" && privHex.toLowerCase() !== derivedArkHex.toLowerCase();
     const userKey = keyFromHex(privHex);
-    const vaultKey = keyFromHex(deriveVaultPrivKeyHexFromNsec(nostrKey.privHex));
+    const vaultKey = keyFromHex(deriveVaultPrivKeyHexFromNsec(seedHex));
+    const nostrKey = identity.rpcKey;
     const vaultPayment = btc.p2tr(vaultKey.pubXOnly, undefined, btc.TEST_NETWORK);
     const arkProvider = new RestArkProvider(ARK_URL);
     const indexerProvider = new RestIndexerProvider(ARK_URL);
@@ -621,6 +635,7 @@ export class BrowserP2pFiatWallet {
       vaultKey,
       vaultPayment,
       nostrKey,
+      authIdentity: identity,
       isLegacySeparateKey,
       wallet,
       arkProvider,

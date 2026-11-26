@@ -6,28 +6,35 @@
     <meta name="theme-color" content="#0b0f17" />
     <link rel="icon" type="image/jpeg" href="./favicon.jpg" />
     <link rel="apple-touch-icon" href="./favicon.jpg" />
-    <link rel="icon" type="image/jpeg" href="./favicon.jpg" />
-    <link rel="apple-touch-icon" href="./favicon.jpg" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <title>p2pFiat — Self-Custody USD on Arkade</title>
   </head>
   <body>
     <div id="app">
       <header class="topbar">
-        <div class="brand">
-          <img src="./favicon.jpg" alt="p2pFiat" class="brand-logo" />
-          <h1>p2pFiat</h1>
-          <span class="badge">Mutinynet</span>
-        </div>
-        <div class="topbar-right">
-          <div class="cur-toggle" role="group" aria-label="Currency">
-            <button id="cur-usd" class="cur-btn active" data-cur="USD">$ USD</button>
-            <button id="cur-eur" class="cur-btn" data-cur="EUR">€ EUR</button>
+        <div class="topbar-row">
+          <div class="brand">
+            <img src="./favicon.jpg" alt="p2pFiat" class="brand-logo" />
+            <h1>p2pFiat</h1>
+            <span class="badge">Mutinynet</span>
           </div>
-          <span id="spot-pill" class="pill">BTC/USD —</span>
-          <button id="nostr-pill" class="pill nostr-pill hidden" title="Profile &amp; Settings"></button>
-          <button id="refresh-btn" class="icon-btn" title="Refresh">↻</button>
-          <button id="settings-btn" class="icon-btn" title="Settings &amp; Backup">⚙</button>
+          <div class="topbar-auth">
+            <button id="header-nostr-login-btn" class="pill nostr-pill" title="Login with Nostr Extension or nsec">🟣 Login</button>
+            <button id="nostr-pill" class="pill nostr-pill hidden" title="Profile &amp; Settings"></button>
+          </div>
+        </div>
+        <div class="topbar-row topbar-sub">
+          <div class="topbar-controls-left">
+            <div class="cur-toggle" role="group" aria-label="Currency">
+              <button id="cur-usd" class="cur-btn active" data-cur="USD">$ USD</button>
+              <button id="cur-eur" class="cur-btn" data-cur="EUR">€ EUR</button>
+            </div>
+            <span id="spot-pill" class="pill">BTC/USD —</span>
+          </div>
+          <div class="topbar-controls-right">
+            <button id="refresh-btn" class="icon-btn" title="Refresh">↻</button>
+            <button id="settings-btn" class="icon-btn" title="Settings &amp; Backup">⚙</button>
+          </div>
         </div>
       </header>
 
@@ -388,22 +395,33 @@
           <button class="close-x" data-close-panel="settings-panel" aria-label="Close">✕</button>
         </div>
         <div class="backup-box">
+          <div class="field" style="margin-bottom:10px">
+            <label>Portable Nostr Login (Optional — works with or without Nostr)</label>
+            <div id="auth-mode-badge" class="muted" style="font-size:0.78rem;margin-bottom:8px">
+              Mode: Local Wallet (no Nostr extension required)
+            </div>
+            <div class="action-row" style="margin-bottom:8px">
+              <button id="nip07-login-btn" class="btn primary small">⚡ Login with Nostr Extension</button>
+              <button id="nip07-logout-btn" class="btn secondary small hidden">Disconnect Extension</button>
+            </div>
+            <div class="copy-row">
+              <input id="nsec-login-input" type="password" placeholder="Or paste nsec1… to login / restore without extension" autocomplete="off" />
+              <button id="nsec-login-btn" class="btn secondary small">Login / Restore</button>
+            </div>
+          </div>
           <div class="field" style="margin-bottom:8px">
-            <label>Wallet Backup Key (single secret string — restores your entire wallet)</label>
+            <label id="backup-key-label">Wallet Backup Key (single secret string — restores your entire wallet)</label>
             <div class="copy-row">
               <input id="backup-key-input" type="password" readonly />
               <button id="reveal-backup-btn" class="btn small">Show</button>
               <button id="copy-backup-btn" class="btn small">Copy</button>
             </div>
           </div>
-          <div class="muted" style="font-size:0.76rem;line-height:1.4;margin-bottom:10px">
-            Save this single backup key offline. It deterministically recovers your wallet on any device — keep it private and never paste it into untrusted apps.
+          <div id="backup-key-hint" class="muted" style="font-size:0.76rem;line-height:1.4;margin-bottom:4px">
+            Save this single backup key offline. It deterministically recovers your Arkade Spending, Bitcoin L1 Vault, and open DLC positions on any device — keep it private.
           </div>
-          <div id="legacy-key-warning" class="roll-hint hidden" style="margin-bottom:10px">
-            This browser has an older separate Arkade key with existing funds. Keep it backed up under <strong>Advanced → Raw Arkade Key</strong>, or restore a unified Backup Key below.
-          </div>
-          <div class="action-row">
-            <button id="restore-backup-btn" class="btn secondary">Restore from Backup Key</button>
+          <div id="legacy-key-warning" class="roll-hint hidden" style="margin-top:8px">
+            This browser has an older separate Arkade key with existing funds. Keep it backed up under <strong>Advanced → Raw Arkade Key</strong>, or restore a unified Backup Key above.
           </div>
         </div>
 
@@ -436,10 +454,6 @@
                   <input id="nostr-pic-input" type="text" placeholder="Photo URL https://… (optional)" />
                   <button id="publish-profile-btn" class="btn small">Save</button>
                 </div>
-              </div>
-              <div class="action-row" style="margin-top:8px">
-                <button id="import-nostr-only-btn" class="btn secondary">Link Separate Nostr Key</button>
-                <button id="new-nostr-btn" class="btn secondary">Rotate Nostr Key</button>
               </div>
             </div>
 
@@ -475,20 +489,12 @@
               </div>
             </div>
 
-            <div class="field">
-              <label>Fallback LP Service URL</label>
-              <div class="copy-row">
-                <input id="lp-url-input" type="text" value="http://127.0.0.1:3456" />
-                <button id="save-lp-btn" class="btn small">Save</button>
-              </div>
-            </div>
-
             <div class="field" style="margin-bottom:0">
-              <label>Raw Arkade Spending Key (hex — derived from Backup Key unless legacy)</label>
+              <label>Raw Arkade Spending Key (read-only hex — derived from your Wallet Seed / Backup Key)</label>
               <div class="copy-row">
                 <input id="privkey-input" type="password" readonly />
                 <button id="reveal-key-btn" class="btn small">Show</button>
-                <button id="import-key-btn" class="btn small">Import</button>
+                <button id="copy-key-btn" class="btn small">Copy</button>
               </div>
             </div>
           </div>

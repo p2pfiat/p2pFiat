@@ -33,7 +33,9 @@ flowchart TD
 
 ## Key Features
 
-- **1-String Backup (`nsec1…`):** One Nostr private key deterministically restores your Nostr identity, Arkade Spending wallet, and pure L1 Bitcoin Vault offline via HKDF-SHA256 — with cryptographic unlinkability between all three public keys.
+- **Flexible Self-Custody Login (NIP-07 Extension, `nsec1…`, or Zero-Nostr Guest):**
+  - **⚡ Login with Nostr Extension (NIP-07: Alby, nos2x):** Your `nsec` never leaves the extension; a 32-byte portable `walletSeed` is NIP-44 encrypted to your own `npub` in `kind: 30078` (`d: "p2pfiat-wallet-seed-v1"`), deterministically deriving your Arkade Spending key, Bitcoin L1 Vault, and background NIP-17 RPC transport key (zero popups while trading).
+  - **Zero-Nostr Guest & `nsec1…` Restore:** Works immediately without any extension or Nostr account, with single-string offline HKDF-SHA256 recovery (and automatically decrypts any NIP-07 cloud seed if you later restore the same `nsec1…` on mobile).
 - **3-Tier Self-Custody:**
   1. **🛡 Stable USD / EUR:** Synthetic fiat locked in 2-party Arkade DLCs, earning daily carry yield.
   2. **⚡ Spending BTC:** Instant Arkade VTXOs + Boltz Lightning VHTLC invoices via Unified BIP-21 QR (`bitcoin:<vault>?ark=<tark1>&lightning=<bolt11>`).
