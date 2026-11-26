@@ -10,13 +10,13 @@ A 100% client-side, self-custody Progressive Web App for holding **Stable USD / 
 ## Architecture & Module Map
 
 ```mermaid
-flowchart LR
-    HTML["index.html + style.css<br/>Mobile-first 3-Tier UI"] --> Main["src/main.js<br/>UI Controller · Auto-Stabilize · Drawers"]
+flowchart TD
+    HTML["index.html + style.css<br/>Mobile-First 3-Tier UI"] --> Main["src/main.js<br/>UI Controller · Auto-Stabilize · Drawers"]
     Main --> Wallet["src/wallet.js<br/>Arkade SDK · Boltz LN · P2TR Vault · P2P Maker"]
     Wallet --> Account["src/nostr-account.js<br/>1-String nsec1... Backup · HKDF-SHA256"]
     Wallet --> OB["src/offerbook.js<br/>Nostr kind:30078 Order Book"]
-    Wallet --> NIP17["src/nip17.js<br/>NIP-44 + NIP-59/17 Encrypted RPC"]
-    Wallet --> Nostracle["src/nostracle-client.js<br/>NIP-51 Nostracle Directory · kind:88/89 Verification"]
+    Wallet --> NIP17["src/nip17.js<br/>NIP-44 + NIP-17 Encrypted RPC"]
+    Wallet --> Nostracle["src/nostracle-client.js<br/>NIP-51 Nostracles · kind:88/89 Verify"]
 ```
 
 | File | Responsibility |

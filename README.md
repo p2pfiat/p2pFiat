@@ -1,6 +1,6 @@
 # p2pFiat — Trustless, Self-Custody Synthetic USD & EUR on Bitcoin (Arkade + DLCs + Nostr)
 
-> **Humanity deserves a trustless, permissionless technology with a fiat peg.**
+> **Humanity deserves a trustless, permissionless digital fiat currency.**
 
 **p2pFiat** is a self-custody, Bitcoin-collateralized synthetic fiat (USD / EUR) and 2× leveraged BTC protocol built on **[Arkade](https://arkadeos.com/)** (Bitcoin L2 VTXOs), **Discreet Log Contracts (DLCs)**, and **Nostr**.
 
@@ -13,7 +13,86 @@
 
 ## Visual Architecture Overview
 
-### 1. System Components & Data Flows
+### 1. System Overview (High-Level)
+
+```mermaid
+flowchart TD
+    User["📱 User Web Wallet (PWA)<br/>Stable USD/EUR · Spending BTC · Vault L1"]
+
+    User <-->|"Encrypted RPC & Order Book<br/>(Nostr NIP-17 + kind:30078)"| Nostr["🟣 Nostr Relays<br/>Serverless Control Plane"]
+    User <-->|"Instant VTXOs & L1 Vault"| BTC["⚡ Arkade L2 + Boltz LN + Bitcoin L1<br/>Non-Custodial Settlement"]
+
+    Nostr <-->|"Quotes & Trade Co-Signing"| LP["💧 Liquidity Providers & P2P Peers<br/>1× Short Fiat ↔ 2× Long BTC"]
+    Nostr <-->|"Price Feeds (kind:88/89)<br/>& On-Demand Disputes"| Oracle["🔮 Nostracle Quorum (k-of-n)<br/>Decentralized BTC/USD & BTC/EUR Oracles"]
+    Nostr <-->|"Exit Packages (NIP-17)"| WT["🗼 Keyless Rust Watchtower<br/>Monitors VTXOs · Earns Onchain Bounty"]
+
+    LP <-->|"Atomic 2-Input DLC VTXOs"| BTC
+    WT -->|"Unilateral CPFP Exit<br/>(if LP disappears)"| BTC
+```
+
+---
+
+### 2. Three-Tier Self-Custody & Single-Key (`nsec1…`) Backup
+
+One Nostr secret key (`nsec1…`) deterministically derives all wallet keys offline via **HKDF-SHA256** (`salt = "p2pfiat/v1"`) with strict domain separation, so your Nostr `npub`, Arkade key, and L1 Vault key are **cryptographically unlinkable**.
+
+```mermaid
+flowchart TD
+    Master["🔑 Single Backup Key (nsec1...)"]
+
+    Master -->|"NIP-01 / NIP-17"| NostrKey["🟣 Nostr Identity (npub1...)<br/>Encrypted RPC & P2P Orders"]
+    Master -->|"HKDF: arkade-spending-key"| ArkKey["⚡ Arkade Spending Key<br/>Stable USD/EUR + Spending BTC"]
+    Master -->|"HKDF: btc-l1-vault"| VaultKey["🏦 Bitcoin L1 Vault (P2TR)<br/>0 Timelock · Pure Onchain"]
+```
+
+In the mobile-first Web Wallet, funds flow vertically between the 3 custody tiers:
+
+1. **🛡 Stable USD / EUR (Top):** Synthetic fiat backed 1:1 by BTC inside a 2-party Arkade DLC VTXO, accruing daily carry yield (`APR`). Supports instant `Receive` (auto-stabilize incoming sats) and `Send` (auto-liquidate soonest-expiring positions + optional change re-lock).
+2. **⚡ Spending BTC (Middle):** Instant, zero-fee Arkade VTXOs + Boltz Lightning VHTLC swaps. Connected to Stable via `↑ To USD/EUR` / `↓ To Sats`.
+3. **🏦 Bitcoin Vault (Bottom):** Pure onchain Taproot (`tb1p…` / `bc1p…`) with **0 timelock** and zero Arkade ASP dependency. Connected to Spending via `↑ To Spending` / `↓ To Vault`.
+
+---
+
+### 3. Arkade DLC Taproot Script Tree (3 Spending Paths)
+
+Every locked position (`Stable USD/EUR` or `2× Long BTC`) is a 2-party custom Tapscript VTXO with an unspendable BIP-341 NUMS internal key:
+
+```mermaid
+flowchart TD
+    Root["🔒 DLC VTXO (P2TR · Unspendable NUMS Key)"]
+
+    Root --> L0["Leaf 0: Collaborative (Happy Path)<br/>3-of-3: User + LP + Arkade<br/>Instant offchain close or rollover"]
+    Root --> L1["Leaf 1: Unilateral DLC Exit<br/>CSV + 2-of-2 Adaptor CET / Refund<br/>Includes tiered Watchtower bounty"]
+    Root --> L2["Leaf 2: On-Demand Dispute<br/>CSV + k-of-n Nostracle Quorum<br/>Mid-term exit & early liquidation"]
+```
+
+---
+
+### 4. Trade, Rollover & Watchtower Safety Flow
+
+```mermaid
+sequenceDiagram
+    actor User as 📱 User Wallet
+    participant LP as 💧 LP (via Nostr)
+    participant Ark as ⚡ Arkade / L1
+    participant Safety as 🗼 Watchtower + 🔮 Oracles
+
+    User->>LP: Encrypted NIP-17 quote & open
+    User->>Ark: Co-sign 2-input DLC VTXO (instant)
+    User->>Safety: Register pre-signed exit package (keyless)
+
+    alt Happy Path (99% of trades)
+        User->>LP: Instant offchain close or rollover (Leaf 0)
+    else LP Offline (Unilateral Safety Net)
+        Safety->>Ark: Broadcast TRUC CPFP unroll + Oracle CET / Dispute
+        Note over Safety,Ark: User gets exact fiat value · Watchtower claims bounty
+    end
+```
+
+<details>
+<summary>🔍 <strong>Detailed Architecture Diagrams (expand for full protocol &amp; component view)</strong></summary>
+
+#### Detailed Component & Protocol Map
 
 ```mermaid
 flowchart TB
@@ -65,45 +144,7 @@ flowchart TB
     WT -.->|"Stale-Exit Check"| ASP
 ```
 
----
-
-### 2. Three-Tier Self-Custody & Single-Key (`nsec1…`) Derivation
-
-One single Nostr secret key (`nsec1…`) deterministically derives all wallet keys offline via **HKDF-SHA256** (`salt = "p2pfiat/v1"`) with strict domain separation, so your Nostr identity (`npub`), Arkade spending key, and onchain Bitcoin Vault key are **cryptographically unlinkable**.
-
-```mermaid
-flowchart LR
-    Master["Master Backup Key<br/>nsec1... (32 bytes)"]
-
-    Master -->|"Identity (NIP-01 / NIP-17)"| NostrKey["Nostr Identity (npub1...)<br/>Encrypted RPC · Profile · P2P Orders"]
-    Master -->|"HKDF info='arkade-spending-key'"| ArkKey["Arkade Spending Key<br/>Instant BTC & DLC VTXOs<br/>(Stable USD/EUR + Spending BTC)"]
-    Master -->|"HKDF info='btc-l1-vault'"| VaultKey["Bitcoin L1 Vault Key (P2TR)<br/>Pure Single-Key Onchain Self-Custody<br/>(0 Timelock · Never Expires)"]
-```
-
-In the mobile-first Web Wallet, funds flow vertically between the 3 custody tiers:
-
-1. **🛡 Stable USD / EUR (Top):** Synthetic fiat balance backed 1:1 by BTC inside a 2-party Arkade DLC VTXO, accruing daily carry yield (`APR`). Supports instant `Receive` (auto-stabilize incoming sats) and `Send` (auto-liquidate soonest-expiring positions + optional change re-lock).
-2. **⚡ Spending BTC (Middle):** Instant, zero-fee Arkade VTXOs + Boltz Lightning VHTLC swaps. Connected to Stable via `↑ To USD/EUR` / `↓ To Sats`.
-3. **🏦 Bitcoin Vault (Bottom):** Pure onchain Taproot (`tb1p…` / `bc1p…`) with **0 timelock** and zero Arkade ASP dependency. Connected to Spending via `↑ To Spending` / `↓ To Vault`.
-
----
-
-### 3. Arkade DLC Taproot Script Tree (3 Spending Leaves)
-
-Every locked position (`Stable USD/EUR` or `2× Long BTC`) is a 2-party custom Tapscript VTXO (`User + LP`) with an unspendable BIP-341 NUMS internal key and three spending paths:
-
-```mermaid
-flowchart TD
-    Root["DLC VTXO Output (P2TR · Unspendable NUMS Internal Key)"]
-
-    Root --> L0["Leaf 0: Collaborative Path (Happy Path)<br/>3-of-3: User + LP + Arkade ASP<br/>Instant offchain close, partial spend, or rollover at live spot"]
-    Root --> L1["Leaf 1: Unilateral Exit Path (DLC CET / Refund)<br/>CSV(exitDelay) + 2-of-2: User + LP<br/>Pre-signed BIP-340 adaptor CETs locked to Nostracle kind:88 nonces<br/>+ Timelocked refund if oracle is absent<br/>Includes tiered Watchtower bounty output"]
-    Root --> L2["Leaf 2: On-Demand Dispute Path (Anytime Exit / Liquidation)<br/>CSV(exitDelay) + BIP-342 k-of-n Nostracle Quorum<br/>(OP_CHECKSIG / OP_CHECKSIGADD >= k)<br/>Allows mid-term exit on 7d/30d/90d contracts or early -50% liquidation<br/>with zero cherry-picking risk"]
-```
-
----
-
-### 4. End-to-End Trade, Rollover & Watchtower Lifecycle
+#### Detailed Sequence Flow
 
 ```mermaid
 sequenceDiagram
@@ -140,6 +181,8 @@ sequenceDiagram
         WT->>WT: Complete BIP-340 adaptor CET & claim tiered bounty
     end
 ```
+
+</details>
 
 ---
 
