@@ -35,9 +35,61 @@ pub struct ExitRefund {
     pub lp_sig: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisputeOracleEntry {
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Oracle x-only secp256k1 / Nostr pubkey (64 hex chars).
+    pub pubkey: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisputeQuorum {
+    pub threshold: usize,
+    pub oracles: Vec<DisputeOracleEntry>,
+}
+
+/// 2-party BIP-340 signed Contract Manifest binding immutable contract terms and payout scripts
+/// for autonomous Leaf 2 (`k-of-n` Nostracle) On-Demand Mid-Term Disputes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DisputeManifest {
+    pub contract_id: String,
+    pub vtxo_outpoint: String,
+    pub currency: String,
+    #[serde(default = "default_dispute_side")]
+    pub side: String,
+    pub total_collateral_sats: u64,
+    pub notional_fiat: f64,
+    pub opened_at: u64,
+    pub funding_rate_bps_per_day: f64,
+    pub user_pubkey_hex: String,
+    pub lp_pubkey_hex: String,
+    pub vtxo_pk_script_hex: String,
+    pub dispute_script_hex: String,
+    pub user_payout_script_hex: String,
+    pub lp_payout_script_hex: String,
+    pub user_manifest_sig_hex: String,
+    pub lp_manifest_sig_hex: String,
+}
+
+fn default_dispute_side() -> String {
+    "short".to_string()
+}
+
+/// Leaf 2 BIP-342 `k-of-n` Nostracle On-Demand Dispute specification attached to a WatchtowerPackage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DisputePackageSpec {
+    pub script_hex: String,
+    pub control_block_hex: String,
+    pub csv_sequence: u32,
+    pub oracle_quorum: DisputeQuorum,
+    #[serde(default)]
+    pub manifest: Option<DisputeManifest>,
+}
+
 /// Everything a keyless watchtower receives at contract opening.
 /// Contains ZERO user or LP private keys.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WatchtowerPackage {
     pub id: String,
     pub vtxo_outpoint: String,
@@ -65,6 +117,9 @@ pub struct WatchtowerPackage {
     #[serde(default)]
     pub payouts: Vec<ExitPayout>,
     pub refund: Option<ExitRefund>,
+    /// Optional Leaf 2 BIP-342 `k-of-n` Nostracle On-Demand Mid-Term Dispute package.
+    #[serde(default)]
+    pub dispute: Option<DisputePackageSpec>,
     #[serde(default)]
     pub trigger_height: u32,
 }

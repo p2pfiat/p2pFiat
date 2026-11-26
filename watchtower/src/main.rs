@@ -124,9 +124,13 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
+            let http = reqwest::Client::builder()
+                .user_agent(concat!("ark-watchtower/", env!("CARGO_PKG_VERSION")))
+                .build()?;
             loop {
                 let t = now();
                 let mut attestations = HashMap::new();
+                let mut dispute_txs = HashMap::new();
                 if let Some(client) = &nostr {
                     if accept_nostr {
                         if let Err(e) = nostr_io::process_incoming_packages(client, &svc, t).await {
@@ -137,8 +141,12 @@ async fn main() -> Result<()> {
                         Ok(map) => attestations = map,
                         Err(e) => log::warn!("fetch oracle attestations: {e:#}"),
                     }
+                    match nostr_io::resolve_pending_disputes(client, &http, &svc, t).await {
+                        Ok(map) => dispute_txs = map,
+                        Err(e) => log::warn!("resolve Leaf 2 disputes: {e:#}"),
+                    }
                 }
-                if let Err(e) = svc.tick(&attestations, t).await {
+                if let Err(e) = svc.tick_with_disputes(&attestations, &dispute_txs, t).await {
                     log::error!("watchtower tick: {e:#}");
                 }
                 if once {

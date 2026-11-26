@@ -1395,6 +1395,22 @@ export class BrowserP2pFiatWallet {
       rolled.exitSuite = { ...prop.exitSuite, payouts: signedPayouts, refund: signedRefund };
     }
 
+    // Verify & co-sign fresh 2-party Contract Manifest if provided on roll
+    const rollManifestSrc = prop.disputeManifest || rolled.disputeManifest;
+    if (rollManifestSrc?.lp_manifest_sig_hex) {
+      const mHash = computeDisputeManifestHash(rollManifestSrc);
+      const lpOk = schnorr.verify(
+        hex.decode(rollManifestSrc.lp_manifest_sig_hex),
+        mHash,
+        hex.decode(rollManifestSrc.lp_pubkey_hex)
+      );
+      if (!lpOk) throw new Error("LP rolled dispute manifest signature invalid! Refusing roll.");
+      rolled.disputeManifest = {
+        ...rollManifestSrc,
+        user_manifest_sig_hex: hex.encode(schnorrSign(this.userKey, mHash)),
+      };
+    }
+
     map[positionId] = rolled;
     savePositions(map);
 
@@ -1525,7 +1541,17 @@ export class BrowserP2pFiatWallet {
         precompleted: Boolean(p.precompleted),
       })),
       refund: suite.refund || null,
-      dispute: suite.dispute || null,
+      dispute: suite.dispute
+        ? { ...suite.dispute, manifest: pos.disputeManifest || null }
+        : pos.disputeScriptHex && pos.disputeControlBlockHex && pos.oracleQuorum
+          ? {
+              script_hex: pos.disputeScriptHex,
+              control_block_hex: pos.disputeControlBlockHex,
+              csv_sequence: Number(pos.disputeCsvSequence || 0),
+              oracle_quorum: pos.oracleQuorum,
+              manifest: pos.disputeManifest || null,
+            }
+          : null,
       trigger_height: 0,
     };
   }

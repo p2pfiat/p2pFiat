@@ -4,6 +4,7 @@ use crate::adaptor::{attestation_outcome_string, finalize_exit_tx, sum_attestati
 use crate::bounty::{parse_xonly, BountyScript, WatchtowerRole};
 use crate::client::{parse_outpoint, ArkIndexerClient, ArkVtxoState, ChainClient};
 use crate::config::Config;
+use crate::dispute::verify_dispute_manifest;
 use crate::storage::{WatchState, WatchedContract, WatchtowerPackage, WatchtowerStorage};
 use crate::wallet::WatchtowerWallet;
 use anyhow::{anyhow, ensure, Context, Result};
@@ -79,8 +80,8 @@ impl WatchtowerService {
         ensure!(!pkg.id.trim().is_empty(), "package id must not be empty");
         ensure!(!pkg.unroll_txs.is_empty(), "unroll_txs must not be empty");
         ensure!(
-            !pkg.payouts.is_empty() || pkg.refund.is_some(),
-            "package must contain at least one payout or refund transaction"
+            !pkg.payouts.is_empty() || pkg.refund.is_some() || pkg.dispute.is_some(),
+            "package must contain at least one payout, refund, or Leaf 2 dispute specification"
         );
         parse_outpoint(&pkg.vtxo_outpoint)?;
         parse_xonly(&pkg.user_pubkey)?;
@@ -135,6 +136,20 @@ impl WatchtowerService {
         if let Some(r) = &pkg.refund {
             verify_exit_bounty("refund", &r.tx_hex)?;
         }
+        if let Some(d) = &pkg.dispute {
+            hex::decode(&d.script_hex).context("invalid dispute.script_hex")?;
+            let d_ctrl = hex::decode(&d.control_block_hex).context("invalid dispute.control_block_hex")?;
+            ControlBlock::decode(&d_ctrl).map_err(|e| anyhow!("invalid dispute control block: {e}"))?;
+            ensure!(
+                d.oracle_quorum.threshold >= 1 && d.oracle_quorum.oracles.len() >= d.oracle_quorum.threshold,
+                "invalid dispute oracle_quorum ({}/{})",
+                d.oracle_quorum.threshold,
+                d.oracle_quorum.oracles.len()
+            );
+            if let Some(m) = &d.manifest {
+                verify_dispute_manifest(m).context("invalid dispute manifest")?;
+            }
+        }
 
         self.storage.insert(pkg, now)?;
         Ok(role)
@@ -180,9 +195,21 @@ impl WatchtowerService {
         attestations: &HashMap<String, OracleAttestation>,
         now: u64,
     ) -> Result<()> {
+        self.tick_with_disputes(attestations, &HashMap::new(), now).await
+    }
+
+    pub async fn tick_with_disputes(
+        &self,
+        attestations: &HashMap<String, OracleAttestation>,
+        dispute_txs: &HashMap<String, Transaction>,
+        now: u64,
+    ) -> Result<()> {
         let tip = self.chain.tip_height().await.context("fetch bitcoin tip height")?;
         for contract in self.storage.list() {
-            if let Err(e) = self.step_contract(&contract, tip, attestations, now).await {
+            if let Err(e) = self
+                .step_contract(&contract, tip, attestations, dispute_txs, now)
+                .await
+            {
                 log::warn!("watchtower {}: {e:#}", contract.package.id);
                 let _ = self.storage.update(&contract.package.id, |c| {
                     c.last_error = Some(format!("{e:#}"));
@@ -198,6 +225,7 @@ impl WatchtowerService {
         contract: &WatchedContract,
         tip: u32,
         attestations: &HashMap<String, OracleAttestation>,
+        dispute_txs: &HashMap<String, Transaction>,
         now: u64,
     ) -> Result<()> {
         let pkg = &contract.package;
@@ -280,7 +308,7 @@ impl WatchtowerService {
                     c.last_error = None;
                 })?;
                 let updated = self.storage.get(&pkg.id).unwrap();
-                Box::pin(self.step_contract(&updated, tip, attestations, now)).await
+                Box::pin(self.step_contract(&updated, tip, attestations, dispute_txs, now)).await
             }
 
             WatchState::Unrolling { hops_done, last_cpfp_txid } => {
@@ -459,7 +487,15 @@ impl WatchtowerService {
                     finalized = Some((tx, false));
                 }
 
-                // Fallback to timelocked onchain refund if no attestation arrived by refund_height.
+                // Priority 2: Autonomous Leaf 2 `k-of-n` Nostracle On-Demand Dispute tx
+                // (when pre-signed adaptor payouts are absent or before maturity, and CSV is satisfied).
+                if finalized.is_none() {
+                    if let Some(dispute_tx) = dispute_txs.get(&pkg.id) {
+                        finalized = Some((dispute_tx.clone(), false));
+                    }
+                }
+
+                // Fallback to timelocked onchain refund if no attestation or dispute tx arrived by refund_height.
                 if finalized.is_none() {
                     if let Some(refund) = &pkg.refund {
                         if tip >= refund.refund_height {

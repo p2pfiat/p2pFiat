@@ -480,6 +480,7 @@ fn build_contract_fixture(
             user_sig: hex::encode(u_refund_sig.as_ref()),
             lp_sig: hex::encode(l_refund_sig.as_ref()),
         }),
+        dispute: None,
         trigger_height: 0,
     }
 }

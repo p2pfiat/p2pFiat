@@ -111,6 +111,7 @@ fn dummy_package(wt_xonly: &str, oracle_hex: &str, event_id: &str) -> Watchtower
             user_sig: "00".repeat(64),
             lp_sig: "00".repeat(64),
         }),
+        dispute: None,
         bounty,
         trigger_height: 100,
     }

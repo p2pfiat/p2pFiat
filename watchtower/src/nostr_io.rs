@@ -6,11 +6,16 @@
 //!    or 4-of-7 threshold oracle) on Nostr relays.
 
 use crate::bounty::WatchtowerRole;
+use crate::dispute::{
+    assemble_dispute_tx_witness, build_watchtower_dispute_tx, DEFAULT_DISPUTE_MINER_FEE_SATS,
+};
 use crate::service::{WatchtowerReply, WatchtowerRequest, WatchtowerService};
+use crate::storage::{DisputePackageSpec, WatchState};
 use anyhow::{anyhow, ensure, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use kormir::bitcoin::secp256k1::Secp256k1;
+use kormir::bitcoin::Transaction;
 use kormir::{OracleAnnouncement, OracleAttestation, Readable};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -380,4 +385,251 @@ pub fn verify_attestation(ev: &Event, ann: &OracleAnnouncement) -> Result<Oracle
     att.validate(&Secp256k1::verification_only(), ann)
         .map_err(|e| anyhow!("attestation signatures invalid: {e:?}"))?;
     Ok(att)
+}
+
+/// Fetch live BTC/<currency> median spot price from Coinbase, Kraken, and Bitstamp.
+pub async fn fetch_live_spot_price(http: &reqwest::Client, currency: &str) -> Result<f64> {
+    let cur = currency.trim().to_uppercase();
+    let mut prices: Vec<f64> = Vec::new();
+
+    // 1. Coinbase
+    if let Ok(resp) = http
+        .get(format!("https://api.coinbase.com/v2/prices/BTC-{cur}/spot"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        if let Ok(val) = resp.json::<serde_json::Value>().await {
+            if let Some(p) = val
+                .pointer("/data/amount")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+            {
+                if p.is_finite() && p > 0.0 {
+                    prices.push(p);
+                }
+            }
+        }
+    }
+
+    // 2. Kraken
+    let kraken_pair = match cur.as_str() {
+        "EUR" => "XXBTZEUR",
+        _ => "XXBTZUSD",
+    };
+    if let Ok(resp) = http
+        .get(format!("https://api.kraken.com/0/public/Ticker?pair={kraken_pair}"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        if let Ok(val) = resp.json::<serde_json::Value>().await {
+            if let Some(p) = val
+                .pointer(&format!("/result/{kraken_pair}/c/0"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+            {
+                if p.is_finite() && p > 0.0 {
+                    prices.push(p);
+                }
+            }
+        }
+    }
+
+    // 3. Bitstamp
+    let bs_pair = format!("btc{}", cur.to_lowercase());
+    if let Ok(resp) = http
+        .get(format!("https://www.bitstamp.net/api/v2/ticker/{bs_pair}/"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        if let Ok(val) = resp.json::<serde_json::Value>().await {
+            if let Some(p) = val
+                .pointer("/last")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+            {
+                if p.is_finite() && p > 0.0 {
+                    prices.push(p);
+                }
+            }
+        }
+    }
+
+    ensure!(
+        !prices.is_empty(),
+        "failed to fetch live BTC/{cur} spot price from any exchange"
+    );
+    prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(prices[prices.len() / 2])
+}
+
+/// Request BIP-340 Schnorr signatures over NIP-17 RPC (`sign_dispute`) from all oracles
+/// in `dispute.oracle_quorum` and wait up to `timeout` for `>= threshold` replies.
+pub async fn request_dispute_signatures(
+    client: &Client,
+    own_pk: PublicKey,
+    dispute: &DisputePackageSpec,
+    rpc_params: &serde_json::Value,
+    timeout: Duration,
+) -> Result<HashMap<String, String>> {
+    let threshold = dispute.oracle_quorum.threshold;
+    let mut req_ids: HashMap<String, String> = HashMap::new();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for (idx, oracle) in dispute.oracle_quorum.oracles.iter().enumerate() {
+        let Ok(pk) = PublicKey::parse(&oracle.pubkey) else { continue };
+        let req_id = format!("wt-dispute-{now_secs}-{idx}");
+        let envelope = serde_json::json!({
+            "type": "p2pfiat-rpc-req",
+            "reqId": req_id,
+            "method": "sign_dispute",
+            "params": rpc_params,
+        });
+        if client
+            .send_private_msg(pk, envelope.to_string(), [])
+            .await
+            .is_ok()
+        {
+            req_ids.insert(req_id, oracle.pubkey.trim().to_lowercase());
+        }
+    }
+
+    ensure!(
+        req_ids.len() >= threshold,
+        "only sent sign_dispute to {}/{} oracles",
+        req_ids.len(),
+        threshold
+    );
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut sigs_by_pubkey: HashMap<String, String> = HashMap::new();
+    // NIP-59 randomizes gift-wrap timestamps up to 48 hours into the past.
+    let since = Timestamp::from(now_secs.saturating_sub(3 * 86400));
+
+    while tokio::time::Instant::now() < deadline && sigs_by_pubkey.len() < threshold {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let filter = Filter::new()
+            .kind(Kind::GiftWrap)
+            .pubkey(own_pk)
+            .since(since);
+        let Ok(wraps) = client.fetch_events(filter, Duration::from_secs(5)).await else {
+            continue;
+        };
+        for wrap in wraps.iter() {
+            let Ok(gift) = client.unwrap_gift_wrap(wrap).await else { continue };
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(&gift.rumor.content) else {
+                continue;
+            };
+            if val.get("type").and_then(|v| v.as_str()) != Some("p2pfiat-rpc-res") {
+                continue;
+            }
+            let Some(req_id) = val.get("reqId").and_then(|v| v.as_str()) else { continue };
+            let Some(expected_pk) = req_ids.get(req_id) else { continue };
+            if gift.sender.to_hex().to_lowercase() != *expected_pk {
+                continue;
+            }
+            if val.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                continue;
+            }
+            if let Some(sig_hex) = val
+                .pointer("/result/signature_hex")
+                .and_then(|v| v.as_str())
+            {
+                sigs_by_pubkey.insert(expected_pk.clone(), sig_hex.to_string());
+            }
+        }
+    }
+
+    Ok(sigs_by_pubkey)
+}
+
+/// For any watched contract in `VtxoConfirmed` with a Leaf 2 `dispute` package & signed manifest,
+/// fetch live spot, build the bounty-paying dispute tx, collect `k-of-n` Nostracle signatures
+/// over NIP-17 RPC, and return the finalized consensus-ready transactions keyed by `package.id`.
+pub async fn resolve_pending_disputes(
+    client: &Client,
+    http: &reqwest::Client,
+    wt: &WatchtowerService,
+    now: u64,
+) -> Result<HashMap<String, Transaction>> {
+    let own_pk = wt.wallet.nostr_keys().public_key();
+    let mut resolved: HashMap<String, Transaction> = HashMap::new();
+    let mut spot_cache: HashMap<String, f64> = HashMap::new();
+
+    for c in wt.storage.list() {
+        if !matches!(c.state, WatchState::VtxoConfirmed { .. }) {
+            continue;
+        }
+        let Some(dispute) = &c.package.dispute else { continue };
+        let Some(manifest) = &dispute.manifest else { continue };
+
+        let cur = manifest.currency.trim().to_uppercase();
+        let live_spot = if let Some(&p) = spot_cache.get(&cur) {
+            p
+        } else {
+            match fetch_live_spot_price(http, &cur).await {
+                Ok(p) => {
+                    spot_cache.insert(cur.clone(), p);
+                    p
+                }
+                Err(e) => {
+                    log::warn!("{}: Leaf 2 dispute skipped (no {cur} spot): {e:#}", c.package.id);
+                    continue;
+                }
+            }
+        };
+
+        let built = match build_watchtower_dispute_tx(
+            dispute,
+            &c.package.bounty,
+            live_spot,
+            now,
+            DEFAULT_DISPUTE_MINER_FEE_SATS,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("{}: build Leaf 2 dispute tx failed: {e:#}", c.package.id);
+                continue;
+            }
+        };
+
+        let sigs = match request_dispute_signatures(
+            client,
+            own_pk,
+            dispute,
+            &built.rpc_params,
+            Duration::from_secs(20),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("{}: Leaf 2 sign_dispute RPC failed: {e:#}", c.package.id);
+                continue;
+            }
+        };
+
+        match assemble_dispute_tx_witness(&built, dispute, &sigs) {
+            Ok(final_tx) => {
+                log::info!(
+                    "{}: assembled autonomous Leaf 2 dispute tx ({cur} @ {live_spot:.2}, user={} sats, lp={} sats, bounty={} sats)",
+                    c.package.id,
+                    built.user_payout_sats,
+                    built.lp_payout_sats,
+                    built.bounty_sats
+                );
+                resolved.insert(c.package.id.clone(), final_tx);
+            }
+            Err(e) => {
+                log::warn!("{}: Leaf 2 witness assembly failed: {e:#}", c.package.id);
+            }
+        }
+    }
+
+    Ok(resolved)
 }

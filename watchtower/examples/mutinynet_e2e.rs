@@ -373,6 +373,7 @@ async fn main() -> Result<()> {
             user_sig: hex::encode(secp.sign_schnorr_no_aux_rand(&rm, &u_kp).as_ref()),
             lp_sig: hex::encode(secp.sign_schnorr_no_aux_rand(&rm, &l_kp).as_ref()),
         }),
+        dispute: None,
         trigger_height: 0,
     };
     let _ = (u_kp, l_kp, commit_kp); // User, LP, and commitment keys are gone!
