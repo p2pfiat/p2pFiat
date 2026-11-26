@@ -332,7 +332,8 @@ export class Nip17Peer {
     if (existing && (existing.readyState === 0 || existing.readyState === 1)) {
       return Promise.resolve(existing.readyState === 1);
     }
-    const since = Math.floor(Date.now() / 1000) - 600;
+    // NIP-59 randomizes outer kind:1059 `created_at` up to 48 hours in the past (used by nostr-sdk).
+    const since = Math.floor(Date.now() / 1000) - 172_800 - 600;
     const filter = { kinds: [KIND_GIFT_WRAP], "#p": [this.myKey.pubHex], since };
 
     return new Promise((resolve) => {
