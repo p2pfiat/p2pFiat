@@ -7,7 +7,7 @@
 **p2pFiat** is a self-custody, Bitcoin-collateralized synthetic fiat (USD / EUR) and 2× leveraged BTC protocol built on **[Arkade](https://arkadeos.com/)** (Bitcoin L2 VTXOs), **Discreet Log Contracts (DLCs)**, and **Nostr**.
 
 - **Zero custody:** Neither the Liquidity Provider (LP), the Arkade server, the price oracles (**Nostracles**), nor the **Watchtower** ever holds user keys or can steal funds.
-- **100% browser-native PWA:** Live Mutinynet demo at **[https://p2pfiat.github.io/](https://p2pfiat.github.io/)** — runs completely client-side with a single `nsec1…` backup key.
+- **100% browser-native PWA:** Live Mutinynet demo at **[https://p2pfiat.github.io/](https://p2pfiat.github.io/)** — runs completely client-side with **NIP-07 Nostr Extension login** (Alby / nos2x + portable NIP-44 encrypted seed) or a single `nsec1…` backup key.
 - **Serverless P2P discovery & RPC:** LPs and peer-to-peer makers publish quotes via Nostr (`kind: 30078`) and negotiate contracts over encrypted **NIP-17** Gift Wraps (`kind: 1059`).
 - **Offline safety net:** A **keyless Rust `ark-watchtower`** monitors contracts and executes pre-signed TRUC (v3) CPFP unilateral exits for a tiered onchain bounty if a counterparty disappears.
 
@@ -34,9 +34,9 @@ flowchart TD
 
 ---
 
-### 2. Three-Tier Self-Custody & Single-Key (`nsec1…`) Backup
+### 2. Three-Tier Self-Custody & Portable Login (NIP-07 Extension or `nsec1…`)
 
-One Nostr secret key (`nsec1…`) deterministically derives all wallet keys offline via **HKDF-SHA256** (`salt = "p2pfiat/v1"`) with strict domain separation, so your Nostr `npub`, Arkade key, and L1 Vault key are **cryptographically unlinkable**.
+Sign in with a **Nostr Extension (NIP-07: Alby / nos2x)** — where your `nsec` never leaves the extension and a 32-byte `walletSeed` is NIP-44 encrypted to your own `npub` (`kind: 30078`, `d: "p2pfiat-wallet-seed-v1"`) — or create/restore a single `nsec1…` backup key without any extension. From that seed, all wallet keys are deterministically derived offline via **HKDF-SHA256** (`salt = "p2pfiat/v1"`) with strict domain separation, so your Nostr `npub`, Arkade key, and L1 Vault key are **cryptographically unlinkable**.
 
 ```mermaid
 flowchart TD

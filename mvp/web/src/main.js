@@ -1640,7 +1640,11 @@ async function boot() {
       : isStable
       ? `1 Unified QR: incoming Arkade or Lightning sats auto-lock into Stable ${activeCurrency}`
       : "1 Unified QR: works with Arkade, Lightning & Bitcoin L1 wallets";
-    $("recv-ln-section").classList.toggle("hidden", isVault);
+    const net = String(appWallet?.info?.network || "mutinynet").toLowerCase();
+    const isMainnet = net === "bitcoin" || net === "mainnet";
+    const showBoltzLn = isMainnet && !isVault;
+    $("recv-ln-section").classList.toggle("hidden", !showBoltzLn);
+    if (showBoltzLn) loadLightningFeeHint();
     $("recv-ark-section").classList.toggle("hidden", isVault);
     if (isStable) {
       startStableAutoReceive();
@@ -1652,7 +1656,7 @@ async function boot() {
     if (slot) slot.appendChild(panel);
     panel.classList.remove("hidden");
     renderReceiveQr();
-    if (!isVault) loadLightningFeeHint();
+    // Boltz Lightning VHTLC is only shown on Bitcoin mainnet (handled above)
   }
 
   $("deposit-toggle").onclick = () => openReceivePanel("spending");

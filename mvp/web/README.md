@@ -33,12 +33,12 @@ flowchart TD
 
 ## Key Features
 
-- **Flexible Self-Custody Login (NIP-07 Extension, `nsec1…`, or Zero-Nostr Guest):**
+- **Flexible Self-Custody Login (No Ghost Keys — 3-Choice Onboarding):**
   - **⚡ Login with Nostr Extension (NIP-07: Alby, nos2x):** Your `nsec` never leaves the extension; a 32-byte portable `walletSeed` is NIP-44 encrypted to your own `npub` in `kind: 30078` (`d: "p2pfiat-wallet-seed-v1"`), deterministically deriving your Arkade Spending key, Bitcoin L1 Vault, and background NIP-17 RPC transport key (zero popups while trading).
-  - **Zero-Nostr Guest & `nsec1…` Restore:** Works immediately without any extension or Nostr account, with single-string offline HKDF-SHA256 recovery (and automatically decrypts any NIP-07 cloud seed if you later restore the same `nsec1…` on mobile).
+  - **`nsec1…` Restore or New Identity (No Nostr Needed):** Restore an existing `nsec1…` (automatically decrypts any NIP-07 cloud seed too) or create a fresh identity with immediate `nsec1…` copy & offline HKDF-SHA256 recovery.
 - **3-Tier Self-Custody:**
   1. **🛡 Stable USD / EUR:** Synthetic fiat locked in 2-party Arkade DLCs, earning daily carry yield.
-  2. **⚡ Spending BTC:** Instant Arkade VTXOs + Boltz Lightning VHTLC invoices via Unified BIP-21 QR (`bitcoin:<vault>?ark=<tark1>&lightning=<bolt11>`).
+  2. **⚡ Spending BTC:** Instant Arkade VTXOs + Boltz Lightning VHTLC invoices (mainnet) via Unified BIP-21 QR (`bitcoin:<vault>?ark=<tark1>&lightning=<bolt11>`).
   3. **🏦 Bitcoin Vault (L1):** Pure single-key P2TR onchain address (`0` timelock, never expires).
 - **2× Long BTC & Symmetric P2P Maker Orders:** Take leveraged long BTC positions or post your own P2P maker order directly from the browser — browser-to-browser P2P matches build the exact same 3-leaf Tapscript (including Leaf 2 `k-of-n` Nostracle disputes, 2-party signed `disputeManifest`, and Watchtower `exitSuite`) as LP trades.
 - **⚡ Force Exit (Leaf 2 On-Demand Dispute):** If an LP or P2P peer disappears mid-term (or BTC crashes ≥ 50%), either party can request live `k-of-n` BIP-340 signatures over NIP-17 RPC (`sign_dispute`) with a 350-sat L1 miner fee and broadcast the finalized BIP-342 `OP_CHECKSIGADD` exit transaction.
