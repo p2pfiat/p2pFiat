@@ -1505,6 +1505,11 @@ export class BrowserP2pFiatWallet {
       funding_rate_bps_per_day: fundingBps,
       bounty_sats: 0,
       fee_paid_sats: 0,
+      raw_tx_hex: hex.encode(tx.toBytes(true, false)),
+      vtxo_pk_script_hex: pos.contractPkScriptHex,
+      dispute_script_hex: pos.disputeScriptHex,
+      user_payout_script_hex: hex.encode(uDest),
+      lp_payout_script_hex: hex.encode(lDest),
       sighash_hex: sighashHex,
     };
 
