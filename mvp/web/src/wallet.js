@@ -46,6 +46,7 @@ import {
   getOrCreateNostrAccount,
   getActiveIdentity,
   importNostrAccount,
+  resetNostrAccount,
   logoutNip07Extension,
   tryDecryptCloudWalletSeedWithNsec,
   deriveArkadePrivKeyHexFromNsec,
@@ -585,6 +586,18 @@ export async function restoreFromBackupKey(nsecOrHex) {
   const derivedArkHex = deriveArkadePrivKeyHexFromNsec(effectiveSeed);
   localStorage.setItem(LS_KEY, derivedArkHex);
   return { nostrAccount, arkPrivHex: derivedArkHex, restoredCloudSeed: Boolean(cloudSeed) };
+}
+
+/**
+ * Create a brand-new Nostr identity (`nsec1...`) and deterministically derive its
+ * unified Arkade Spending & Bitcoin L1 Vault keys (for users without an existing Nostr account).
+ */
+export function createFreshNostrWallet() {
+  logoutNip07Extension();
+  const nostrAccount = resetNostrAccount();
+  const derivedArkHex = deriveArkadePrivKeyHexFromNsec(nostrAccount.privHex);
+  localStorage.setItem(LS_KEY, derivedArkHex);
+  return { nostrAccount, arkPrivHex: derivedArkHex };
 }
 
 async function postJson(url, body) {

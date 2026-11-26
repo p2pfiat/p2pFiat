@@ -28,6 +28,7 @@ import {
   loadPositions,
   restorePositionsFromNostr,
   restoreFromBackupKey,
+  createFreshNostrWallet,
 } from "./wallet.js";
 import {
   LocalOrderBook,
@@ -45,8 +46,9 @@ import {
   fetchNostrProfile,
   publishNostrProfile,
   hasNip07Extension,
+  hasStoredAccount,
   loginWithNip07Extension,
-  logoutNip07Extension,
+  clearAllWalletAuth,
 } from "./nostr-account.js";
 
 const $ = (id) => document.getElementById(id);
@@ -165,10 +167,10 @@ function renderNostrAccount() {
       : "";
   const hasProfile = Boolean(displayName || picture);
 
-  // Top-right header: show profile pill when logged in via NIP-07 or when profile is set;
-  // otherwise show compact "🟣 Login" button for 1-click Nostr Extension / nsec login.
+  // Top-right header: when signed in, show profile pill (or compact account pill) and hide Login button
   const pill = $("nostr-pill");
   const headerLoginBtn = $("header-nostr-login-btn");
+  headerLoginBtn?.classList.add("hidden");
   if (hasProfile || isNip07) {
     pill.textContent = "";
     if (picture) {
@@ -182,23 +184,17 @@ function renderNostrAccount() {
     span.textContent = displayName || `⚡ ${id.npub.slice(0, 10)}…`;
     pill.appendChild(span);
     pill.classList.remove("hidden");
-    headerLoginBtn?.classList.add("hidden");
   } else {
     pill.classList.add("hidden");
-    headerLoginBtn?.classList.remove("hidden");
   }
 
-  // Auth mode badge & NIP-07 Extension controls
+  // Auth mode badge in Settings
   const modeBadge = $("auth-mode-badge");
   if (modeBadge) {
     modeBadge.innerHTML = isNip07
-      ? `⚡ <strong>Connected via Nostr Extension</strong> (<code>${id.npub.slice(0, 14)}…</code>) — Arkade &amp; L1 Vault seed synced encrypted via NIP-44`
-      : hasNip07Extension()
-        ? `Mode: <strong>Local Wallet</strong> (works without Nostr · Extension detected for portable login)`
-        : `Mode: <strong>Local Wallet</strong> (works without Nostr or any browser extension)`;
+      ? `⚡ <strong>Signed in via Nostr Extension</strong> (<code>${id.npub.slice(0, 14)}…</code>) — Arkade &amp; L1 Vault seed synced encrypted via NIP-44`
+      : `🔑 <strong>Signed in with Local Backup Key</strong> (<code>${id.npub.slice(0, 14)}…</code>)`;
   }
-  $("nip07-login-btn")?.classList.toggle("hidden", isNip07);
-  $("nip07-logout-btn")?.classList.toggle("hidden", !isNip07);
 
   // Unified Wallet Backup Key (nsec in local mode, emergency offline walletSeed in NIP-07 mode)
   $("backup-key-label").textContent = isNip07
@@ -209,6 +205,8 @@ function renderNostrAccount() {
 
   // Advanced → Nostr section
   $("nostr-npub").textContent = id.npub;
+  const primalLink = $("nostr-primal-link");
+  if (primalLink) primalLink.href = `https://primal.net/p/${id.npub}`;
   if (displayName && !$("nostr-name-input").value) {
     $("nostr-name-input").value = displayName;
   }
@@ -2441,19 +2439,16 @@ async function boot() {
 
   $("header-nostr-login-btn").onclick = () => {
     if (hasNip07Extension()) {
-      $("nip07-login-btn").click();
+      $("onboard-nip07-btn")?.click();
     } else {
-      const panel = $("settings-panel");
-      panel.classList.remove("hidden");
-      panel.scrollIntoView({ behavior: "smooth", block: "start" });
-      setTimeout(() => $("nsec-login-input")?.focus(), 200);
+      $("onboard-nsec-input")?.focus();
     }
   };
 
-  $("nip07-login-btn").onclick = async () => {
-    const btn = $("nip07-login-btn");
+  $("onboard-nip07-btn").onclick = async () => {
+    const btn = $("onboard-nip07-btn");
     btn.disabled = true;
-    btn.textContent = "Connecting Extension…";
+    btn.textContent = "Connecting Nostr Extension…";
     try {
       const res = await loginWithNip07Extension(getNostrRelays());
       showToast(
@@ -2462,47 +2457,69 @@ async function boot() {
           : `⚡ Restored portable Arkade + L1 Vault wallet for ${res.npub.slice(0, 12)}…!`,
         4500
       );
-      setTimeout(() => location.reload(), 800);
+      setTimeout(() => location.reload(), 700);
     } catch (e) {
       showToast(`Extension login failed: ${e.message}`, 5500);
       btn.disabled = false;
-      btn.textContent = "⚡ Login with Nostr Extension";
+      btn.textContent = "⚡ Login with Nostr Extension (Alby / nos2x)";
     }
   };
 
-  $("nip07-logout-btn").onclick = () => {
-    const ok = confirm(
-      "Disconnect Nostr Extension and return to your local browser wallet?\nYour encrypted wallet seed stays safely stored on Nostr for next login."
-    );
-    if (!ok) return;
-    logoutNip07Extension();
-    showToast("Disconnected Nostr Extension — reloading…");
-    location.reload();
-  };
-
-  $("nsec-login-btn").onclick = async () => {
-    const raw = $("nsec-login-input").value.trim();
+  $("onboard-nsec-btn").onclick = async () => {
+    const raw = $("onboard-nsec-input").value.trim();
     if (!raw) {
       showToast("Paste your nsec1… or 64-char hex Backup Key first");
       return;
     }
-    const btn = $("nsec-login-btn");
+    const btn = $("onboard-nsec-btn");
     btn.disabled = true;
     btn.textContent = "Restoring…";
     try {
       const res = await restoreFromBackupKey(raw);
-      $("nsec-login-input").value = "";
+      $("onboard-nsec-input").value = "";
       showToast(
         res.restoredCloudSeed
-          ? "Restored portable encrypted seed from Nostr — reloading…"
-          : "Wallet restored from nsec — reloading…"
+          ? "Restored portable encrypted seed from Nostr — loading wallet…"
+          : "Wallet restored from nsec — loading wallet…"
       );
       setTimeout(() => location.reload(), 600);
     } catch (e) {
       showToast(`Invalid Backup Key: ${e.message}`, 4500);
       btn.disabled = false;
-      btn.textContent = "Login / Restore";
+      btn.textContent = "Login";
     }
+  };
+
+  $("onboard-create-btn").onclick = () => {
+    const { nostrAccount } = createFreshNostrWallet();
+    $("onboard-choices").classList.add("hidden");
+    $("onboard-created-step").classList.remove("hidden");
+    $("onboard-new-nsec").value = nostrAccount.nsec;
+    showToast("✨ New Nostr identity created — copy your nsec1… backup key!");
+  };
+
+  $("onboard-copy-nsec-btn").onclick = async () => {
+    const val = $("onboard-new-nsec").value;
+    if (!val) return;
+    await navigator.clipboard.writeText(val);
+    showToast("Secret nsec1… copied — store it offline and keep it private!");
+  };
+
+  $("onboard-enter-btn").onclick = () => {
+    location.reload();
+  };
+
+  $("logout-btn").onclick = () => {
+    const isNip07 = appWallet?.authIdentity?.mode === "nip07";
+    const ok = confirm(
+      isNip07
+        ? "Log out of Nostr Extension?\nYour encrypted wallet seed remains safely stored on Nostr for next login."
+        : "Log out and clear this browser's wallet key?\n\nMake sure you have copied your Backup Key (nsec1…) first if you hold any funds!"
+    );
+    if (!ok) return;
+    clearAllWalletAuth();
+    showToast("Logged out — returning to sign-in…");
+    setTimeout(() => location.reload(), 400);
   };
 
   $("publish-profile-btn").onclick = async () => {
@@ -2548,6 +2565,19 @@ async function boot() {
 
   renderOrderBook();
   startOrderBookSubscription();
+
+  // Do NOT auto-generate a ghost key before the user chooses how to sign in.
+  if (!hasStoredAccount()) {
+    $("onboarding-card").classList.remove("hidden");
+    $("wallet-main").classList.add("hidden");
+    $("refresh-btn").classList.add("hidden");
+    $("settings-btn").classList.add("hidden");
+    $("header-nostr-login-btn").classList.remove("hidden");
+    return;
+  }
+
+  $("onboarding-card").classList.add("hidden");
+  $("wallet-main").classList.remove("hidden");
 
   appWallet = await BrowserP2pFiatWallet.create();
   $("privkey-input").value = appWallet.userKey.privHex;

@@ -38,6 +38,59 @@
         </div>
       </header>
 
+      <section id="onboarding-card" class="card hidden" style="text-align:left">
+        <div style="margin-bottom:14px">
+          <h2 style="margin:0 0 6px;font-size:1.15rem">Welcome to p2pFiat</h2>
+          <p class="muted" style="margin:0;font-size:0.84rem;line-height:1.45">
+            Self-custody Stable USD/EUR &amp; Bitcoin on Arkade. Choose how you want to sign in — no keys are generated until you choose.
+          </p>
+        </div>
+
+        <div id="onboard-choices" style="display:flex;flex-direction:column;gap:10px">
+          <button id="onboard-nip07-btn" class="btn primary" style="width:100%">
+            ⚡ Login with Nostr Extension (Alby / nos2x)
+          </button>
+          <div class="muted" style="font-size:0.75rem;text-align:center">
+            Portable across devices · Arkade &amp; Bitcoin L1 Vault seed synced encrypted via NIP-44
+          </div>
+
+          <div class="field" style="margin:6px 0 2px">
+            <label>Or login / restore with existing Nostr key (no extension needed)</label>
+            <div class="copy-row">
+              <input id="onboard-nsec-input" type="password" placeholder="Paste nsec1… or 64-char hex" autocomplete="off" />
+              <button id="onboard-nsec-btn" class="btn secondary small">Login</button>
+            </div>
+          </div>
+
+          <div style="border-top:1px solid var(--card-border);padding-top:12px;margin-top:4px">
+            <button id="onboard-create-btn" class="btn secondary" style="width:100%">
+              ✨ I don't have a Nostr identity, please create one
+            </button>
+            <div class="muted" style="font-size:0.74rem;text-align:center;margin-top:6px">
+              Works immediately without Nostr — generates 1 single backup key for your entire wallet.
+            </div>
+          </div>
+        </div>
+
+        <div id="onboard-created-step" class="hidden" style="display:flex;flex-direction:column;gap:10px">
+          <div class="roll-hint good">
+            <strong>✨ New Nostr identity &amp; wallet created!</strong><br/>
+            Copy and save your secret backup key (<code>nsec1…</code>) offline before continuing. It recovers your entire wallet on any device.
+          </div>
+          <div class="field" style="margin:0">
+            <label>Your Secret Backup Key (<code>nsec1…</code> — keep private!)</label>
+            <div class="copy-row">
+              <input id="onboard-new-nsec" type="text" readonly />
+              <button id="onboard-copy-nsec-btn" class="btn small">Copy</button>
+            </div>
+          </div>
+          <button id="onboard-enter-btn" class="btn primary" style="width:100%">
+            I saved my backup key — Enter Wallet →
+          </button>
+        </div>
+      </section>
+
+      <div id="wallet-main" style="display:flex;flex-direction:column;gap:14px">
       <section class="balance-card">
         <div class="balance-label">Total Balance (Self-Custody)</div>
         <div id="total-usd" class="balance-main">$0.00</div>
@@ -395,19 +448,8 @@
           <button class="close-x" data-close-panel="settings-panel" aria-label="Close">✕</button>
         </div>
         <div class="backup-box">
-          <div class="field" style="margin-bottom:10px">
-            <label>Portable Nostr Login (Optional — works with or without Nostr)</label>
-            <div id="auth-mode-badge" class="muted" style="font-size:0.78rem;margin-bottom:8px">
-              Mode: Local Wallet (no Nostr extension required)
-            </div>
-            <div class="action-row" style="margin-bottom:8px">
-              <button id="nip07-login-btn" class="btn primary small">⚡ Login with Nostr Extension</button>
-              <button id="nip07-logout-btn" class="btn secondary small hidden">Disconnect Extension</button>
-            </div>
-            <div class="copy-row">
-              <input id="nsec-login-input" type="password" placeholder="Or paste nsec1… to login / restore without extension" autocomplete="off" />
-              <button id="nsec-login-btn" class="btn secondary small">Login / Restore</button>
-            </div>
+          <div id="auth-mode-badge" class="muted" style="font-size:0.78rem;margin-bottom:10px">
+            Mode: Local Wallet
           </div>
           <div class="field" style="margin-bottom:8px">
             <label id="backup-key-label">Wallet Backup Key (single secret string — restores your entire wallet)</label>
@@ -417,11 +459,14 @@
               <button id="copy-backup-btn" class="btn small">Copy</button>
             </div>
           </div>
-          <div id="backup-key-hint" class="muted" style="font-size:0.76rem;line-height:1.4;margin-bottom:4px">
+          <div id="backup-key-hint" class="muted" style="font-size:0.76rem;line-height:1.4;margin-bottom:10px">
             Save this single backup key offline. It deterministically recovers your Arkade Spending, Bitcoin L1 Vault, and open DLC positions on any device — keep it private.
           </div>
-          <div id="legacy-key-warning" class="roll-hint hidden" style="margin-top:8px">
-            This browser has an older separate Arkade key with existing funds. Keep it backed up under <strong>Advanced → Raw Arkade Key</strong>, or restore a unified Backup Key above.
+          <div id="legacy-key-warning" class="roll-hint hidden" style="margin-bottom:10px">
+            This browser has an older separate Arkade key with existing funds. Keep it backed up under <strong>Advanced → Raw Arkade Key</strong>.
+          </div>
+          <div class="action-row">
+            <button id="logout-btn" class="btn secondary small">Log out</button>
           </div>
         </div>
 
@@ -443,6 +488,7 @@
                 <div class="copy-row">
                   <code id="nostr-npub">—</code>
                   <button class="btn small" data-copy="nostr-npub">Copy</button>
+                  <a id="nostr-primal-link" class="btn small secondary" href="https://primal.net/" target="_blank" rel="noopener noreferrer" style="text-decoration:none;white-space:nowrap">Primal ↗</a>
                 </div>
               </div>
               <div class="field">
@@ -500,6 +546,7 @@
           </div>
         </details>
       </section>
+      </div>
 
       <footer class="app-footer">
         <span class="muted">p2pFiat · Self-Custody on Arkade</span>

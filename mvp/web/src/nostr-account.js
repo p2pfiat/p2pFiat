@@ -96,6 +96,28 @@ export function hasNip07Extension() {
   return Boolean(typeof window !== "undefined" && window.nostr?.getPublicKey);
 }
 
+/**
+ * Returns true only if the user has already logged in (via NIP-07 Extension, nsec restore,
+ * or explicitly created a local wallet). Never auto-generates a ghost key.
+ */
+export function hasStoredAccount() {
+  if (getAuthMode() === "nip07") return true;
+  if (localStorage.getItem(LS_NOSTR_PRIVKEY)) return true;
+  if (localStorage.getItem("p2pfiat_user_privkey_hex")) return true;
+  return false;
+}
+
+/**
+ * Clear active wallet session keys from this browser (explicit Log out).
+ */
+export function clearAllWalletAuth() {
+  localStorage.removeItem(LS_AUTH_MODE);
+  localStorage.removeItem(LS_NIP07_PUBKEY);
+  localStorage.removeItem(LS_WALLET_SEED);
+  localStorage.removeItem(LS_NOSTR_PRIVKEY);
+  localStorage.removeItem("p2pfiat_user_privkey_hex");
+}
+
 export function getAuthMode() {
   const mode = localStorage.getItem(LS_AUTH_MODE);
   const pub = localStorage.getItem(LS_NIP07_PUBKEY);
