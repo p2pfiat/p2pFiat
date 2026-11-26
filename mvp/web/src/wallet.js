@@ -30,11 +30,17 @@ import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 
 import {
   DEFAULT_RELAYS,
+  computeEventId,
   buildQuorumForPreset,
   buildP2pOrderEvent,
   publishOfferEvent,
 } from "./offerbook.js";
-import { Nip17Peer } from "./nip17.js";
+import {
+  Nip17Peer,
+  getConversationKey,
+  nip44Encrypt,
+  nip44Decrypt,
+} from "./nip17.js";
 import { computeKormirOutcomePoint } from "./nostracle-client.js";
 import {
   getOrCreateNostrAccount,
@@ -339,6 +345,9 @@ export function removeCustomNostracle(pubHex) {
   return next;
 }
 
+const POSITIONS_BACKUP_D_TAG = "p2pfiat-positions-backup-v1";
+let _posBackupTimer = null;
+
 export function loadPositions() {
   try {
     return JSON.parse(localStorage.getItem(LS_POSITIONS) || "{}");
@@ -347,8 +356,132 @@ export function loadPositions() {
   }
 }
 
-export function savePositions(map) {
+export function savePositions(map, { skipNostrBackup = false } = {}) {
   localStorage.setItem(LS_POSITIONS, JSON.stringify(map));
+  if (!skipNostrBackup) {
+    if (_posBackupTimer) clearTimeout(_posBackupTimer);
+    _posBackupTimer = setTimeout(() => {
+      _posBackupTimer = null;
+      backupPositionsToNostr(map).catch(() => {});
+    }, 1500);
+  }
+}
+
+/**
+ * Encrypt open & recent DLC position metadata to self using NIP-44 v2 (`nsec1...` -> `npub1...`)
+ * and publish as a replaceable NIP-78 `kind: 30078` event so restoring `nsec1...` on a new
+ * device recovers all open DLC contracts (including Leaf 2 dispute scripts & oracle quorum).
+ */
+export async function backupPositionsToNostr(map = loadPositions()) {
+  const acct = getOrCreateNostrAccount();
+  if (!acct?.privHex || !acct?.pubHex) return null;
+  const entries = Object.values(map || {});
+  const open = entries.filter((p) => p?.status === "open");
+  const closed = entries
+    .filter((p) => p?.status !== "open")
+    .sort((a, b) => (b.closedAt || b.openedAt || 0) - (a.closedAt || a.openedAt || 0))
+    .slice(0, 15);
+  const compact = {};
+  for (const p of [...open, ...closed]) {
+    if (!p?.positionId) continue;
+    compact[p.positionId] = p;
+  }
+  const plaintext = JSON.stringify({ v: 1, updatedAt: Math.floor(Date.now() / 1000), positions: compact });
+  if (plaintext.length > 60_000) return null;
+  const convKey = getConversationKey(hex.decode(acct.privHex), acct.pubHex);
+  const encrypted = nip44Encrypt(plaintext, convKey);
+  const unsigned = {
+    pubkey: acct.pubHex,
+    created_at: Math.floor(Date.now() / 1000),
+    kind: 30078,
+    tags: [["d", POSITIONS_BACKUP_D_TAG]],
+    content: encrypted,
+  };
+  const id = computeEventId(unsigned);
+  const sig = hex.encode(schnorr.sign(hex.decode(id), hex.decode(acct.privHex)));
+  return publishOfferEvent({ ...unsigned, id, sig }, getNostrRelays());
+}
+
+/**
+ * Fetch and decrypt the latest NIP-44 self-encrypted DLC position backup from Nostr relays,
+ * merging any missing or newer positions into `localStorage`.
+ */
+export async function restorePositionsFromNostr(timeoutMs = 4000) {
+  const acct = getOrCreateNostrAccount();
+  if (!acct?.privHex || !acct?.pubHex) return { restoredCount: 0, totalCount: 0 };
+  const relays = getNostrRelays();
+  let latest = null;
+  await Promise.all(
+    relays.map(
+      (relayUrl) =>
+        new Promise((resolve) => {
+          let ws;
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            try { ws?.close(); } catch {}
+            resolve();
+          };
+          const timer = setTimeout(finish, timeoutMs);
+          try {
+            ws = new WebSocket(relayUrl);
+            const subId = `pbk-${Math.random().toString(16).slice(2, 8)}`;
+            ws.onopen = () => {
+              ws.send(
+                JSON.stringify([
+                  "REQ",
+                  subId,
+                  { kinds: [30078], authors: [acct.pubHex], "#d": [POSITIONS_BACKUP_D_TAG], limit: 1 },
+                ])
+              );
+            };
+            ws.onmessage = (msg) => {
+              try {
+                const frame = JSON.parse(String(msg.data));
+                if (frame[0] === "EVENT" && frame[2]) {
+                  const ev = frame[2];
+                  if (ev.kind !== 30078 || ev.pubkey !== acct.pubHex) return;
+                  if (computeEventId(ev) !== ev.id) return;
+                  if (!schnorr.verify(hex.decode(ev.sig), hex.decode(ev.id), hex.decode(ev.pubkey))) return;
+                  if (!latest || ev.created_at > latest.created_at) latest = ev;
+                } else if (frame[0] === "EOSE") {
+                  clearTimeout(timer);
+                  finish();
+                }
+              } catch {}
+            };
+            ws.onerror = () => { clearTimeout(timer); finish(); };
+            ws.onclose = () => { clearTimeout(timer); finish(); };
+          } catch {
+            clearTimeout(timer);
+            finish();
+          }
+        })
+    )
+  );
+  if (!latest?.content) return { restoredCount: 0, totalCount: Object.keys(loadPositions()).length };
+
+  const convKey = getConversationKey(hex.decode(acct.privHex), acct.pubHex);
+  const parsed = JSON.parse(nip44Decrypt(latest.content, convKey));
+  const remoteMap = parsed?.positions || {};
+  const localMap = loadPositions();
+  let restoredCount = 0;
+  for (const [id, remotePos] of Object.entries(remoteMap)) {
+    const localPos = localMap[id];
+    if (!localPos) {
+      localMap[id] = remotePos;
+      restoredCount++;
+    } else if (localPos.status === "open" && remotePos.status === "closed") {
+      localMap[id] = remotePos;
+      restoredCount++;
+    } else if ((remotePos.rollCount || 0) > (localPos.rollCount || 0)) {
+      localMap[id] = remotePos;
+      restoredCount++;
+    }
+  }
+  if (restoredCount > 0) savePositions(localMap, { skipNostrBackup: true });
+  return { restoredCount, totalCount: Object.keys(localMap).length };
 }
 
 export function getOrCreatePrivKeyHex(nostrAccount = null) {

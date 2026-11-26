@@ -27,6 +27,7 @@ import {
   addCustomNostracle,
   removeCustomNostracle,
   loadPositions,
+  restorePositionsFromNostr,
   importPrivKeyHex,
   restoreFromBackupKey,
 } from "./wallet.js";
@@ -2528,6 +2529,15 @@ async function boot() {
   $("privkey-input").value = appWallet.userKey.privHex;
   renderNostrAccount();
   refreshNostrProfile();
+  restorePositionsFromNostr()
+    .then((res) => {
+      if (res?.restoredCount > 0) {
+        renderPositions();
+        tickInterest();
+        showToast(`Restored ${res.restoredCount} position(s) from encrypted Nostr backup`, 5000);
+      }
+    })
+    .catch(() => {});
   await verifyOrderBookPof(true);
   await refresh();
   await fetchQuoteUi();
