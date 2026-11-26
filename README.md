@@ -2,6 +2,8 @@
 
 > **Humanity deserves a trustless, permissionless digital fiat currency.**
 
+![p2pFiat DLC Architecture Overview](docs/p2pfiat-dlc-overview.jpg)
+
 **p2pFiat** is a self-custody, Bitcoin-collateralized synthetic fiat (USD / EUR) and 2× leveraged BTC protocol built on **[Arkade](https://arkadeos.com/)** (Bitcoin L2 VTXOs), **Discreet Log Contracts (DLCs)**, and **Nostr**.
 
 - **Zero custody:** Neither the Liquidity Provider (LP), the Arkade server, the price oracles (**Nostracles**), nor the **Watchtower** ever holds user keys or can steal funds.
