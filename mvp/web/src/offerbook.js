@@ -433,12 +433,19 @@ export class LocalOrderBook {
     return this.getOffers({ pair, notionalUsd, minSats })[0] || null;
   }
 
-  getOrderbookPrice({ pair = null, nowSecs = Math.floor(Date.now() / 1000), verifiedOnly = false } = {}) {
+  getOrderbookPrice({
+    pair = null,
+    nowSecs = Math.floor(Date.now() / 1000),
+    verifiedOnly = false,
+    maxOfferDeviation = 0.02,
+  } = {}) {
     const ts = typeof arguments[0] === "number" ? arguments[0] : nowSecs;
     const offers = this.getOffers({ pair, nowSecs: ts });
     if (offers.length === 0) {
       return {
         medianMidUsd: null,
+        shortMedianUsd: null,
+        longMedianUsd: null,
         lpCount: 0,
         verifiedLpCount: 0,
         totalVerifiedSats: 0,
@@ -447,19 +454,56 @@ export class LocalOrderBook {
       };
     }
 
-    const midOf = (o) =>
-      Number.isFinite(o.bidUsd) && Number.isFinite(o.askUsd)
-        ? (o.bidUsd + o.askUsd) / 2
-        : o.spotUsd;
+    // Outlier-resistant liquidity-weighted median per side (drops offers > maxOfferDeviation from raw median)
+    const robustWeightedMedian = (items) => {
+      if (!items.length) return null;
+      const rawMed = weightedMedian(items);
+      if (!Number.isFinite(rawMed) || rawMed <= 0) return null;
+      const inliers = items.filter(
+        (it) => Math.abs(it.value - rawMed) / rawMed <= maxOfferDeviation
+      );
+      return weightedMedian(inliers.length > 0 ? inliers : items);
+    };
+
+    // Split offers into Short (Stable) and Long (2x) books so APR/spread bias cancels out
+    const computeBalancedMid = (pool, weightFn) => {
+      const shortItems = [];
+      const longItems = [];
+      for (const o of pool) {
+        const w = weightFn(o);
+        if (!Number.isFinite(w) || w <= 0) continue;
+        const spot = o.spotPrice ?? o.spotUsd;
+        const bid = Number.isFinite(o.bidPrice ?? o.bidUsd) ? (o.bidPrice ?? o.bidUsd) : spot;
+        const ask = Number.isFinite(o.askPrice ?? o.askUsd) ? (o.askPrice ?? o.askUsd) : spot;
+        if (o.makerType === "p2p") {
+          if (o.makerSide === "short") shortItems.push({ value: spot, weight: w });
+          else longItems.push({ value: spot, weight: w });
+        } else {
+          // Two-sided LP quotes both short (bid) and long (ask)
+          shortItems.push({ value: bid, weight: w });
+          longItems.push({ value: ask, weight: w });
+        }
+      }
+      const shortMed = robustWeightedMedian(shortItems);
+      const longMed = robustWeightedMedian(longItems);
+      const mid =
+        shortMed !== null && longMed !== null
+          ? (shortMed + longMed) / 2
+          : shortMed ?? longMed;
+      return { mid, shortMed, longMed };
+    };
 
     const verifiedFunded = offers.filter((o) => o.pofVerified && o.verifiedLiquiditySats > 0);
     if (verifiedFunded.length > 0) {
       const totalVerifiedSats = verifiedFunded.reduce((s, o) => s + o.verifiedLiquiditySats, 0);
-      const wm = weightedMedian(
-        verifiedFunded.map((o) => ({ value: midOf(o), weight: o.verifiedLiquiditySats }))
+      const { mid, shortMed, longMed } = computeBalancedMid(
+        verifiedFunded,
+        (o) => o.verifiedLiquiditySats
       );
       return {
-        medianMidUsd: Math.round(wm),
+        medianMidUsd: mid !== null ? Math.round(mid) : null,
+        shortMedianUsd: shortMed !== null ? Math.round(shortMed) : null,
+        longMedianUsd: longMed !== null ? Math.round(longMed) : null,
         lpCount: offers.length,
         verifiedLpCount: verifiedFunded.length,
         totalVerifiedSats,
@@ -471,6 +515,8 @@ export class LocalOrderBook {
     if (verifiedOnly) {
       return {
         medianMidUsd: null,
+        shortMedianUsd: null,
+        longMedianUsd: null,
         lpCount: offers.length,
         verifiedLpCount: 0,
         totalVerifiedSats: 0,
@@ -479,12 +525,11 @@ export class LocalOrderBook {
       };
     }
 
-    const mids = offers.map(midOf).sort((a, b) => a - b);
-    const midIdx = Math.floor(mids.length / 2);
-    const median =
-      mids.length % 2 === 1 ? mids[midIdx] : (mids[midIdx - 1] + mids[midIdx]) / 2;
+    const { mid, shortMed, longMed } = computeBalancedMid(offers, () => 1);
     return {
-      medianMidUsd: Math.round(median),
+      medianMidUsd: mid !== null ? Math.round(mid) : null,
+      shortMedianUsd: shortMed !== null ? Math.round(shortMed) : null,
+      longMedianUsd: longMed !== null ? Math.round(longMed) : null,
       lpCount: offers.length,
       verifiedLpCount: 0,
       totalVerifiedSats: 0,
