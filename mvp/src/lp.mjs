@@ -339,7 +339,11 @@ export async function createLpServer({
         posQuorum
       );
       const disputeControlBlockHex = disputeClosure
-        ? hex.encode(contractScript.findLeaf(disputeClosure.scriptHex)[0])
+        ? hex.encode(
+            btc.TaprootControlBlock.encode(
+              contractScript.findLeaf(disputeClosure.scriptHex)[0]
+            )
+          )
         : null;
 
       const lpVtxos = await wallet.getVtxos();
