@@ -10,6 +10,7 @@ import {
 } from "@arkade-os/sdk";
 import * as btc from "@scure/btc-signer";
 import { hex, base64 } from "@scure/base";
+import { sha256 } from "@noble/hashes/sha2.js";
 import {
   schnorrSign,
   adaptorSign,
@@ -24,6 +25,55 @@ import {
 /** Unspendable BIP-341 NUMS internal key (matches `ark-watchtower/src/bounty.rs`). */
 export const NUMS_INTERNAL_KEY_HEX =
   "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+
+const _enc = new TextEncoder();
+
+/**
+ * Compute the deterministic BIP-340 tagged hash (`p2pfiat/dispute-manifest/v1`) binding
+ * all immutable contract terms and payout scripts (matches `nostracle/src/dispute.rs`).
+ */
+export function computeDisputeManifestHash({
+  contract_id,
+  vtxo_outpoint,
+  currency,
+  side = "short",
+  total_collateral_sats,
+  notional_fiat,
+  opened_at,
+  funding_rate_bps_per_day,
+  user_pubkey_hex,
+  lp_pubkey_hex,
+  vtxo_pk_script_hex,
+  dispute_script_hex,
+  user_payout_script_hex,
+  lp_payout_script_hex,
+}) {
+  const notionalCents = Math.round(Number(notional_fiat) * 100);
+  const fundingBpsX100 = Math.round(Number(funding_rate_bps_per_day) * 100);
+  const canonical = [
+    String(contract_id).trim(),
+    String(vtxo_outpoint).trim().toLowerCase(),
+    String(currency).trim().toUpperCase(),
+    String(side).trim().toLowerCase(),
+    String(Number(total_collateral_sats)),
+    String(notionalCents),
+    String(Number(opened_at)),
+    String(fundingBpsX100),
+    String(user_pubkey_hex).trim().toLowerCase(),
+    String(lp_pubkey_hex).trim().toLowerCase(),
+    String(vtxo_pk_script_hex).trim().toLowerCase(),
+    String(dispute_script_hex).trim().toLowerCase(),
+    String(user_payout_script_hex).trim().toLowerCase(),
+    String(lp_payout_script_hex).trim().toLowerCase(),
+  ].join("|");
+  const tagHash = sha256(_enc.encode("p2pfiat/dispute-manifest/v1"));
+  const body = _enc.encode(canonical);
+  const preimage = new Uint8Array(64 + body.length);
+  preimage.set(tagHash, 0);
+  preimage.set(tagHash, 32);
+  preimage.set(body, 64);
+  return sha256(preimage);
+}
 
 /**
  * Compile a tiered Taproot watchtower bounty output script matching `ark-watchtower/src/bounty.rs`:

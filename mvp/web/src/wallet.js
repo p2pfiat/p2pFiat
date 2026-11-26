@@ -84,6 +84,28 @@ function taggedHash(tag, ...parts) {
   return nobleSha256(concatBytes(th, th, ...parts));
 }
 
+function computeDisputeManifestHash(m) {
+  const notionalCents = Math.round(Number(m.notional_fiat) * 100);
+  const fundingBpsX100 = Math.round(Number(m.funding_rate_bps_per_day) * 100);
+  const canonical = [
+    String(m.contract_id).trim(),
+    String(m.vtxo_outpoint).trim().toLowerCase(),
+    String(m.currency).trim().toUpperCase(),
+    String(m.side || "short").trim().toLowerCase(),
+    String(Number(m.total_collateral_sats)),
+    String(notionalCents),
+    String(Number(m.opened_at)),
+    String(fundingBpsX100),
+    String(m.user_pubkey_hex).trim().toLowerCase(),
+    String(m.lp_pubkey_hex).trim().toLowerCase(),
+    String(m.vtxo_pk_script_hex).trim().toLowerCase(),
+    String(m.dispute_script_hex).trim().toLowerCase(),
+    String(m.user_payout_script_hex).trim().toLowerCase(),
+    String(m.lp_payout_script_hex).trim().toLowerCase(),
+  ].join("|");
+  return taggedHash("p2pfiat/dispute-manifest/v1", enc.encode(canonical));
+}
+
 function bytesToBigInt(b) {
   return BigInt("0x" + hex.encode(b));
 }
@@ -1274,6 +1296,23 @@ export class BrowserP2pFiatWallet {
       };
     }
 
+    // Verify LP's Contract Manifest signature and attach User's BIP-340 signature
+    // (cryptographically binds both payout addresses and contract terms for Leaf 2 disputes).
+    const manifestSrc = prop.disputeManifest || pos.disputeManifest;
+    if (manifestSrc?.lp_manifest_sig_hex) {
+      const mHash = computeDisputeManifestHash(manifestSrc);
+      const lpOk = schnorr.verify(
+        hex.decode(manifestSrc.lp_manifest_sig_hex),
+        mHash,
+        hex.decode(manifestSrc.lp_pubkey_hex)
+      );
+      if (!lpOk) throw new Error("LP dispute manifest signature invalid! Refusing position.");
+      pos.disputeManifest = {
+        ...manifestSrc,
+        user_manifest_sig_hex: hex.encode(schnorrSign(this.userKey, mHash)),
+      };
+    }
+
     const map = loadPositions();
     map[pos.positionId] = pos;
     savePositions(map);
@@ -1627,22 +1666,32 @@ export class BrowserP2pFiatWallet {
       if (ok === 0) throw new Error("Could not connect to Nostr relays for dispute RPC");
     }
 
+    const manifest = pos.disputeManifest;
+    if (!manifest?.user_manifest_sig_hex || !manifest?.lp_manifest_sig_hex) {
+      throw new Error("This position lacks a 2-party signed dispute manifest (re-open or roll to enable)");
+    }
+
     const reqParams = {
-      contract_id: positionId,
-      currency: cur,
-      side,
-      total_collateral_sats: Number(total),
-      notional_fiat: notional,
-      opened_at: openedAt,
+      contract_id: manifest.contract_id,
+      vtxo_outpoint: manifest.vtxo_outpoint,
+      currency: manifest.currency,
+      side: manifest.side,
+      total_collateral_sats: manifest.total_collateral_sats,
+      notional_fiat: manifest.notional_fiat,
+      opened_at: manifest.opened_at,
       dispute_timestamp: disputeTimestamp,
-      funding_rate_bps_per_day: fundingBps,
+      funding_rate_bps_per_day: manifest.funding_rate_bps_per_day,
       bounty_sats: 0,
       fee_paid_sats: 0,
+      user_pubkey_hex: manifest.user_pubkey_hex,
+      lp_pubkey_hex: manifest.lp_pubkey_hex,
+      user_manifest_sig_hex: manifest.user_manifest_sig_hex,
+      lp_manifest_sig_hex: manifest.lp_manifest_sig_hex,
       raw_tx_hex: hex.encode(tx.toBytes(true, false)),
-      vtxo_pk_script_hex: pos.contractPkScriptHex,
-      dispute_script_hex: pos.disputeScriptHex,
-      user_payout_script_hex: hex.encode(uDest),
-      lp_payout_script_hex: hex.encode(lDest),
+      vtxo_pk_script_hex: manifest.vtxo_pk_script_hex,
+      dispute_script_hex: manifest.dispute_script_hex,
+      user_payout_script_hex: manifest.user_payout_script_hex,
+      lp_payout_script_hex: manifest.lp_payout_script_hex,
       sighash_hex: sighashHex,
     };
 

@@ -47,7 +47,13 @@ import {
   computeFiatPayoutSats,
   computeUsdPayoutSats,
 } from "./crypto.mjs";
-import { buildDlcContractScript, buildDefaultArkScript, buildLpExitSuite } from "./contract.mjs";
+import {
+  buildDlcContractScript,
+  buildDefaultArkScript,
+  buildLpExitSuite,
+  computeDisputeManifestHash,
+} from "./contract.mjs";
+import * as btc from "@scure/btc-signer";
 import { JsonStore } from "./store.mjs";
 import {
   DEFAULT_RELAYS,
@@ -388,12 +394,43 @@ export async function createLpServer({
       attachTapscriptSig(lpCkSigned, 0, lpKey.pubXOnly, lpDefaultLeafHash, schnorrSign(lpKey, lpCkHash));
 
       const positionId = `pos-${crypto.randomBytes(6).toString("hex")}`;
+      const openedAt = Math.floor(Date.now() / 1000);
       const primaryOracle = (quote.oracleQuorum || oracleQuorum)?.oracles?.[0];
       const cur = (quote.currency || "USD").toUpperCase();
-      const maturityEpoch = Math.floor(Date.now() / 1000) + Number(quote.termSecs || 86_400);
+      const maturityEpoch = openedAt + Number(quote.termSecs || 86_400);
       const oracleEventId = `btc${cur.toLowerCase()}-${maturityEpoch}`;
-      const refundLockTime = Math.floor(Date.now() / 1000) + 7 * 86_400;
+      const refundLockTime = openedAt + 7 * 86_400;
       const useLeanDisputeMode = Boolean(disputeClosure);
+      let disputeManifest = null;
+      if (useLeanDisputeMode) {
+        const userPayoutScriptHex = hex.encode(
+          btc.p2tr(userPubXOnly, undefined, btc.TEST_NETWORK).script
+        );
+        const lpPayoutScriptHex = hex.encode(
+          btc.p2tr(lpKey.pubXOnly, undefined, btc.TEST_NETWORK).script
+        );
+        const manifestFields = {
+          contract_id: positionId,
+          vtxo_outpoint: `${arkTx.id}:0`,
+          currency: cur,
+          side: quote.side || "short",
+          total_collateral_sats: Number(quote.totalCollateralSats),
+          notional_fiat: Number(quote.notional ?? quote.notionalUsd),
+          opened_at: openedAt,
+          funding_rate_bps_per_day: Number(quote.fundingRateBpsPerDay),
+          user_pubkey_hex: body.userPubHex.toLowerCase(),
+          lp_pubkey_hex: lpKey.pubHex.toLowerCase(),
+          vtxo_pk_script_hex: hex.encode(contractScript.pkScript),
+          dispute_script_hex: disputeClosure.scriptHex,
+          user_payout_script_hex: userPayoutScriptHex,
+          lp_payout_script_hex: lpPayoutScriptHex,
+        };
+        const mHash = computeDisputeManifestHash(manifestFields);
+        disputeManifest = {
+          ...manifestFields,
+          lp_manifest_sig_hex: hex.encode(schnorrSign(lpKey, mHash)),
+        };
+      }
       const liveAnn =
         !useLeanDisputeMode && primaryOracle && relays.length > 0
           ? await fetchLatestNostracleAnnouncement({
@@ -435,6 +472,7 @@ export async function createLpServer({
 
       pendingOpen.set(positionId, {
         quote,
+        openedAt,
         userPubHex: body.userPubHex,
         contractScriptHex: hex.encode(contractScript.pkScript),
         contractTapTreeHex: hex.encode(contractScript.encode()),
@@ -443,6 +481,7 @@ export async function createLpServer({
         disputeScriptHex: disputeClosure?.scriptHex || null,
         disputeControlBlockHex,
         disputeCsvSequence: disputeClosure?.csvSequence || null,
+        disputeManifest,
         userCkUnsignedB64: base64.encode(userCk.toPSBT()),
         lpCkUnsignedB64,
         lpCkSigned,
@@ -456,6 +495,7 @@ export async function createLpServer({
         arkTxB64: base64.encode(arkTx.toPSBT()),
         userCkB64: base64.encode(userCk.toPSBT()),
         exitSuite,
+        disputeManifest,
       };
     }
 
@@ -488,7 +528,7 @@ export async function createLpServer({
         liquidationPrice: pend.quote.liquidationPrice || 0,
         currency: pend.quote.currency || "USD",
         pair: pend.quote.pair || `BTC-${pend.quote.currency || "USD"}`,
-        openedAt: Math.floor(Date.now() / 1000),
+        openedAt: pend.openedAt || Math.floor(Date.now() / 1000),
         vtxoTxid: sub.arkTxid,
         vtxoVout: 0,
         notional: pend.quote.notional ?? pend.quote.notionalUsd,
@@ -510,6 +550,7 @@ export async function createLpServer({
         disputeScriptHex: pend.disputeScriptHex,
         disputeControlBlockHex: pend.disputeControlBlockHex,
         disputeCsvSequence: pend.disputeCsvSequence,
+        disputeManifest: pend.disputeManifest,
         exitDelaySecs: Number(exitDelaySecs),
       };
       store.update((d) => {
