@@ -4,6 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0b0f17" />
+    <link rel="icon" type="image/jpeg" href="./favicon.jpg" />
+    <link rel="apple-touch-icon" href="./favicon.jpg" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <title>p2pFiat — Self-Custody USD on Arkade</title>
   </head>
@@ -11,7 +13,7 @@
     <div id="app">
       <header class="topbar">
         <div class="brand">
-          <span class="dot"></span>
+          <img src="./favicon.jpg" alt="p2pFiat" class="brand-logo" />
           <h1>p2pFiat</h1>
           <span class="badge">Mutinynet</span>
         </div>
@@ -399,7 +401,7 @@
               <select id="quorum-select" class="select-input">
                 <option value="2-of-3">2-of-3 — Light / Low cost (tolerates 1 offline or 1 dishonest)</option>
                 <option value="3-of-5" selected>3-of-5 — Balanced ★ (tolerates 2 offline &amp; 2 dishonest; fee competition)</option>
-                <option value="4-of-7">4-of-7 — Max Security (tolerates 3 offline &amp; 3 dishonest)</option>
+                <option value="4-of-7">4-of-7 — Max Security (tolerates 3 offline &amp; 3 dishonest; strongest fee competition)</option>
               </select>
               <div id="quorum-note" class="muted" style="margin:6px 0 8px"></div>
               <div id="nostracles-box" class="nostracle-list"></div>

@@ -24,6 +24,6 @@ cpfp_fee_sats   = 600   # minimum / fallback CPFP fee per unroll hop
 sweep_fee_sats  = 400   # minimum / fallback bounty sweep fee
 min_bounty_sats = 2000  # refuse packages with smaller bounties
 min_profit_sats = 500   # refuse unrolls when estimated net profit < this
-tick_secs       = 30    # main loop period
+tick_secs       = 120   # main loop period
 
 accept_nostr_packages = true

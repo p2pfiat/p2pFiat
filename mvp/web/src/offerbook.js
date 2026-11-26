@@ -51,7 +51,7 @@ export const QUORUM_PRESETS = {
     threshold: 4,
     total: 7,
     label: "4-of-7 (Max Security — Exp 17)",
-    note: "Tolerates 3 offline AND 3 dishonest oracles. Highest resilience for larger balances.",
+    note: "Tolerates 3 offline AND 3 dishonest oracles. Strongest fee competition (cheapest 4 win); highest resilience for larger balances.",
   },
 };
 

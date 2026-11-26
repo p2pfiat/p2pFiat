@@ -37,6 +37,7 @@ body {
 }
 .brand { display: flex; align-items: center; gap: 8px; }
 .brand h1 { font-size: 1.15rem; margin: 0; font-weight: 700; }
+.brand-logo { width: 26px; height: 26px; border-radius: 6px; object-fit: cover; flex-shrink: 0; }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
 .badge { font-size: 0.7rem; padding: 2px 7px; border-radius: 99px; background: #1e293b; color: var(--muted); }
 .topbar-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
