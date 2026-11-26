@@ -263,6 +263,10 @@ Because the expected long-term return of BTC priced in fiat is positive in most 
 - [Galoy Stablesats](https://stablesats.com/) — Original inspiration for BTC-backed synthetic USD in Bitcoin wallets
 - [10101](https://10101.finance/), [Ben Carman](https://github.com/benthecarman), [Juraj Bednár & René Pickardt (LN-DLC)](https://hackmd.io/@lpQxZaCeTG6OJZI3awxQPQ/LN-DLC), [kormir](https://crates.io/crates/kormir), and [VweTS (ePrint 2022/499)](https://eprint.iacr.org/2022/499)
 
+## License
+
+Licensed under the **Business Source License 1.1 (BSL 1.1)** — see [`LICENSE`](LICENSE). Non-commercial use, auditing, and testnet/Mutinynet operation are permitted; commercial production use requires a separate license from `p2pFiat`. Converts automatically to **AGPL-3.0** on `2030-11-26`.
+
 ---
 
 *Follow updates on [X (@p2pfiat)](https://x.com/p2pfiat) and [Nostr](https://primal.net/p/npub1p2ppegcr9j875e2d76vzn9za9s3rd6npgvde8d5cwjza8c80en3sj72l43).*
