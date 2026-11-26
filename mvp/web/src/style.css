@@ -121,6 +121,32 @@ body {
 .tier-vault {
   background: rgba(14, 20, 31, 0.75);
 }
+.tier-long {
+  border-color: rgba(56, 189, 248, 0.28);
+  background: linear-gradient(180deg, rgba(56, 189, 248, 0.06) 0%, #0e141f 100%);
+}
+.long-gauge {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(31, 42, 61, 0.75);
+}
+.long-payoff-svg {
+  width: 100%;
+  height: 66px;
+  display: block;
+  overflow: visible;
+}
+.long-gauge-labels {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 0.69rem;
+  font-variant-numeric: tabular-nums;
+  gap: 6px;
+}
 .tier-info {
   display: flex;
   flex-direction: column;
@@ -287,9 +313,9 @@ body {
 }
 .split-item { display: flex; flex-direction: column; gap: 2px; font-size: 0.82rem; }
 .muted { color: var(--muted); font-size: 0.78rem; }
+.interest-sub { font-size: 0.72rem; color: var(--green); font-variant-numeric: tabular-nums; }
 .accent-green { color: var(--green); }
 .accent-red { color: var(--red); }
-.interest-sub { font-size: 0.72rem; color: var(--green); font-variant-numeric: tabular-nums; }
 
 .card h2 { font-size: 0.98rem; margin: 0 0 12px; }
 .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }

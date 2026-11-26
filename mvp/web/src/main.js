@@ -520,6 +520,12 @@ function tickInterest() {
   let peggedWeightedAprSum = 0;
   let peggedSatsTotal = 0;
   let longEquityActive = 0;
+  let longCostActive = 0;
+  let longSatsTotal = 0;
+  let longInitSatsTotal = 0;
+  let longWeightedEntrySum = 0;
+  let longWeightedLiqSum = 0;
+  let longCount = 0;
   const nowMs = Date.now();
   const activeSpot = spots[activeCurrency] || spots.USD || 0;
 
@@ -539,13 +545,24 @@ function tickInterest() {
 
     if (p.side === "long") {
       const valFiat = pSpot > 0 ? (estSats / 1e8) * pSpot : pNotional;
+      const initSats = Number(p.userCollateralSats || 0);
+      const entryP = Number(p.openSpotPrice ?? p.openSpotUsd ?? pSpot) * fx;
+      const liqP = Number(p.liquidationPrice || Math.round((p.openSpotPrice ?? p.openSpotUsd ?? pSpot) * 0.5)) * fx;
+      longCount++;
+      longSatsTotal += estSats;
+      longInitSatsTotal += initSats;
       longEquityActive += valFiat * fx;
+      longCostActive += pNotional * fx;
+      longWeightedEntrySum += entryP * Math.max(1, initSats);
+      longWeightedLiqSum += liqP * Math.max(1, initSats);
       const pnlFiat = valFiat - pNotional;
+      const pnlSats = estSats - initSats;
       const pnlPct = pNotional > 0 ? (pnlFiat / pNotional) * 100 : 0;
       const el = document.querySelector(`[data-interest-pos="${p.positionId}"]`);
       if (el) {
         const sign = pnlFiat >= 0 ? "+" : "-";
-        el.textContent = `${sign}${curSym(pCur)}${Math.abs(pnlFiat).toFixed(2)} (${sign}${Math.abs(pnlPct).toFixed(1)}%) · Est. payout: ${estSats.toLocaleString()} sats`;
+        const sSign = pnlSats >= 0 ? "+" : "-";
+        el.textContent = `${sign}${curSym(pCur)}${Math.abs(pnlFiat).toFixed(2)} (${sign}${Math.abs(pnlPct).toFixed(1)}%) · ${sSign}${Math.abs(pnlSats).toLocaleString()} sats · Est. payout: ${estSats.toLocaleString()} sats`;
         el.className = pnlFiat >= 0 ? "accent-green" : "accent-red";
       }
     } else {
@@ -579,6 +596,108 @@ function tickInterest() {
   const vaultFiat = activeSpot > 0 ? (lastVaultSats / 1e8) * activeSpot : 0;
   if ($("avail-fiat")) $("avail-fiat").textContent = `≈ ${fmtFiat(spendingFiat, activeCurrency)}`;
   if ($("vault-fiat")) $("vault-fiat").textContent = `≈ ${fmtFiat(vaultFiat, activeCurrency)}`;
+  const longBox = $("long-tier-box");
+  if (longBox) {
+    longBox.classList.toggle("hidden", longCount === 0);
+    if (longCount > 0) {
+      const longPnl = longEquityActive - longCostActive;
+      const longPnlSats = longSatsTotal - longInitSatsTotal;
+      const longPnlPct = longCostActive > 0 ? (longPnl / longCostActive) * 100 : 0;
+      const sign = longPnl >= 0 ? "+" : "-";
+      const sSign = longPnlSats >= 0 ? "+" : "-";
+      const sym = curSym();
+      if ($("long-sats")) $("long-sats").textContent = `${longSatsTotal.toLocaleString()} sats`;
+      if ($("long-fiat")) $("long-fiat").textContent = `≈ ${fmtFiat(longEquityActive, activeCurrency)}`;
+      const lr = $("long-return");
+      if (lr) {
+        lr.textContent = `${sign}${sym}${Math.abs(longPnl).toFixed(2)} (${sign}${Math.abs(longPnlPct).toFixed(1)}%) · ${sSign}${Math.abs(longPnlSats).toLocaleString()} sats`;
+        lr.className = `interest-sub ${longPnl >= 0 ? "accent-green" : "accent-red"}`;
+      }
+      // Dynamic diagonal 2x payoff SVG:
+      // Below entry -> X runs Liq (0.5x) to 1.25x Entry (extra breathing room between Liq and Entry).
+      // Above entry -> X scales up smoothly to at most 2x Entry so the green line extends past Now.
+      const denom = Math.max(1, longInitSatsTotal);
+      const avgEntry = Math.round(longWeightedEntrySum / denom);
+      const avgLiq = Math.round(longWeightedLiqSum / denom);
+      const nowSpot = Math.round(activeSpot || avgEntry);
+      const maxP =
+        nowSpot <= avgEntry
+          ? Math.round(avgEntry * 1.25)
+          : Math.round(Math.max(avgEntry * 1.25, Math.min(avgEntry * 2, nowSpot * 1.15)));
+      const span = Math.max(1, maxP - avgLiq);
+      const entryRatio = Math.min(0.9, Math.max(0.1, (avgEntry - avgLiq) / span));
+      const nowRatio = Math.min(1, Math.max(0, (nowSpot - avgLiq) / span));
+      const x0 = 8;
+      const x1 = 312;
+      const yBottom = 60;
+      const yTop = 6;
+      const entryX = (x0 + entryRatio * (x1 - x0)).toFixed(1);
+      const entryY = (yBottom - entryRatio * (yBottom - yTop)).toFixed(1);
+      const nowX = (x0 + nowRatio * (x1 - x0)).toFixed(1);
+      const nowY = (yBottom - nowRatio * (yBottom - yTop)).toFixed(1);
+      const isUp = nowSpot >= avgEntry;
+      const strokeCol = isUp ? "#22c55e" : "#ef4444";
+      const haloCol = isUp ? "rgba(34,197,94,0.28)" : "rgba(239,68,68,0.28)";
+
+      $("long-loss-poly")?.setAttribute("points", `${x0},${yBottom} ${entryX},${entryY} ${entryX},${yBottom}`);
+      $("long-gain-poly")?.setAttribute("points", `${entryX},${entryY} ${x1},${yTop} ${x1},${yBottom} ${entryX},${yBottom}`);
+      $("long-be-line")?.setAttribute("y1", entryY);
+      $("long-be-line")?.setAttribute("y2", entryY);
+      $("long-entry-guide")?.setAttribute("x1", entryX);
+      $("long-entry-guide")?.setAttribute("x2", entryX);
+      $("long-loss-line")?.setAttribute("x2", entryX);
+      $("long-loss-line")?.setAttribute("y2", entryY);
+      $("long-gain-line")?.setAttribute("x1", entryX);
+      $("long-gain-line")?.setAttribute("y1", entryY);
+      $("long-entry-dot")?.setAttribute("cx", entryX);
+      $("long-entry-dot")?.setAttribute("cy", entryY);
+
+      const dot = $("long-now-dot");
+      const halo = $("long-now-halo");
+      const guide = $("long-now-guide");
+      if (dot) {
+        dot.setAttribute("cx", nowX);
+        dot.setAttribute("cy", nowY);
+        dot.setAttribute("fill", strokeCol);
+      }
+      if (halo) {
+        halo.setAttribute("cx", nowX);
+        halo.setAttribute("cy", nowY);
+        halo.setAttribute("fill", haloCol);
+      }
+      if (guide) {
+        guide.setAttribute("x1", nowX);
+        guide.setAttribute("y1", String(yTop));
+        guide.setAttribute("x2", nowX);
+        guide.setAttribute("y2", String(yBottom));
+        guide.setAttribute("stroke", strokeCol);
+      }
+      if ($("long-lbl-liq")) $("long-lbl-liq").textContent = `Liq ${sym}${avgLiq.toLocaleString()}`;
+      const midLbl = $("long-lbl-mid");
+      const rightLbl = $("long-lbl-right");
+      if (midLbl && rightLbl) {
+        if (isUp) {
+          midLbl.textContent = `Entry ${sym}${avgEntry.toLocaleString()}`;
+          midLbl.className = "";
+          midLbl.style.color = "var(--accent)";
+          midLbl.style.fontWeight = "600";
+          rightLbl.textContent = `Now ${sym}${nowSpot.toLocaleString()}`;
+          rightLbl.className = "accent-green";
+          rightLbl.style.color = "";
+          rightLbl.style.fontWeight = "700";
+        } else {
+          midLbl.textContent = `Now ${sym}${nowSpot.toLocaleString()}`;
+          midLbl.className = "accent-red";
+          midLbl.style.color = "";
+          midLbl.style.fontWeight = "700";
+          rightLbl.textContent = `Entry ${sym}${avgEntry.toLocaleString()}`;
+          rightLbl.className = "";
+          rightLbl.style.color = "var(--accent)";
+          rightLbl.style.fontWeight = "600";
+        }
+      }
+    }
+  }
   $("total-usd").textContent = fmtFiat(
     peggedActive + totalInterestActive + longEquityActive + spendingFiat + vaultFiat,
     activeCurrency
@@ -594,12 +713,14 @@ function fmtTimeLeft(secs) {
 }
 
 function getRollReason(pos, nowSecs) {
+  const isLong = pos.side === "long";
   const termSecs = Number(pos.termSecs || 86_400);
   const startTs = Number(pos.lastRolledAt || pos.openedAt || nowSecs);
   const secsLeft = startTs + termSecs - nowSecs;
-  const posYield = Number(pos.fundingRateBpsPerDay ?? 3);
+  const posYield = Number(pos.fundingRateBpsPerDay ?? (isLong ? -3 : 3));
 
-  // Compare with current LP offer (or best live offer) in the orderbook
+  // Compare with current LP offer (or best live offer) in the orderbook.
+  // Orderbook `fundingRateBpsPerDay` is quoted for Stable Short; for 2x Long the user pays `-rate`.
   const posCur = (pos.currency || "USD").toUpperCase();
   const liveOffers = orderBook.getOffers({
     pair: `BTC-${posCur}`,
@@ -607,10 +728,21 @@ function getRollReason(pos, nowSecs) {
   });
   const sameLp = liveOffers.find((o) => o.pubkey === (pos.lpPubkey || pos.lpPubHex));
   const bestOffer = liveOffers[0];
-  const refYield = sameLp ? sameLp.fundingRateBpsPerDay : bestOffer?.fundingRateBpsPerDay;
+  const rawRef = sameLp ? sameLp.fundingRateBpsPerDay : bestOffer?.fundingRateBpsPerDay;
+  const refYield = Number.isFinite(rawRef) ? (isLong ? -Math.abs(rawRef) : rawRef) : NaN;
+  const fmtSignedApr = (bpsPerDay) => {
+    const apr = (bpsPerDay * 365) / 100;
+    return `${apr >= 0 ? "+" : ""}${apr.toFixed(1)}%`;
+  };
 
   if (secsLeft <= 0) {
-    return { urgent: true, good: false, text: "Term expired — Roll now to keep your USD peg active" };
+    return {
+      urgent: true,
+      good: false,
+      text: isLong
+        ? "Term expired — Roll now to keep your 2× Long BTC active"
+        : `Term expired — Roll now to keep your ${posCur} peg active`,
+    };
   }
   if (secsLeft < 6 * 3600) {
     return {
@@ -620,18 +752,20 @@ function getRollReason(pos, nowSecs) {
     };
   }
   if (Number.isFinite(refYield) && refYield > posYield + 0.1) {
-    const curApr = ((posYield * 365) / 100).toFixed(1);
-    const newApr = ((refYield * 365) / 100).toFixed(1);
     return {
       urgent: false,
       good: true,
-      text: `↑ Higher yield available (+${newApr}% vs +${curApr}% APR) — Roll to upgrade`,
+      text: isLong
+        ? `↓ Lower funding available (${fmtSignedApr(refYield)} vs ${fmtSignedApr(posYield)} APR) — Roll to save`
+        : `↑ Higher yield available (${fmtSignedApr(refYield)} vs ${fmtSignedApr(posYield)} APR) — Roll to upgrade`,
     };
   }
   return {
     urgent: false,
     good: false,
-    text: `Expires in ${fmtTimeLeft(secsLeft)} · Roll re-centers peg & extends 24h`,
+    text: isLong
+      ? `Expires in ${fmtTimeLeft(secsLeft)} · Roll resets margin & extends 24h`
+      : `Expires in ${fmtTimeLeft(secsLeft)} · Roll re-centers peg & extends 24h`,
   };
 }
 
@@ -1359,6 +1493,12 @@ function applyCurrencyUi() {
     inp.step = isLong ? "500" : "1";
     inp.min = isLong ? "1000" : "1";
     inp.placeholder = isLong ? "sats" : activeCurrency;
+    const activeChip = document.querySelector(".chip[data-usd].active");
+    if (activeChip) {
+      inp.value = isLong
+        ? activeChip.getAttribute("data-sats") || "5000"
+        : activeChip.getAttribute("data-usd") || "2";
+    }
   }
   const sp = spots[activeCurrency];
   if (sp) $("spot-pill").textContent = `BTC ${sym}${sp.toLocaleString()}`;
@@ -1512,6 +1652,12 @@ async function boot() {
       $("positions-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
     }
   };
+  if ($("long-manage-btn")) {
+    $("long-manage-btn").onclick = () => {
+      setSectionOpen("positions-body", true);
+      $("positions-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+  }
 
   function openVaultPanel(direction) {
     const panel = $("vault-panel");

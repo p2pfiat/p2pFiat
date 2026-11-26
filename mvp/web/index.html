@@ -98,6 +98,51 @@
 
         <div id="vault-drawer-slot" class="drawer-slot"></div>
 
+        <div id="long-tier-box" class="tier-box tier-long hidden" style="margin-top:8px;flex-direction:column;align-items:stretch;gap:10px">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+            <div class="tier-info">
+              <div class="tier-label">🚀 2× Long BTC</div>
+              <span id="long-return" class="interest-sub">+$0.00 (+0.0%) · +0 sats</span>
+            </div>
+            <div class="tier-right">
+              <strong id="long-sats" class="tier-amount">0 sats</strong>
+              <div id="long-fiat" class="muted tier-sub">≈ $0.00</div>
+              <div class="mini-actions">
+                <button id="long-manage-btn" class="arrow-pill">Manage</button>
+              </div>
+            </div>
+          </div>
+          <div class="long-gauge">
+            <svg id="long-payoff-svg" class="long-payoff-svg" viewBox="0 0 320 70" preserveAspectRatio="none" aria-label="2x Long BTC Payoff Chart">
+              <defs>
+                <linearGradient id="longLossGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#ef4444" stop-opacity="0.32" />
+                  <stop offset="100%" stop-color="#ef4444" stop-opacity="0.03" />
+                </linearGradient>
+                <linearGradient id="longGainGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#22c55e" stop-opacity="0.35" />
+                  <stop offset="100%" stop-color="#22c55e" stop-opacity="0.03" />
+                </linearGradient>
+              </defs>
+              <polygon id="long-loss-poly" points="8,60 211,24 211,60" fill="url(#longLossGrad)" />
+              <polygon id="long-gain-poly" points="211,24 312,6 312,60 211,60" fill="url(#longGainGrad)" />
+              <line id="long-be-line" x1="8" y1="24" x2="312" y2="24" stroke="rgba(139,155,180,0.28)" stroke-width="1" stroke-dasharray="3,3" />
+              <line id="long-entry-guide" x1="211" y1="6" x2="211" y2="60" stroke="#f7931a" stroke-width="1.6" stroke-dasharray="3,2" />
+              <line id="long-loss-line" x1="8" y1="60" x2="211" y2="24" stroke="#ef4444" stroke-width="2" stroke-linecap="round" />
+              <line id="long-gain-line" x1="211" y1="24" x2="312" y2="6" stroke="#22c55e" stroke-width="2" stroke-linecap="round" />
+              <circle id="long-entry-dot" cx="211" cy="24" r="3.5" fill="#f7931a" stroke="#0b0f17" stroke-width="1.2" />
+              <line id="long-now-guide" x1="211" y1="6" x2="211" y2="60" stroke="#22c55e" stroke-width="1.8" />
+              <circle id="long-now-halo" cx="211" cy="24" r="8" fill="rgba(34,197,94,0.28)" />
+              <circle id="long-now-dot" cx="211" cy="24" r="4.5" fill="#22c55e" stroke="#0b0f17" stroke-width="1.5" />
+            </svg>
+            <div id="long-gauge-labels" class="long-gauge-labels">
+              <span id="long-lbl-liq" class="accent-red">Liq —</span>
+              <span id="long-lbl-mid" class="muted">Entry —</span>
+              <span id="long-lbl-right" style="font-weight:700">Now —</span>
+            </div>
+          </div>
+        </div>
+
         <div id="incoming-banner" class="incoming-banner hidden" style="margin-top:10px;margin-bottom:0"></div>
       </section>
 

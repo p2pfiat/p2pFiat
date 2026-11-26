@@ -1311,7 +1311,12 @@ export class BrowserP2pFiatWallet {
       }
       ordered.push(id);
     };
-    for (const c of nonCommit) visit(c.txid);
+    // Only traverse strict ancestors of the DLC VTXO to keep the unroll chain minimal.
+    if (txObjByTxid.has(pos.vtxoTxid)) {
+      visit(pos.vtxoTxid);
+    } else {
+      for (const c of nonCommit) visit(c.txid);
+    }
 
     const suite = pos.exitSuite || {};
     return {
@@ -1351,15 +1356,45 @@ export class BrowserP2pFiatWallet {
     if (!targetPub) {
       throw new Error("Configure a Watchtower 64-hex pubkey in Settings first");
     }
+    // NIP-17 double-encrypts (rumor -> base64 seal -> gift wrap), so NIP-44's 65,535-byte
+    // ceiling limits the inner rumor payload to ~46 KB. Compact if a deep preconfirmed
+    // Arkade VTXO chain pushes the package near that threshold.
+    const NIP17_SAFE_LIMIT = 45_000;
+    let payloadStr = JSON.stringify({ type: "register_package", package: pkg });
+    if (payloadStr.length > NIP17_SAFE_LIMIT && pkg.unroll_txs.length > 1) {
+      // Drop any ancestor tx already confirmed onchain (watchtower skips confirmed hops anyway).
+      const unconfirmed = [];
+      for (const rawHex of pkg.unroll_txs) {
+        try {
+          const txObj = Transaction.fromRaw(hex.decode(rawHex), { allowUnknownInputs: true, allowUnknownOutputs: true });
+          const st = await this.esploraProvider.getTxStatus(txObj.id).catch(() => null);
+          if (st?.confirmed) continue;
+        } catch {}
+        unconfirmed.push(rawHex);
+      }
+      if (unconfirmed.length > 0) {
+        pkg.unroll_txs = unconfirmed;
+        payloadStr = JSON.stringify({ type: "register_package", package: pkg });
+      }
+    }
+    if (payloadStr.length > NIP17_SAFE_LIMIT && pkg.payouts.length > 3) {
+      // Keep min, mid/spot, and max payout buckets + refund to stay under NIP-17 limit.
+      const p = pkg.payouts;
+      pkg.payouts = [p[0], p[Math.floor(p.length / 2)], p[p.length - 1]];
+      payloadStr = JSON.stringify({ type: "register_package", package: pkg });
+    }
+    if (payloadStr.length > 47_500) {
+      throw new Error(
+        `VTXO unroll chain too deep for NIP-17 (${payloadStr.length} bytes, ${pkg.unroll_txs.length} hops) — roll or wait for next Arkade round to compact`
+      );
+    }
+
     const peer = this.getNip17Peer();
     if (peer.sockets.size === 0) {
       const ok = await peer.connect();
       if (ok === 0) throw new Error("Could not connect to Nostr relays for watchtower NIP-17 send");
     }
-    const wrapId = await peer.sendWrapped(
-      targetPub,
-      JSON.stringify({ type: "register_package", package: pkg })
-    );
+    const wrapId = await peer.sendWrapped(targetPub, payloadStr);
     const map = loadPositions();
     if (map[positionId]) {
       map[positionId].watchtowerRegistered = true;
