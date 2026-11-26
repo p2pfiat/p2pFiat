@@ -65,8 +65,10 @@ flowchart TD
 
     Root --> L0["Leaf 0: Collaborative (Happy Path)<br/>3-of-3: User + LP + Arkade<br/>Instant offchain close or rollover"]
     Root --> L1["Leaf 1: Unilateral DLC Exit<br/>CSV + 2-of-2 Adaptor CET / Refund<br/>Includes tiered Watchtower bounty"]
-    Root --> L2["Leaf 2: On-Demand Dispute<br/>CSV + k-of-n Nostracle Quorum<br/>Mid-term exit & early liquidation"]
+    Root --> L2["Leaf 2: On-Demand Dispute<br/>CSV + k-of-n Nostracle Quorum<br/>2-Party Signed Manifest · Mid-Term Exit"]
 ```
+
+> **Mainnet-hardened Leaf 2 security:** Every Leaf 2 dispute is bound to a **2-party BIP-340 signed Contract Manifest** (`p2pfiat/dispute-manifest/v1`) committing both payout scripts, outpoint, notional, and funding rate. Each Nostracle independently deserializes `raw_tx_hex`, verifies both signatures and payouts within a ±1% volatility band (plus bounded L1 miner fee + optional tiered NUMS P2TR Watchtower bounty), and recomputes the BIP-342 Tapscript sighash before signing. Both LP trades and browser-to-browser P2P matches support Leaf 2 `⚡ Force Exit` and autonomous `ark-watchtower` execution.
 
 ---
 

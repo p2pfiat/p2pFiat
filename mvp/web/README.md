@@ -38,8 +38,10 @@ flowchart TD
   1. **🛡 Stable USD / EUR:** Synthetic fiat locked in 2-party Arkade DLCs, earning daily carry yield.
   2. **⚡ Spending BTC:** Instant Arkade VTXOs + Boltz Lightning VHTLC invoices via Unified BIP-21 QR (`bitcoin:<vault>?ark=<tark1>&lightning=<bolt11>`).
   3. **🏦 Bitcoin Vault (L1):** Pure single-key P2TR onchain address (`0` timelock, never expires).
-- **2× Long BTC & P2P Maker Orders:** Take leveraged long BTC positions or post your own P2P maker order directly from the browser.
-- **Keyless Watchtower Sync:** Automatically exports and registers pre-signed exit packages with the configured `ark-watchtower` pubkey over NIP-17.
+- **2× Long BTC & Symmetric P2P Maker Orders:** Take leveraged long BTC positions or post your own P2P maker order directly from the browser — browser-to-browser P2P matches build the exact same 3-leaf Tapscript (including Leaf 2 `k-of-n` Nostracle disputes, 2-party signed `disputeManifest`, and Watchtower `exitSuite`) as LP trades.
+- **⚡ Force Exit (Leaf 2 On-Demand Dispute):** If an LP or P2P peer disappears mid-term (or BTC crashes ≥ 50%), either party can request live `k-of-n` BIP-340 signatures over NIP-17 RPC (`sign_dispute`) with a 350-sat L1 miner fee and broadcast the finalized BIP-342 `OP_CHECKSIGADD` exit transaction.
+- **Keyless Watchtower Sync & NIP-51 Discovery:** Automatically exports and registers lean Leaf 2 + Refund packages (carrying the 2-party signed `disputeManifest`) with primary and curated NIP-51 (`p2pfiat-watchtowers`) backup watchtowers over NIP-17.
+- **Encrypted Cloud Position Backup:** Automatically backs up and restores open DLC positions via self-encrypted NIP-44 Nostr events (`kind: 30078`, `d: "p2pfiat-positions-backup-v1"`).
 - **Custom Nostracles:** Inspect live oracle uptime/reputation or add your own Nostracle `npub1…` under *Settings → Advanced*.
 
 ---

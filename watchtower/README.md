@@ -21,13 +21,14 @@ bounty to a P2TR script with an unspendable BIP-341 NUMS internal key:
 
 ## What it does on each tick
 
-1. **NIP-17 package intake:** unwraps incoming `WatchtowerRequest::RegisterPackage` DMs, validates the bounty script and transactions, persists to `watchtower.json`, and replies with `WatchtowerReply::Registered` or `Rejected`.
+1. **NIP-17 package intake:** unwraps incoming `WatchtowerRequest::RegisterPackage` DMs, validates the bounty script, transactions, and optional 2-party BIP-340 signed Leaf 2 `DisputeManifest` (`p2pfiat/dispute-manifest/v1`), persists to `watchtower.json`, and replies with `WatchtowerReply::Registered` or `Rejected`.
 2. **External oracle attestation sync:** fetches and verifies kind-88/89 DLC oracle events from Nostr relays for watched contracts (supports both single `nostracle` and threshold oracles).
-3. **Stale-exit guard:** queries the Ark indexer (if reachable) and skips contracts already settled offchain.
-4. **Profitability guard:** counts remaining unconfirmed unroll hops and refuses to unroll at a loss when estimated CPFP + sweep fees exceed the bounty minus `min_profit_sats`.
-5. **TRUC (v3) CPFP unrolling:** spends each virtual tx's 0-sat P2A anchor (`OP_1 <0x4e73>`) using a **confirmed** P2TR wallet UTXO via 1p1c package relay (`/txs/package`).
-6. **Exit finalization:** once the VTXO confirms and satisfies `exit_csv`, completes the matching BIP-340 adaptor signatures from the oracle attestation — or broadcasts the pre-signed timelocked refund at `refund_height` if the oracle is absent.
-7. **Bounty sweep:** sweeps the bounty output immediately (`Primary`) or after `backup_csv` confirmations (`Backup`) and tracks net profit in `watchtower.json`.
+3. **Autonomous Leaf 2 (`sign_dispute`) resolution:** for confirmed VTXOs carrying a signed `DisputePackageSpec` (even when **both** User and LP are offline), fetches median live spot (`BTC/USD` or `BTC/EUR`), builds a deterministic v2 dispute transaction with `output[0]` (User), `output[1]` (LP), `output[2]` (compiled tiered NUMS P2TR bounty), and a 350-sat L1 miner fee, collects `>= k` BIP-340 Schnorr signatures from the contract's `k-of-n` Nostracle quorum over NIP-17 RPC (`sign_dispute`), and assembles the BIP-342 `OP_CHECKSIGADD` witness.
+4. **Stale-exit guard:** queries the Ark indexer (if reachable) and skips contracts already settled offchain.
+5. **Profitability guard:** counts remaining unconfirmed unroll hops and refuses to unroll at a loss when estimated CPFP + sweep fees exceed the bounty minus `min_profit_sats`.
+6. **TRUC (v3) CPFP unrolling:** spends each virtual tx's 0-sat P2A anchor (`OP_1 <0x4e73>`) using a **confirmed** P2TR wallet UTXO via 1p1c package relay (`/txs/package`).
+7. **Exit finalization:** once the VTXO confirms and satisfies `exit_csv`, broadcasts in priority order: (a) matching kind-89 BIP-340 adaptor payout, (b) autonomous Leaf 2 `k-of-n` Nostracle dispute tx, or (c) pre-signed timelocked refund at `refund_height`.
+8. **Bounty sweep:** sweeps the bounty output immediately (`Primary`) or after `backup_csv` confirmations (`Backup`) and tracks net profit in `watchtower.json`.
 
 ## Usage
 
