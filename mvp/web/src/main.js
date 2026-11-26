@@ -1293,10 +1293,35 @@ async function fetchQuoteUi() {
         ? ` · <strong>2× Leverage</strong> · Liq: <strong>${sym}${Number(q.liquidationPrice || Math.round(sp * 0.5)).toLocaleString()}</strong>`
         : "";
     const effEntry = Number(q.effectiveSpotUsd ?? sp);
+    const spreadBps = Math.max(0, Number(q.spreadBps ?? selected.spreadBps ?? 0));
+    const spreadPct = (spreadBps / 100).toFixed(2);
+    const notionalFiat = Number(q.notional ?? q.notionalUsd ?? (side === "long" ? (amt / 1e8) * sp : amt));
+    const termSecs = Number(q.termSecs ?? selected.termSecs ?? 86400);
+    const termDays = Math.max(1, Math.round(termSecs / 86400));
+    const termLabel = termDays === 1 ? "1d" : `${termDays}d`;
+    const entryFeeFiat = notionalFiat * (spreadBps / 10_000);
+    const termYieldFiat = notionalFiat * (funding / 10_000) * termDays;
+    const netTermFiat = termYieldFiat - entryFeeFiat;
+    const fmtSmallFiat = (v) => {
+      const abs = Math.abs(v);
+      const dec = abs > 0 && abs < 0.01 ? 4 : abs < 0.1 ? 3 : 2;
+      return `${v < 0 ? "-" : ""}${sym}${abs.toFixed(dec)}`;
+    };
+    const breakEvenDays =
+      side === "short" && funding > 0 && spreadBps > 0 ? Math.ceil(spreadBps / funding) : null;
+    const netHint =
+      side === "short"
+        ? netTermFiat >= 0
+          ? `<span class="accent-green"><strong>+${fmtSmallFiat(netTermFiat)} net</strong></span>`
+          : `<span style="color:var(--accent)"><strong>${fmtSmallFiat(netTermFiat)} net</strong>${
+              breakEvenDays ? ` (break-even ~${breakEvenDays}d)` : ""
+            }</span>`
+        : `<span class="accent-red"><strong>${fmtSmallFiat(netTermFiat)}</strong> total cost over ${termLabel}</span>`;
     $("quote-box").innerHTML = `
-      LP: <strong>${q.lpName || selected.lpName}</strong> · Entry: <strong>${sym}${effEntry.toLocaleString()}</strong>${liqLine} · <span class="${funding >= 0 ? "accent-green" : "accent-red"}">${side === "long" ? "Funding" : "Yield"}: ${fmtYield(funding)}</span><br/>
-      Your margin: <strong>${q.userCollateralSats.toLocaleString()} sats</strong> · LP matches: <strong>${q.lpCollateralSats.toLocaleString()} sats</strong><br/>
-      Total DLC VTXO: ${q.totalCollateralSats.toLocaleString()} sats (atomic 2-input Arkade tx)
+      LP: <strong>${q.lpName || selected.lpName}</strong> · Entry: <strong>${sym}${effEntry.toLocaleString()}</strong> · Term: <strong>${termLabel}</strong>${liqLine}<br/>
+      Entry fee: <strong>${fmtSmallFiat(entryFeeFiat)}</strong> (${spreadPct}%) · <span class="${funding >= 0 ? "accent-green" : "accent-red"}"><strong>${fmtYield(funding)}</strong></span><br/>
+      ${termLabel} ${side === "long" ? "funding" : "yield"}: <strong class="${termYieldFiat >= 0 ? "accent-green" : "accent-red"}">${termYieldFiat >= 0 ? "+" : ""}${fmtSmallFiat(termYieldFiat)}</strong> · ${netHint}<br/>
+      <span class="muted">Your margin: ${q.userCollateralSats.toLocaleString()} sats · LP matches: ${q.lpCollateralSats.toLocaleString()} sats</span>
     `;
   } catch (e) {
     $("quote-box").textContent = `Quote error (${selected.lpName}): ${e.message}`;
