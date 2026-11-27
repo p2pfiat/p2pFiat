@@ -251,7 +251,7 @@ export async function createLpServer({
       if (Number(bal.available || 0) < FAUCET_SATS + MIN_LP_RESERVE_SATS) {
         throw new RpcError(503, "LP faucet reserve low — try again shortly");
       }
-      const txid = await wallet.sendBitcoin({ address: arkAddress, amount: FAUCET_SATS });
+      const txid = await wallet.send({ address: arkAddress, amount: FAUCET_SATS });
       store.update((st) => {
         if (!st.faucetClaims) st.faucetClaims = {};
         st.faucetClaims[claimKey] = {
