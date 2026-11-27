@@ -796,10 +796,10 @@ export class BrowserP2pFiatWallet {
     const arkAddress = await this.wallet.getAddress();
     const peer = this.getNip17Peer();
     if (peer.sockets.size === 0) {
-      const ok = await peer.connect();
+      const ok = await peer.connect(6_000);
       if (ok === 0) throw new Error("Could not connect to Nostr relays for faucet request");
     }
-    const res = await peer.request(lpPubHex, "faucet", { arkAddress }, 15_000);
+    const res = await peer.request(lpPubHex, "faucet", { arkAddress }, 25_000);
     return { ...res, arkAddress, lpPubHex };
   }
 

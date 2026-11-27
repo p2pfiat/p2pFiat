@@ -2560,22 +2560,6 @@ async function boot() {
     $("reveal-key-btn").textContent = hidden ? "Hide" : "Show";
   };
 
-  $("settle-vtxos-btn").onclick = async () => {
-    const btn = $("settle-vtxos-btn");
-    btn.disabled = true;
-    btn.textContent = "Settling Arkade round…";
-    try {
-      const txid = await appWallet.settleVtxos();
-      showToast(`⚡ VTXOs settled into 1-hop round (${String(txid || "").slice(0, 12)}…)`, 5000);
-      await refresh();
-    } catch (e) {
-      showToast(`Settle skipped/failed: ${e.message}`, 5000);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "⚡ Compact / Settle VTXOs";
-    }
-  };
-
   $("copy-key-btn").onclick = async () => {
     const val = $("privkey-input").value;
     if (!val) return;
@@ -2612,47 +2596,86 @@ async function boot() {
       }
     })
     .catch(() => {});
-  await verifyOrderBookPof(true);
   await refresh();
+
+  // Mutinynet instant onboarding faucet: run immediately after initial balance check
+  // (do NOT wait for orderbook PoF or quote RPC!) so new testers see the pending banner right away.
+  (async () => {
+    try {
+      const net = String(appWallet?.info?.network || "mutinynet").toLowerCase();
+      const isMutinynet = net !== "bitcoin" && net !== "mainnet";
+      const pubId = (appWallet?.authIdentity?.pubHex || appWallet?.nostrKey?.pubHex || "").toLowerCase();
+      const faucetFlag = pubId ? `p2pfiat_faucet_requested_${pubId}` : "";
+      const hasOpenPositions = Object.values(loadPositions()).some((p) => p?.status === "open");
+      if (
+        isMutinynet &&
+        faucetFlag &&
+        !localStorage.getItem(faucetFlag) &&
+        lastAvailSats === 0 &&
+        lastVaultSats === 0 &&
+        !hasOpenPositions
+      ) {
+        const banner = $("faucet-pending-banner");
+        if (banner) {
+          banner.innerHTML =
+            "⏳ <strong>Pending 20,000 free Mutinynet testnet sats…</strong> Requesting instant Arkade VTXO from LP-Home.";
+          banner.classList.remove("hidden");
+        }
+        const balNow = await appWallet.getBalance().catch(() => ({ boarding: 0, available: 0 }));
+        if (Number(balNow.available || 0) > 0 || Number(balNow.boarding || 0) > 0) {
+          banner?.classList.add("hidden");
+          return;
+        }
+        localStorage.setItem(faucetFlag, "1");
+        try {
+          const res = await appWallet.requestMutinynetFaucet();
+          banner?.classList.add("hidden");
+          if (res?.ok) {
+            showToast("🎉 Received 20,000 free Mutinynet testnet sats — ready to test!", 6000);
+            await refresh();
+          }
+        } catch (err) {
+          localStorage.removeItem(faucetFlag);
+          if (banner) {
+            banner.innerHTML = `⚠ Faucet delayed (${escapeHtml(err?.message || "timeout")}) — <button id="faucet-retry-btn" class="btn small secondary" style="margin-left:6px">Retry 20k sats</button>`;
+            $("faucet-retry-btn").onclick = async () => {
+              banner.innerHTML = "⏳ <strong>Pending 20,000 free Mutinynet testnet sats…</strong> Retrying…";
+              try {
+                const r = await appWallet.requestMutinynetFaucet();
+                banner.classList.add("hidden");
+                if (r?.ok) {
+                  localStorage.setItem(faucetFlag, "1");
+                  showToast("🎉 Received 20,000 free Mutinynet testnet sats!", 6000);
+                  await refresh();
+                }
+              } catch (e2) {
+                banner.innerHTML = `⚠ Faucet error: ${escapeHtml(e2?.message || "retry later")}`;
+              }
+            };
+          }
+        }
+      }
+    } catch {}
+  })();
+
+  await verifyOrderBookPof(true);
   await fetchQuoteUi();
 
-  // Mutinynet instant onboarding faucet: on first login with 0 balance, automatically request
-  // 20,000 free instant Arkade test sats from LP-Home straight to the user's tark1... address.
-  try {
-    const net = String(appWallet?.info?.network || "mutinynet").toLowerCase();
-    const isMutinynet = net !== "bitcoin" && net !== "mainnet";
-    const pubId = (appWallet?.authIdentity?.pubHex || appWallet?.nostrKey?.pubHex || "").toLowerCase();
-    const faucetFlag = pubId ? `p2pfiat_faucet_requested_${pubId}` : "";
-    const hasOpenPositions = Object.values(loadPositions()).some((p) => p?.status === "open");
-    if (
-      isMutinynet &&
-      faucetFlag &&
-      !localStorage.getItem(faucetFlag) &&
-      lastAvailSats === 0 &&
-      lastVaultSats === 0 &&
-      !hasOpenPositions
-    ) {
-      const balNow = await appWallet.getBalance().catch(() => ({ boarding: 0 }));
-      if (Number(balNow.boarding || 0) === 0) {
-        const banner = $("faucet-pending-banner");
-        banner?.classList.remove("hidden");
-        localStorage.setItem(faucetFlag, "1");
-        appWallet
-          .requestMutinynetFaucet()
-          .then(async (res) => {
-            banner?.classList.add("hidden");
-            if (res?.ok) {
-              showToast("🎉 Received 20,000 free Mutinynet testnet sats — ready to test!", 6000);
-              await refresh();
-            }
-          })
-          .catch(() => {
-            banner?.classList.add("hidden");
-            localStorage.removeItem(faucetFlag);
-          });
+  // Silent background VTXO compaction: settle any preconfirmed VTXOs into a 1-hop Arkade round
+  // 15s after boot (and every 15 min) so users never have to think about VTXO chain depth.
+  const autoCompactVtxos = async () => {
+    try {
+      const b = await appWallet.getBalance();
+      if (Number(b?.preconfirmed || 0) > 0) {
+        await appWallet.settleVtxos();
+        await refresh();
       }
-    }
-  } catch {}
+    } catch {}
+  };
+  setTimeout(autoCompactVtxos, 15_000);
+  setInterval(() => {
+    if (document.visibilityState === "visible") autoCompactVtxos();
+  }, 15 * 60_000);
 
   // Battery-friendly 10s local interest ticker (pauses automatically when tab is hidden)
   setInterval(() => {
