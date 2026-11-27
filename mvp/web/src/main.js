@@ -2560,6 +2560,22 @@ async function boot() {
     $("reveal-key-btn").textContent = hidden ? "Hide" : "Show";
   };
 
+  $("settle-vtxos-btn").onclick = async () => {
+    const btn = $("settle-vtxos-btn");
+    btn.disabled = true;
+    btn.textContent = "Settling Arkade round…";
+    try {
+      const txid = await appWallet.settleVtxos();
+      showToast(`⚡ VTXOs settled into 1-hop round (${String(txid || "").slice(0, 12)}…)`, 5000);
+      await refresh();
+    } catch (e) {
+      showToast(`Settle skipped/failed: ${e.message}`, 5000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "⚡ Compact / Settle VTXOs";
+    }
+  };
+
   $("copy-key-btn").onclick = async () => {
     const val = $("privkey-input").value;
     if (!val) return;
@@ -2599,6 +2615,37 @@ async function boot() {
   await verifyOrderBookPof(true);
   await refresh();
   await fetchQuoteUi();
+
+  // Mutinynet onboarding faucet: on first login with 0 balance, automatically request
+  // 20,000 free test sats from the Watchtower to this wallet's Arkade boarding address.
+  try {
+    const net = String(appWallet?.info?.network || "mutinynet").toLowerCase();
+    const isMutinynet = net !== "bitcoin" && net !== "mainnet";
+    const pubId = (appWallet?.authIdentity?.pubHex || appWallet?.nostrKey?.pubHex || "").toLowerCase();
+    const faucetFlag = pubId ? `p2pfiat_faucet_requested_${pubId}` : "";
+    const hasOpenPositions = Object.values(loadPositions()).some((p) => p?.status === "open");
+    if (
+      isMutinynet &&
+      faucetFlag &&
+      !localStorage.getItem(faucetFlag) &&
+      lastAvailSats === 0 &&
+      lastVaultSats === 0 &&
+      !hasOpenPositions
+    ) {
+      const balNow = await appWallet.getBalance().catch(() => ({ boarding: 0 }));
+      if (Number(balNow.boarding || 0) === 0) {
+        localStorage.setItem(faucetFlag, "1");
+        appWallet
+          .requestMutinynetFaucet()
+          .then(() => {
+            showToast("🎁 Welcome! Requested 20,000 free Mutinynet test sats from Watchtower — arriving in ~30s!", 6500);
+          })
+          .catch(() => {
+            localStorage.removeItem(faucetFlag);
+          });
+      }
+    }
+  } catch {}
 
   // Battery-friendly 10s local interest ticker (pauses automatically when tab is hidden)
   setInterval(() => {

@@ -19,7 +19,7 @@ use kormir::bitcoin::Transaction;
 use kormir::{OracleAnnouncement, OracleAttestation, Readable};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const KIND_ANNOUNCEMENT: u16 = 88;
@@ -207,41 +207,30 @@ pub async fn process_incoming_packages(
         .since(since);
     let wraps = client.fetch_events(filter, Duration::from_secs(10)).await?;
     let mut registered = 0;
+    let mut chunk_buf: HashMap<(PublicKey, String), (usize, BTreeMap<usize, String>)> =
+        HashMap::new();
 
     for wrap in wraps.iter() {
         let Ok(gift) = client.unwrap_gift_wrap(wrap).await else { continue };
         let Ok(req) = serde_json::from_str::<WatchtowerRequest>(&gift.rumor.content) else {
             continue;
         };
-        match req {
-            WatchtowerRequest::RegisterPackage { package } => {
-                let pkg_id = package.id.clone();
-                if wt.storage.get(&pkg_id).is_some() {
+        let maybe_pkg: Option<Box<crate::storage::WatchtowerPackage>> = match req {
+            WatchtowerRequest::RequestFaucet { address } => {
+                let sender_hex = gift.sender.to_hex();
+                if wt.storage.get_faucet_claim(&sender_hex).is_some() {
                     continue;
                 }
-                let bounty_sats = package.bounty.amount_sats;
-                let reply = match wt.register_package(*package, now) {
-                    Ok(role) => {
-                        registered += 1;
-                        let role_str = match role {
-                            WatchtowerRole::Primary => "primary".to_string(),
-                            WatchtowerRole::Backup { csv_blocks } => {
-                                format!("backup(csv={csv_blocks})")
-                            }
-                        };
-                        log::info!(
-                            "registered package {pkg_id} via NIP-17 ({role_str}, bounty {bounty_sats} sats)"
-                        );
-                        WatchtowerReply::Registered {
-                            package_id: pkg_id,
-                            role: role_str,
-                            bounty_sats,
-                        }
-                    }
+                let reply = match wt.send_mutinynet_faucet(&sender_hex, &address).await {
+                    Ok((txid, amount_sats)) => WatchtowerReply::FaucetSent {
+                        txid,
+                        amount_sats,
+                        address,
+                    },
                     Err(e) => {
-                        log::warn!("rejected package {pkg_id}: {e:#}");
+                        log::warn!("faucet request from {} rejected: {e:#}", &sender_hex[..12]);
                         WatchtowerReply::Rejected {
-                            package_id: pkg_id,
+                            package_id: "faucet".to_string(),
                             reason: format!("{e:#}"),
                         }
                     }
@@ -249,8 +238,88 @@ pub async fn process_incoming_packages(
                 let _ = client
                     .send_private_msg(gift.sender, serde_json::to_string(&reply)?, [])
                     .await;
+                continue;
             }
+            WatchtowerRequest::RegisterPackage { package } => Some(package),
+            WatchtowerRequest::RegisterPackageChunk {
+                package_id,
+                chunk_index,
+                total_chunks,
+                data,
+            } => {
+                if total_chunks == 0 || total_chunks > 32 || chunk_index >= total_chunks {
+                    continue;
+                }
+                if wt.storage.get(&package_id).is_some() {
+                    continue;
+                }
+                let entry = chunk_buf
+                    .entry((gift.sender, package_id.clone()))
+                    .or_insert_with(|| (total_chunks, BTreeMap::new()));
+                if entry.0 != total_chunks {
+                    continue;
+                }
+                entry.1.insert(chunk_index, data);
+                if entry.1.len() < total_chunks {
+                    None
+                } else {
+                    let assembled: String = (0..total_chunks)
+                        .filter_map(|i| entry.1.get(&i).map(String::as_str))
+                        .collect();
+                    chunk_buf.remove(&(gift.sender, package_id.clone()));
+                    match serde_json::from_str::<crate::storage::WatchtowerPackage>(&assembled) {
+                        Ok(pkg) => Some(Box::new(pkg)),
+                        Err(e) => {
+                            log::warn!("invalid chunked package {package_id}: {e:#}");
+                            let reply = WatchtowerReply::Rejected {
+                                package_id,
+                                reason: format!("invalid chunked package JSON: {e}"),
+                            };
+                            let _ = client
+                                .send_private_msg(gift.sender, serde_json::to_string(&reply)?, [])
+                                .await;
+                            None
+                        }
+                    }
+                }
+            }
+        };
+
+        let Some(package) = maybe_pkg else { continue };
+        let pkg_id = package.id.clone();
+        if wt.storage.get(&pkg_id).is_some() {
+            continue;
         }
+        let bounty_sats = package.bounty.amount_sats;
+        let reply = match wt.register_package(*package, now) {
+            Ok(role) => {
+                registered += 1;
+                let role_str = match role {
+                    WatchtowerRole::Primary => "primary".to_string(),
+                    WatchtowerRole::Backup { csv_blocks } => {
+                        format!("backup(csv={csv_blocks})")
+                    }
+                };
+                log::info!(
+                    "registered package {pkg_id} via NIP-17 ({role_str}, bounty {bounty_sats} sats)"
+                );
+                WatchtowerReply::Registered {
+                    package_id: pkg_id,
+                    role: role_str,
+                    bounty_sats,
+                }
+            }
+            Err(e) => {
+                log::warn!("rejected package {pkg_id}: {e:#}");
+                WatchtowerReply::Rejected {
+                    package_id: pkg_id,
+                    reason: format!("{e:#}"),
+                }
+            }
+        };
+        let _ = client
+            .send_private_msg(gift.sender, serde_json::to_string(&reply)?, [])
+            .await;
     }
     Ok(registered)
 }

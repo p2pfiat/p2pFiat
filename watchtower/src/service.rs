@@ -29,6 +29,19 @@ pub fn now() -> u64 {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WatchtowerRequest {
     RegisterPackage { package: Box<WatchtowerPackage> },
+    /// Multi-part chunked delivery for packages whose unroll chain exceeds NIP-44's ~45 KB
+    /// single-message ceiling (e.g. deep preconfirmed Arkade VTXO chains).
+    RegisterPackageChunk {
+        package_id: String,
+        chunk_index: usize,
+        total_chunks: usize,
+        data: String,
+    },
+    /// One-time Mutinynet/testnet onboarding faucet (20,000 sats to the user's Arkade boarding or L1 address).
+    /// Strictly rejected on Bitcoin mainnet.
+    RequestFaucet {
+        address: String,
+    },
 }
 
 /// Replies sent by a watchtower over NIP-17 private messages.
@@ -36,6 +49,7 @@ pub enum WatchtowerRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WatchtowerReply {
     Registered { package_id: String, role: String, bounty_sats: u64 },
+    FaucetSent { txid: String, amount_sats: u64, address: String },
     Rejected { package_id: String, reason: String },
 }
 
@@ -153,6 +167,46 @@ impl WatchtowerService {
 
         self.storage.insert(pkg, now)?;
         Ok(role)
+    }
+
+    /// Send a one-time 20,000-sat onboarding grant on Mutinynet/signet/testnet to `address`.
+    /// Strictly disabled on Bitcoin mainnet and limited to 1 claim per Nostr identity.
+    pub async fn send_mutinynet_faucet(&self, sender_hex: &str, address: &str) -> Result<(String, u64)> {
+        const FAUCET_AMOUNT_SATS: u64 = 20_000;
+        const FAUCET_FEE_SATS: u64 = 350;
+        const MIN_CPFP_RESERVE_SATS: u64 = 5_000;
+
+        ensure!(
+            self.wallet.network != kormir::bitcoin::Network::Bitcoin,
+            "faucet is strictly disabled on Bitcoin mainnet"
+        );
+        if let Some(prev_txid) = self.storage.get_faucet_claim(sender_hex) {
+            anyhow::bail!("faucet already claimed for this Nostr identity (txid {prev_txid})");
+        }
+        let utxos = self
+            .chain
+            .get_utxos(&self.wallet.address.to_string())
+            .await
+            .context("fetch watchtower UTXOs for faucet")?;
+        let tx = self.wallet.build_faucet_tx(
+            &utxos,
+            address,
+            FAUCET_AMOUNT_SATS,
+            FAUCET_FEE_SATS,
+            MIN_CPFP_RESERVE_SATS,
+        )?;
+        let tx_hex = serialize_hex(&tx);
+        let txid = self
+            .chain
+            .broadcast_tx(&tx_hex)
+            .await
+            .context("broadcast faucet transaction")?;
+        self.storage.record_faucet_claim(sender_hex, &txid)?;
+        log::info!(
+            "faucet: sent {FAUCET_AMOUNT_SATS} sats to {address} for {} (txid {txid})",
+            &sender_hex[..sender_hex.len().min(12)]
+        );
+        Ok((txid, FAUCET_AMOUNT_SATS))
     }
 
     pub async fn estimate_cost(&self, pkg: &WatchtowerPackage) -> Result<(usize, u64, u64, u64)> {

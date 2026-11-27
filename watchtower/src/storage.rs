@@ -178,6 +178,9 @@ struct StoreState {
     total_sweep_fees_spent: u64,
     #[serde(default)]
     total_bounties_earned: u64,
+    /// One-time Mutinynet/testnet faucet claims keyed by requester Nostr pubkey hex -> txid.
+    #[serde(default)]
+    faucet_claims: BTreeMap<String, String>,
 }
 
 pub struct WatchtowerStorage {
@@ -270,5 +273,18 @@ impl WatchtowerStorage {
     pub fn totals(&self) -> (u64, u64, u64) {
         let st = self.state.lock().unwrap();
         (st.total_cpfp_fees_spent, st.total_sweep_fees_spent, st.total_bounties_earned)
+    }
+
+    pub fn get_faucet_claim(&self, sender_hex: &str) -> Option<String> {
+        let key = sender_hex.trim().to_lowercase();
+        self.state.lock().unwrap().faucet_claims.get(&key).cloned()
+    }
+
+    pub fn record_faucet_claim(&self, sender_hex: &str, txid: &str) -> Result<()> {
+        let key = sender_hex.trim().to_lowercase();
+        let mut st = self.state.lock().unwrap();
+        st.faucet_claims.insert(key, txid.to_string());
+        self.persist(&st)?;
+        Ok(())
     }
 }

@@ -777,6 +777,34 @@ export class BrowserP2pFiatWallet {
     return new Ramps(this.wallet).onboard(this.info.fees, undefined, undefined, onEvent);
   }
 
+  /** Settle preconfirmed Arkade VTXOs into the next Arkade Round (compacts deep unroll chains to 1 hop). */
+  async settleVtxos(onEvent) {
+    return this.wallet.settle(undefined, onEvent);
+  }
+
+  /**
+   * Request a one-time 20,000-sat onboarding grant from the Watchtower Mutinynet faucet
+   * straight to this wallet's Arkade boarding address (`tb1p...`). Strictly Mutinynet/signet only.
+   */
+  async requestMutinynetFaucet(watchtowerPubHex = getWatchtowerPubkey() || DEFAULT_WATCHTOWER_PUBKEY) {
+    const net = String(this.info?.network || "mutinynet").toLowerCase();
+    if (net === "bitcoin" || net === "mainnet") {
+      return { skipped: true, reason: "mainnet" };
+    }
+    if (!watchtowerPubHex) {
+      throw new Error("No watchtower pubkey configured for Mutinynet faucet");
+    }
+    const address = await this.wallet.getBoardingAddress();
+    const peer = this.getNip17Peer();
+    if (peer.sockets.size === 0) {
+      const ok = await peer.connect();
+      if (ok === 0) throw new Error("Could not connect to Nostr relays for faucet request");
+    }
+    const payloadStr = JSON.stringify({ type: "request_faucet", address });
+    const wrapId = await peer.sendWrapped(watchtowerPubHex, payloadStr);
+    return { wrapId, address, watchtowerPubHex };
+  }
+
   /** Instant offchain Arkade payment to a `tark1...` / `ark1...` address. */
   async sendArk(address, amountSats) {
     const sats = Math.floor(Number(amountSats));
@@ -1841,22 +1869,39 @@ export class BrowserP2pFiatWallet {
       pkg.payouts = [p[0], p[Math.floor(p.length / 2)], p[p.length - 1]];
       payloadStr = JSON.stringify({ type: "register_package", package: pkg });
     }
-    if (payloadStr.length > 47_500) {
-      throw new Error(
-        `VTXO unroll chain too deep for NIP-17 (${payloadStr.length} bytes, ${pkg.unroll_txs.length} hops) — roll or wait for next Arkade round to compact`
-      );
-    }
-
     const peer = this.getNip17Peer();
     if (peer.sockets.size === 0) {
       const ok = await peer.connect();
       if (ok === 0) throw new Error("Could not connect to Nostr relays for watchtower NIP-17 send");
     }
-    const wrapId = await peer.sendWrapped(targetPub, payloadStr);
+
+    const sendPayloadTo = async (destPub) => {
+      if (payloadStr.length <= NIP17_SAFE_LIMIT) {
+        return peer.sendWrapped(destPub, payloadStr);
+      }
+      // Multi-part NIP-17 chunking for deep preconfirmed VTXO unroll chains (>45 KB).
+      const pkgJson = JSON.stringify(pkg);
+      const CHUNK_SIZE = 36_000;
+      const totalChunks = Math.ceil(pkgJson.length / CHUNK_SIZE);
+      let lastWrapId = null;
+      for (let i = 0; i < totalChunks; i++) {
+        const chunkMsg = JSON.stringify({
+          type: "register_package_chunk",
+          package_id: pkg.id,
+          chunk_index: i,
+          total_chunks: totalChunks,
+          data: pkgJson.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE),
+        });
+        lastWrapId = await peer.sendWrapped(destPub, chunkMsg);
+      }
+      return lastWrapId;
+    };
+
+    const wrapId = await sendPayloadTo(targetPub);
     // Also mirror the exit package to any curated backup watchtowers from NIP-51 `p2pfiat-watchtowers`.
     const backups = getBackupWatchtowerPubkeys().filter((pk) => pk !== targetPub.toLowerCase());
     if (backups.length > 0) {
-      await Promise.allSettled(backups.map((bpk) => peer.sendWrapped(bpk, payloadStr)));
+      await Promise.allSettled(backups.map((bpk) => sendPayloadTo(bpk)));
     }
     const map = loadPositions();
     if (map[positionId]) {

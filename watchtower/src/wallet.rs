@@ -190,6 +190,116 @@ impl WatchtowerWallet {
         };
         Ok((child, change_utxo))
     }
+
+    /// Build a signed v2 P2TR transaction sending `amount_sats` from the watchtower's
+    /// confirmed UTXOs to `dest_address` (strictly disabled on Bitcoin mainnet).
+    pub fn build_faucet_tx(
+        &self,
+        utxos: &[WalletUtxo],
+        dest_address: &str,
+        amount_sats: u64,
+        fee_sats: u64,
+        min_reserve_sats: u64,
+    ) -> Result<Transaction> {
+        ensure!(
+            self.network != Network::Bitcoin,
+            "faucet is strictly disabled on Bitcoin mainnet"
+        );
+        ensure!(amount_sats >= 546, "faucet amount {} is dust", amount_sats);
+
+        let parsed = dest_address
+            .trim()
+            .parse::<Address<kormir::bitcoin::address::NetworkUnchecked>>()
+            .context("invalid destination Bitcoin address")?;
+        let dest_addr = parsed
+            .require_network(self.network)
+            .with_context(|| format!("destination address does not match network {:?}", self.network))?;
+        let dest_script = dest_addr.script_pubkey();
+
+        let mut confirmed: Vec<&WalletUtxo> = utxos.iter().filter(|u| u.confirmed).collect();
+        confirmed.sort_by(|a, b| b.value_sats.cmp(&a.value_sats));
+
+        let total_confirmed: u64 = confirmed.iter().map(|u| u.value_sats).sum();
+        let needed_total = amount_sats
+            .checked_add(fee_sats)
+            .and_then(|v| v.checked_add(min_reserve_sats))
+            .ok_or_else(|| anyhow!("faucet amount overflow"))?;
+        ensure!(
+            total_confirmed >= needed_total,
+            "watchtower faucet balance ({total_confirmed} sats) below required {} sats (incl. {min_reserve_sats} sat CPFP reserve)",
+            needed_total
+        );
+
+        let target_in = amount_sats + fee_sats;
+        let mut selected: Vec<&WalletUtxo> = Vec::new();
+        let mut sum_in: u64 = 0;
+        for u in confirmed {
+            selected.push(u);
+            sum_in = sum_in.saturating_add(u.value_sats);
+            if sum_in >= target_in {
+                break;
+            }
+        }
+        ensure!(sum_in >= target_in, "insufficient confirmed UTXOs for faucet");
+
+        let change = sum_in - target_in;
+        let mut outputs = vec![TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: dest_script,
+        }];
+        if change > 546 {
+            outputs.push(TxOut {
+                value: Amount::from_sat(change),
+                script_pubkey: self.script_pubkey.clone(),
+            });
+        }
+
+        let inputs: Vec<TxIn> = selected
+            .iter()
+            .map(|u| TxIn {
+                previous_output: u.outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            })
+            .collect();
+
+        let prevouts: Vec<TxOut> = selected
+            .iter()
+            .map(|u| TxOut {
+                value: Amount::from_sat(u.value_sats),
+                script_pubkey: self.script_pubkey.clone(),
+            })
+            .collect();
+
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs,
+            output: outputs,
+        };
+
+        let secp = Secp256k1::new();
+        let mut cache = SighashCache::new(&tx);
+        let mut sigs = Vec::with_capacity(selected.len());
+        for idx in 0..selected.len() {
+            let sighash = cache
+                .taproot_key_spend_signature_hash(
+                    idx,
+                    &Prevouts::All(&prevouts),
+                    TapSighashType::Default,
+                )
+                .map_err(|e| anyhow!("faucet sighash input {idx}: {e}"))?;
+            let msg = Message::from_digest_slice(sighash.as_ref())?;
+            sigs.push(secp.sign_schnorr_no_aux_rand(&msg, &self.tweaked_keypair));
+        }
+        for (idx, sig) in sigs.into_iter().enumerate() {
+            let mut w = Witness::new();
+            w.push(sig.as_ref());
+            tx.input[idx].witness = w;
+        }
+        Ok(tx)
+    }
 }
 
 /// Find the P2A (`OP_1 <0x4e73>`) anchor output in a virtual transaction.
@@ -210,5 +320,38 @@ pub fn parse_network(s: &str) -> Result<Network> {
         "signet" => Ok(Network::Signet),
         "regtest" => Ok(Network::Regtest),
         other => anyhow::bail!("unknown bitcoin network {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kormir::bitcoin::hashes::Hash;
+    use kormir::bitcoin::Txid;
+
+    #[test]
+    fn faucet_is_disabled_on_mainnet_and_works_on_signet() {
+        let sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let dest_sk = SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let utxo = WalletUtxo {
+            outpoint: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+            value_sats: 100_000,
+            confirmed: true,
+            is_v3: false,
+        };
+
+        // Mainnet MUST always reject
+        let main_w = WatchtowerWallet::from_secret(sk, Network::Bitcoin);
+        let main_dest = WatchtowerWallet::from_secret(dest_sk, Network::Bitcoin).address.to_string();
+        assert!(main_w.build_faucet_tx(&[utxo.clone()], &main_dest, 20_000, 350, 5_000).is_err());
+
+        // Signet / Mutinynet succeeds and sends 20,000 sats + change
+        let sig_w = WatchtowerWallet::from_secret(sk, Network::Signet);
+        let sig_dest = WatchtowerWallet::from_secret(dest_sk, Network::Signet).address.to_string();
+        let tx = sig_w.build_faucet_tx(&[utxo], &sig_dest, 20_000, 350, 5_000).unwrap();
+        assert_eq!(tx.output.len(), 2);
+        assert_eq!(tx.output[0].value.to_sat(), 20_000);
+        assert_eq!(tx.output[1].value.to_sat(), 100_000 - 20_000 - 350);
+        assert_eq!(tx.input[0].witness.len(), 1);
     }
 }
