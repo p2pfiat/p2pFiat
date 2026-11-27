@@ -229,7 +229,42 @@ export async function createLpServer({
   }
 
   // Transport-agnostic LP RPC dispatcher (shared by HTTP and NIP-17 encrypted DMs)
-  async function handleRpc(method, body = {}) {
+  async function handleRpc(method, body = {}, senderPubkey = "") {
+    if (method === "faucet") {
+      const net = String(info.network || "mutinynet").toLowerCase();
+      if (net === "bitcoin" || net === "mainnet") {
+        throw new RpcError(403, "Faucet is strictly disabled on Bitcoin mainnet");
+      }
+      const arkAddress = String(body.arkAddress || "").trim();
+      if (!arkAddress.startsWith("tark1")) {
+        throw new RpcError(400, "Invalid Mutinynet Arkade address (expected tark1…)");
+      }
+      const claimKey = (senderPubkey || arkAddress).toLowerCase();
+      const d = store.read();
+      const prev = d.faucetClaims?.[claimKey];
+      if (prev) {
+        throw new RpcError(409, `Faucet already claimed for this identity (txid ${prev.txid})`);
+      }
+      const FAUCET_SATS = 20_000;
+      const MIN_LP_RESERVE_SATS = 50_000;
+      const bal = await wallet.getBalance();
+      if (Number(bal.available || 0) < FAUCET_SATS + MIN_LP_RESERVE_SATS) {
+        throw new RpcError(503, "LP faucet reserve low — try again shortly");
+      }
+      const txid = await wallet.sendBitcoin({ address: arkAddress, amount: FAUCET_SATS });
+      store.update((st) => {
+        if (!st.faucetClaims) st.faucetClaims = {};
+        st.faucetClaims[claimKey] = {
+          txid,
+          arkAddress,
+          amountSats: FAUCET_SATS,
+          claimedAt: Math.floor(Date.now() / 1000),
+        };
+      });
+      console.log(`  LP faucet      : sent ${FAUCET_SATS} instant Arkade sats -> ${arkAddress.slice(0, 18)}… (${txid})`);
+      return { ok: true, txid, amountSats: FAUCET_SATS, arkAddress };
+    }
+
     if (method === "health") {
       const [spotUsd, spotEur, bal, arkAddress] = await Promise.all([
         fetchBtcSpot("USD"),
@@ -903,7 +938,7 @@ export async function createLpServer({
   let initialPublish = null;
   if (relays.length > 0) {
     nip17Peer = new Nip17Peer(lpKey, relays, {
-      onRequest: (method, params) => handleRpc(method, params),
+      onRequest: (method, params, senderPubkey) => handleRpc(method, params, senderPubkey),
     });
     nip17Connected = await nip17Peer.connect();
     initialPublish = await buildAndPublishOffer().catch((err) => ({

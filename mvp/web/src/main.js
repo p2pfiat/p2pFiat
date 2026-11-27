@@ -2616,8 +2616,8 @@ async function boot() {
   await refresh();
   await fetchQuoteUi();
 
-  // Mutinynet onboarding faucet: on first login with 0 balance, automatically request
-  // 20,000 free test sats from the Watchtower to this wallet's Arkade boarding address.
+  // Mutinynet instant onboarding faucet: on first login with 0 balance, automatically request
+  // 20,000 free instant Arkade test sats from LP-Home straight to the user's tark1... address.
   try {
     const net = String(appWallet?.info?.network || "mutinynet").toLowerCase();
     const isMutinynet = net !== "bitcoin" && net !== "mainnet";
@@ -2634,13 +2634,20 @@ async function boot() {
     ) {
       const balNow = await appWallet.getBalance().catch(() => ({ boarding: 0 }));
       if (Number(balNow.boarding || 0) === 0) {
+        const banner = $("faucet-pending-banner");
+        banner?.classList.remove("hidden");
         localStorage.setItem(faucetFlag, "1");
         appWallet
           .requestMutinynetFaucet()
-          .then(() => {
-            showToast("🎁 Welcome! Requested 20,000 free Mutinynet test sats from Watchtower — arriving in ~30s!", 6500);
+          .then(async (res) => {
+            banner?.classList.add("hidden");
+            if (res?.ok) {
+              showToast("🎉 Received 20,000 free Mutinynet testnet sats — ready to test!", 6000);
+              await refresh();
+            }
           })
           .catch(() => {
+            banner?.classList.add("hidden");
             localStorage.removeItem(faucetFlag);
           });
       }

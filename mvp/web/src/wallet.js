@@ -59,6 +59,8 @@ const LEGACY_DEV_WATCHTOWER_PUBKEY =
   "08d19fed75e500fa6763db118b951a906c3ad7dfa98ace6d1c2c5bebde6e282d";
 export const DEFAULT_WATCHTOWER_PUBKEY =
   "beb4bc21ac4e61d62dbcec51dbd8cfd7d45cd941cfb36258011eafe1b5fc8ffe";
+export const DEFAULT_FAUCET_LP_PUBKEY =
+  "577fcbd37606362e3c77273287a57c98c325de77e577fc77271c8e7c9ba504cd";
 
 const LS_KEY = "p2pfiat_user_privkey_hex";
 const LS_POSITIONS = "p2pfiat_user_positions";
@@ -783,26 +785,22 @@ export class BrowserP2pFiatWallet {
   }
 
   /**
-   * Request a one-time 20,000-sat onboarding grant from the Watchtower Mutinynet faucet
-   * straight to this wallet's Arkade boarding address (`tb1p...`). Strictly Mutinynet/signet only.
+   * Request a one-time 20,000-sat instant Arkade onboarding grant on Mutinynet from LP-Home
+   * straight to this wallet's `tark1…` Arkade address (~2s arrival, strictly Mutinynet only).
    */
-  async requestMutinynetFaucet(watchtowerPubHex = getWatchtowerPubkey() || DEFAULT_WATCHTOWER_PUBKEY) {
+  async requestMutinynetFaucet(lpPubHex = DEFAULT_FAUCET_LP_PUBKEY) {
     const net = String(this.info?.network || "mutinynet").toLowerCase();
     if (net === "bitcoin" || net === "mainnet") {
       return { skipped: true, reason: "mainnet" };
     }
-    if (!watchtowerPubHex) {
-      throw new Error("No watchtower pubkey configured for Mutinynet faucet");
-    }
-    const address = await this.wallet.getBoardingAddress();
+    const arkAddress = await this.wallet.getAddress();
     const peer = this.getNip17Peer();
     if (peer.sockets.size === 0) {
       const ok = await peer.connect();
       if (ok === 0) throw new Error("Could not connect to Nostr relays for faucet request");
     }
-    const payloadStr = JSON.stringify({ type: "request_faucet", address });
-    const wrapId = await peer.sendWrapped(watchtowerPubHex, payloadStr);
-    return { wrapId, address, watchtowerPubHex };
+    const res = await peer.request(lpPubHex, "faucet", { arkAddress }, 15_000);
+    return { ...res, arkAddress, lpPubHex };
   }
 
   /** Instant offchain Arkade payment to a `tark1...` / `ark1...` address. */
