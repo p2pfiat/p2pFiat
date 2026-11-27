@@ -17,6 +17,8 @@ import {
   buildOffchainTx,
   MultisigTapscript,
   CSVMultisigTapscript,
+  InMemoryWalletRepository,
+  InMemoryContractRepository,
 } from "@arkade-os/sdk";
 import {
   ArkadeSwaps,
@@ -641,6 +643,10 @@ export class BrowserP2pFiatWallet {
       indexerProvider,
       onchainProvider,
       settlementConfig: false,
+      storage: {
+        walletRepository: new InMemoryWalletRepository(),
+        contractRepository: new InMemoryContractRepository(),
+      },
     });
     const userArkScript = new DefaultVtxo.Script({
       pubKey: userKey.pubXOnly,

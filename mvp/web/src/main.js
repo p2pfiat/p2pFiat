@@ -2523,6 +2523,7 @@ async function boot() {
     if (!ok) return;
     try {
       await appWallet?.wallet?.clear?.();
+      await appWallet?.wallet?.dispose?.();
     } catch {}
     try {
       if (typeof indexedDB !== "undefined" && indexedDB.databases) {
