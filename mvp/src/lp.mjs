@@ -951,17 +951,28 @@ export async function createLpServer({
     publishTimer.unref?.();
   }
 
-  // Periodic VTXO compaction: settle preconfirmed LP VTXOs into the next Arkade round
-  // every 10 minutes (when no trade is in flight) so unroll chains stay at ~1-2 hops.
+  // Smart periodic VTXO compaction: only settle preconfirmed LP VTXOs when chain depth >= 6 hops
+  // (avoids paying ~40 sat Arkade round fees on shallow 1-2 hop VTXOs while preventing deep chains).
   let settling = false;
   async function compactLpVtxos() {
     if (settling || pendingOpen.size > 0 || pendingRoll.size > 0 || pendingClose.size > 0) return;
     settling = true;
     try {
-      const bal = await wallet.getBalance();
-      if (Number(bal.preconfirmed || 0) > 0) {
+      const vtxos = await wallet.getVtxos();
+      const preconf = (vtxos || []).filter((v) => v?.virtualStatus?.state === "preconfirmed");
+      if (preconf.length === 0) return;
+      let maxHops = 0;
+      for (const v of preconf.slice(0, 3)) {
+        try {
+          const resp = await indexerProvider.getVtxoChain({ txid: v.txid, vout: v.vout });
+          const chain = resp?.txs?.length ? resp.txs : resp?.chain || [];
+          const hops = chain.filter((c) => !String(c.type).toLowerCase().includes("commitment") && c.type !== 1).length;
+          if (hops > maxHops) maxHops = hops;
+        } catch {}
+      }
+      if (maxHops >= 6) {
         const txid = await wallet.settle();
-        console.log(`  LP VTXO round  : compacted preconfirmed VTXOs into 1-hop round (${txid || "ok"})`);
+        console.log(`  LP VTXO round  : compacted ${maxHops}-hop preconfirmed VTXOs into 1-hop round (${txid || "ok"})`);
       }
     } catch (err) {
       console.warn(`  LP VTXO round  : skipped (${err?.message || err})`);
@@ -971,9 +982,8 @@ export async function createLpServer({
   }
   const settleTimer = setInterval(() => {
     compactLpVtxos().catch(() => {});
-  }, 10 * 60 * 1000);
+  }, 30 * 60 * 1000);
   settleTimer.unref?.();
-  // Also run once 20s after boot if there are preconfirmed VTXOs waiting
   const bootSettleTimer = setTimeout(() => {
     compactLpVtxos().catch(() => {});
   }, 20_000);

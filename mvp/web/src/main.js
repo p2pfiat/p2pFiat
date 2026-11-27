@@ -2661,21 +2661,33 @@ async function boot() {
   await verifyOrderBookPof(true);
   await fetchQuoteUi();
 
-  // Silent background VTXO compaction: settle any preconfirmed VTXOs into a 1-hop Arkade round
-  // 15s after boot (and every 15 min) so users never have to think about VTXO chain depth.
+  // Smart background VTXO compaction: ONLY settle preconfirmed VTXOs when the unroll chain
+  // actually gets deep (>= 12 hops) so normal 1-2 hop users NEVER pay unnecessary Arkade round fees (~40 sats).
   const autoCompactVtxos = async () => {
     try {
-      const b = await appWallet.getBalance();
-      if (Number(b?.preconfirmed || 0) > 0) {
+      const vtxos = await appWallet.wallet.getVtxos();
+      const preconf = (vtxos || []).filter((v) => v?.virtualStatus?.state === "preconfirmed");
+      if (preconf.length === 0) return;
+      let maxHops = 0;
+      for (const v of preconf.slice(0, 3)) {
+        try {
+          const resp = await appWallet.indexerProvider.getVtxoChain({ txid: v.txid, vout: v.vout });
+          const chain = resp?.txs?.length ? resp.txs : resp?.chain || [];
+          const hops = chain.filter((c) => !String(c.type).toLowerCase().includes("commitment") && c.type !== 1).length;
+          if (hops > maxHops) maxHops = hops;
+        } catch {}
+      }
+      if (maxHops >= 12) {
         await appWallet.settleVtxos();
+        showToast(`⚡ Compacted deep VTXO chain (${maxHops} hops → 1 hop · ~40 sats Arkade round fee)`, 5500);
         await refresh();
       }
     } catch {}
   };
-  setTimeout(autoCompactVtxos, 15_000);
+  setTimeout(autoCompactVtxos, 30_000);
   setInterval(() => {
     if (document.visibilityState === "visible") autoCompactVtxos();
-  }, 15 * 60_000);
+  }, 30 * 60_000);
 
   // Battery-friendly 10s local interest ticker (pauses automatically when tab is hidden)
   setInterval(() => {
