@@ -582,6 +582,7 @@ export function importPrivKeyHex(privHex) {
  */
 export async function restoreFromBackupKey(nsecOrHex) {
   logoutNip07Extension();
+  localStorage.removeItem(LS_POSITIONS);
   const nostrAccount = importNostrAccount(nsecOrHex);
   const cloudSeed = await tryDecryptCloudWalletSeedWithNsec(nostrAccount, getNostrRelays());
   const effectiveSeed = cloudSeed || nostrAccount.privHex;
@@ -596,6 +597,7 @@ export async function restoreFromBackupKey(nsecOrHex) {
  */
 export function createFreshNostrWallet() {
   logoutNip07Extension();
+  localStorage.removeItem(LS_POSITIONS);
   const nostrAccount = resetNostrAccount();
   const derivedArkHex = deriveArkadePrivKeyHexFromNsec(nostrAccount.privHex);
   localStorage.setItem(LS_KEY, derivedArkHex);

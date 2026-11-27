@@ -2513,7 +2513,7 @@ async function boot() {
     location.reload();
   };
 
-  $("logout-btn").onclick = () => {
+  $("logout-btn").onclick = async () => {
     const isNip07 = appWallet?.authIdentity?.mode === "nip07";
     const ok = confirm(
       isNip07
@@ -2521,6 +2521,17 @@ async function boot() {
         : "Log out and clear this browser's wallet key?\n\nMake sure you have copied your Backup Key (nsec1…) first if you hold any funds!"
     );
     if (!ok) return;
+    try {
+      await appWallet?.wallet?.clear?.();
+    } catch {}
+    try {
+      if (typeof indexedDB !== "undefined" && indexedDB.databases) {
+        const dbs = await indexedDB.databases();
+        for (const db of dbs) {
+          if (db?.name) indexedDB.deleteDatabase(db.name);
+        }
+      }
+    } catch {}
     clearAllWalletAuth();
     showToast("Logged out — returning to sign-in…");
     setTimeout(() => location.reload(), 400);

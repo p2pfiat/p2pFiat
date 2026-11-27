@@ -108,7 +108,7 @@ export function hasStoredAccount() {
 }
 
 /**
- * Clear active wallet session keys from this browser (explicit Log out).
+ * Clear active wallet session keys and cached account data from this browser (explicit Log out).
  */
 export function clearAllWalletAuth() {
   localStorage.removeItem(LS_AUTH_MODE);
@@ -116,6 +116,7 @@ export function clearAllWalletAuth() {
   localStorage.removeItem(LS_WALLET_SEED);
   localStorage.removeItem(LS_NOSTR_PRIVKEY);
   localStorage.removeItem("p2pfiat_user_privkey_hex");
+  localStorage.removeItem("p2pfiat_user_positions");
 }
 
 export function getAuthMode() {
