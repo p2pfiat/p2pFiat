@@ -46,7 +46,13 @@ import {
   nip44Decrypt,
 } from "./nip17.js";
 import { computeKormirOutcomePoint } from "./nostracle-client.js";
-import { buildDisputeWitnessSigs } from "./dispute-witness.js";
+import { buildDisputeWitnessSigs, parseDisputeLeaf } from "./dispute-witness.js";
+import {
+  computeDisputeManifestHash,
+  disputeLeafHashesHex,
+  disputeLeavesFromTapTree,
+  selectFallbackLeaf,
+} from "./dispute-manifest.js";
 import {
   getOrCreateNostrAccount,
   getActiveIdentity,
@@ -123,6 +129,7 @@ function buildNostracleDisputeLeaf(oraclePubsHex, threshold, exitDelaySecs) {
     oraclePubsHex: primary.oraclePubsHex,
     allOraclePubsHex: normalized,
     allLeaves,
+    leafHashesHex: disputeLeafHashesHex(allLeaves.map((l) => l.script)),
     threshold: k,
     csvSequence: csvVal,
   };
@@ -163,28 +170,6 @@ function concatBytes(...arrays) {
 function taggedHash(tag, ...parts) {
   const th = nobleSha256(enc.encode(tag));
   return nobleSha256(concatBytes(th, th, ...parts));
-}
-
-function computeDisputeManifestHash(m) {
-  const notionalCents = Math.round(Number(m.notional_fiat) * 100);
-  const fundingBpsX100 = Math.round(Number(m.funding_rate_bps_per_day) * 100);
-  const canonical = [
-    String(m.contract_id).trim(),
-    String(m.vtxo_outpoint).trim().toLowerCase(),
-    String(m.currency).trim().toUpperCase(),
-    String(m.side || "short").trim().toLowerCase(),
-    String(Number(m.total_collateral_sats)),
-    String(notionalCents),
-    String(Number(m.opened_at)),
-    String(fundingBpsX100),
-    String(m.user_pubkey_hex).trim().toLowerCase(),
-    String(m.lp_pubkey_hex).trim().toLowerCase(),
-    String(m.vtxo_pk_script_hex).trim().toLowerCase(),
-    String(m.dispute_script_hex).trim().toLowerCase(),
-    String(m.user_payout_script_hex).trim().toLowerCase(),
-    String(m.lp_payout_script_hex).trim().toLowerCase(),
-  ].join("|");
-  return taggedHash("p2pfiat/dispute-manifest/v1", enc.encode(canonical));
 }
 
 function bytesToBigInt(b) {
@@ -1237,7 +1222,10 @@ export class BrowserP2pFiatWallet {
           user_pubkey_hex: params.userPubHex.toLowerCase(),
           lp_pubkey_hex: this.userKey.pubHex.toLowerCase(),
           vtxo_pk_script_hex: hex.encode(contractScript.pkScript),
+          // v2: commit to every k-of-n subset leaf (p2pfiat/p2pFiat#20)
+          manifest_version: disputeClosure.allLeaves ? 2 : 1,
           dispute_script_hex: disputeClosure.scriptHex,
+          ...(disputeClosure.allLeaves ? { dispute_leaf_hashes_hex: disputeClosure.leafHashesHex } : {}),
           user_payout_script_hex: userPayoutScriptHex,
           lp_payout_script_hex: lpPayoutScriptHex,
         };
@@ -1298,6 +1286,12 @@ export class BrowserP2pFiatWallet {
             control_block_hex: disputeControlBlockHex,
             csv_sequence: disputeClosure.csvSequence,
             oracle_quorum: posQuorum,
+            leaves: (disputeClosure.allLeaves || []).map((l) => ({
+              script_hex: l.scriptHex,
+              control_block_hex: hex.encode(
+                btc.TaprootControlBlock.encode(contractScript.findLeaf(l.scriptHex)[0])
+              ),
+            })),
           },
         };
       }
@@ -1905,6 +1899,10 @@ export class BrowserP2pFiatWallet {
               control_block_hex: pos.disputeControlBlockHex,
               csv_sequence: Number(pos.disputeCsvSequence || 0),
               oracle_quorum: pos.oracleQuorum,
+              leaves: this._disputeLeavesOf(pos).map((l) => ({
+                script_hex: l.scriptHex,
+                control_block_hex: l.controlBlockHex,
+              })),
               manifest: pos.disputeManifest || null,
             }
           : null,
@@ -1992,6 +1990,24 @@ export class BrowserP2pFiatWallet {
   }
 
   /**
+   * The contract's committed k-of-n dispute leaves with control blocks, read from the stored
+   * taptree (checked against the contract pkScript). Empty when the position predates it.
+   */
+  _disputeLeavesOf(pos) {
+    if (!pos?.contractTapTreeHex || !pos?.contractPkScriptHex || !pos?.oracleQuorum) return [];
+    try {
+      return disputeLeavesFromTapTree({
+        tapTreeHex: pos.contractTapTreeHex,
+        pkScriptHex: pos.contractPkScriptHex,
+        oracleQuorum: pos.oracleQuorum,
+      });
+    } catch (err) {
+      console.warn(`dispute leaves for ${pos.positionId}: ${err.message}`);
+      return [];
+    }
+  }
+
+  /**
    * Emergency On-Demand Mid-Term Dispute Exit via Leaf 2 (`k-of-n` Nostracle BIP-342 quorum).
    * Used if the LP goes offline mid-term or BTC drops >= 50% (early liquidation).
    *
@@ -2057,18 +2073,9 @@ export class BrowserP2pFiatWallet {
     tx.addOutput({ script: uDest, amount: userAmt });
     tx.addOutput({ script: lDest, amount: lpAmt });
 
-    const disputeScript = hex.decode(manifest.dispute_script_hex);
     const contractPkScript = hex.decode(manifest.vtxo_pk_script_hex);
-    const sighash = tx.preimageWitnessV1(
-      0,
-      [contractPkScript],
-      btc.SigHash.DEFAULT,
-      [total],
-      undefined,
-      disputeScript,
-      0xc0
-    );
-    const sighashHex = hex.encode(sighash);
+    const leafSighash = (leafScript) =>
+      tx.preimageWitnessV1(0, [contractPkScript], btc.SigHash.DEFAULT, [total], undefined, leafScript, 0xc0);
 
     const peer = this.getNip17Peer();
     if (peer.sockets.size === 0) {
@@ -2076,7 +2083,8 @@ export class BrowserP2pFiatWallet {
       if (ok === 0) throw new Error("Could not connect to Nostr relays for dispute RPC");
     }
 
-    const reqParams = {
+    const isV2 = Number(manifest.manifest_version) === 2;
+    const baseParams = {
       contract_id: manifest.contract_id,
       vtxo_outpoint: manifest.vtxo_outpoint,
       currency: manifest.currency,
@@ -2095,33 +2103,68 @@ export class BrowserP2pFiatWallet {
       lp_manifest_sig_hex: manifest.lp_manifest_sig_hex,
       raw_tx_hex: hex.encode(tx.toBytes(true, false)),
       vtxo_pk_script_hex: manifest.vtxo_pk_script_hex,
-      dispute_script_hex: manifest.dispute_script_hex,
       user_payout_script_hex: manifest.user_payout_script_hex,
       lp_payout_script_hex: manifest.lp_payout_script_hex,
-      sighash_hex: sighashHex,
+      ...(isV2
+        ? { manifest_version: 2, dispute_leaf_hashes_hex: manifest.dispute_leaf_hashes_hex }
+        : {}),
     };
 
     const oracles = pos.oracleQuorum.oracles;
     const threshold = Number(pos.oracleQuorum.threshold || 2);
-    const sigsByOracle = new Map();
     const errors = [];
 
-    await Promise.all(
-      oracles.map(async (o) => {
-        try {
-          const res = await peer.request(o.pubkey, "sign_dispute", reqParams, 20_000);
-          if (!res?.signature_hex || res.signature_hex.length !== 128) {
-            throw new Error("missing signature_hex");
+    // Ask `oraclePubs` to sign the (fixed) dispute tx for `leafScript`; returns verified sigs.
+    const requestLeafSigs = async (leafScript, oraclePubs) => {
+      const sighash = leafSighash(leafScript);
+      const params = { ...baseParams, dispute_script_hex: hex.encode(leafScript), sighash_hex: hex.encode(sighash) };
+      const sigs = new Map();
+      await Promise.all(
+        oraclePubs.map(async (pub) => {
+          const o = oracles.find((x) => x.pubkey.toLowerCase() === pub) || { pubkey: pub };
+          try {
+            const res = await peer.request(o.pubkey, "sign_dispute", params, 20_000);
+            if (!res?.signature_hex || res.signature_hex.length !== 128) {
+              throw new Error("missing signature_hex");
+            }
+            const sigBytes = hex.decode(res.signature_hex);
+            if (!schnorr.verify(sigBytes, sighash, hex.decode(o.pubkey))) {
+              throw new Error("invalid BIP-340 signature");
+            }
+            sigs.set(pub, sigBytes);
+          } catch (err) {
+            errors.push(`${o.name || o.pubkey.slice(0, 8)}: ${err.message}`);
           }
-          const sigBytes = hex.decode(res.signature_hex);
-          const okSig = schnorr.verify(sigBytes, sighash, hex.decode(o.pubkey));
-          if (!okSig) throw new Error("invalid BIP-340 signature");
-          sigsByOracle.set(o.pubkey.toLowerCase(), sigBytes);
-        } catch (err) {
-          errors.push(`${o.name || o.pubkey.slice(0, 8)}: ${err.message}`);
-        }
-      })
+        })
+      );
+      return sigs;
+    };
+
+    // Round 1: everyone signs the manifest's primary leaf. Each oracle that signs also locks
+    // this exact tx, so in round 2 it will sign the same tx for another committed leaf.
+    let leafScript = hex.decode(manifest.dispute_script_hex);
+    let controlBlockHex = pos.disputeControlBlockHex;
+    let sigsByOracle = await requestLeafSigs(
+      leafScript,
+      oracles.map((o) => o.pubkey.toLowerCase())
     );
+    const round1Signers = [...sigsByOracle.keys()];
+    const primaryKeys = parseDisputeLeaf(leafScript).pubkeysHex;
+    const primaryComplete = primaryKeys.every((pk) => sigsByOracle.has(pk));
+
+    // Round 2 (v2 only): some primary oracle did not sign, but k others did -> use their leaf.
+    let usedFallbackLeaf = false;
+    if (!primaryComplete && isV2 && round1Signers.length >= threshold) {
+      const committed = new Set((manifest.dispute_leaf_hashes_hex || []).map((h) => h.toLowerCase()));
+      const leaves = this._disputeLeavesOf(pos).filter((l) => committed.has(l.leafHashHex));
+      const fallback = selectFallbackLeaf(leaves, round1Signers);
+      if (fallback) {
+        leafScript = fallback.script;
+        controlBlockHex = fallback.controlBlockHex;
+        sigsByOracle = await requestLeafSigs(leafScript, fallback.pubkeysHex);
+        usedFallbackLeaf = true;
+      }
+    }
 
     if (sigsByOracle.size < threshold) {
       throw new Error(
@@ -2129,16 +2172,15 @@ export class BrowserP2pFiatWallet {
       );
     }
 
-    // Witness signatures come from the leaf script's own key order (parsed opcodes, not a
-    // byte search for 0xba, which misread ~1/3 of CSVMultisig leaves as OP_CHECKSIGADD).
-    // The manifest commits to one leaf, so for CSVMultisig every oracle in that leaf must sign.
+    // Witness signatures follow the leaf script's own key order; every key of a CSVMultisig
+    // leaf must sign (see dispute-witness.js).
     let witnessSigs;
     try {
-      ({ sigs: witnessSigs } = buildDisputeWitnessSigs(disputeScript, sigsByOracle));
+      ({ sigs: witnessSigs } = buildDisputeWitnessSigs(leafScript, sigsByOracle));
     } catch (err) {
       throw new Error(`${err.message}${errors.length ? ` (${errors.join("; ")})` : ""}`);
     }
-    const witnessStack = [...witnessSigs, disputeScript, hex.decode(pos.disputeControlBlockHex)];
+    const witnessStack = [...witnessSigs, leafScript, hex.decode(controlBlockHex)];
     tx.updateInput(0, { finalScriptWitness: witnessStack });
     const rawTxHex = hex.encode(tx.toBytes(true, true));
 
@@ -2160,6 +2202,8 @@ export class BrowserP2pFiatWallet {
       signedCount: sigsByOracle.size,
       threshold,
       totalOracles: oracles.length,
+      usedFallbackLeaf,
+      disputeLeafHex: hex.encode(leafScript),
       userPayoutSats: Number(userAmt),
       lpPayoutSats: Number(lpAmt),
       spotPrice: liveSpot,
