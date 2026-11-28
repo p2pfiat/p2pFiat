@@ -119,3 +119,42 @@ export function selectFallbackLeaf(leaves, signedPubkeysHex) {
   const signed = new Set([...signedPubkeysHex].map((p) => String(p).toLowerCase()));
   return leaves.find((l) => l.pubkeysHex.every((pk) => signed.has(pk))) || null;
 }
+
+/**
+ * Round 1 of a v2 dispute: which leaf each oracle is asked to sign. A Nostracle only signs a
+ * leaf that contains its own key, so asking every oracle for the primary leaf would make the
+ * oracles outside it look offline. Each oracle gets the primary leaf if it holds the oracle's
+ * key, else the first committed leaf that does. All requests are for the same fixed tx, which
+ * the Nostracle txid lock allows across leaves.
+ * Returns `[{ leaf, pubkeysHex }]`, primary first; oracles in no leaf are left out.
+ */
+export function planDisputeRound1(primaryLeaf, leaves, oraclePubkeysHex) {
+  const byLeaf = new Map([[primaryLeaf.leafHashHex, { leaf: primaryLeaf, pubkeysHex: [] }]]);
+  for (const raw of oraclePubkeysHex) {
+    const pk = String(raw).toLowerCase();
+    const leaf = primaryLeaf.pubkeysHex.includes(pk)
+      ? primaryLeaf
+      : leaves.find((l) => l.pubkeysHex.includes(pk));
+    if (!leaf) continue;
+    if (!byLeaf.has(leaf.leafHashHex)) byLeaf.set(leaf.leafHashHex, { leaf, pubkeysHex: [] });
+    byLeaf.get(leaf.leafHashHex).pubkeysHex.push(pk);
+  }
+  return [...byLeaf.values()].filter((r) => r.pubkeysHex.length > 0);
+}
+
+/**
+ * After round 1: every oracle that returned a valid signature for any leaf is live. Pick the
+ * primary leaf if all its oracles are live, else the first committed leaf whose oracles all
+ * are. `sigsByLeaf` maps leafHashHex -> Map(pubkeyHex -> sig). Returns
+ * `{ leaf, have: Map(pubkeyHex -> sig) for that leaf, missing: [pubkeyHex] still to ask }`,
+ * or null when no leaf has all its oracles live.
+ */
+export function planDisputeRound2(primaryLeaf, leaves, sigsByLeaf) {
+  const live = new Set();
+  for (const sigs of sigsByLeaf.values()) for (const pk of sigs.keys()) live.add(pk);
+  const allLive = (l) => l.pubkeysHex.every((pk) => live.has(pk));
+  const leaf = allLive(primaryLeaf) ? primaryLeaf : leaves.find(allLive);
+  if (!leaf) return null;
+  const have = new Map(sigsByLeaf.get(leaf.leafHashHex) || []);
+  return { leaf, have, missing: leaf.pubkeysHex.filter((pk) => !have.has(pk)) };
+}

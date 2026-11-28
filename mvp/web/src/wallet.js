@@ -57,8 +57,10 @@ import {
 import {
   computeDisputeManifestHash,
   disputeLeafHashesHex,
+  disputeLeafHashHex,
   disputeLeavesFromTapTree,
-  selectFallbackLeaf,
+  planDisputeRound1,
+  planDisputeRound2,
 } from "./dispute-manifest.js";
 import {
   getOrCreateNostrAccount,
@@ -2176,29 +2178,49 @@ export class BrowserP2pFiatWallet {
       return sigs;
     };
 
-    // Round 1: everyone signs the manifest's primary leaf. Each oracle that signs also locks
-    // this exact tx, so in round 2 it will sign the same tx for another committed leaf.
-    let leafScript = hex.decode(manifest.dispute_script_hex);
-    let controlBlockHex = pos.disputeControlBlockHex;
-    let sigsByOracle = await requestLeafSigs(
-      leafScript,
-      oracles.map((o) => o.pubkey.toLowerCase())
-    );
-    const round1Signers = [...sigsByOracle.keys()];
-    const primaryKeys = parseDisputeLeaf(leafScript).pubkeysHex;
-    const primaryComplete = primaryKeys.every((pk) => sigsByOracle.has(pk));
-
-    // Round 2 (v2 only): some primary oracle did not sign, but k others did -> use their leaf.
-    let usedFallbackLeaf = false;
-    if (!primaryComplete && isV2 && round1Signers.length >= threshold) {
+    // Round 1. v1: every oracle signs the primary leaf. v2: each oracle signs a committed leaf
+    // that contains its own key (the primary leaf if it is in it); a Nostracle refuses leaves
+    // without its key, so asking everyone for the primary leaf would hide the online oracles
+    // outside it. Every request is for this same fixed tx (the Nostracle txid lock allows it).
+    const primaryScript = hex.decode(manifest.dispute_script_hex);
+    const primaryLeaf = {
+      script: primaryScript,
+      controlBlockHex: pos.disputeControlBlockHex,
+      pubkeysHex: parseDisputeLeaf(primaryScript).pubkeysHex,
+      leafHashHex: disputeLeafHashHex(primaryScript),
+    };
+    const oraclePubs = oracles.map((o) => o.pubkey.toLowerCase());
+    let leaves = [primaryLeaf];
+    if (isV2) {
       const committed = new Set((manifest.dispute_leaf_hashes_hex || []).map((h) => h.toLowerCase()));
-      const leaves = this._disputeLeavesOf(pos).filter((l) => committed.has(l.leafHashHex));
-      const fallback = selectFallbackLeaf(leaves, round1Signers);
-      if (fallback) {
-        leafScript = fallback.script;
-        controlBlockHex = fallback.controlBlockHex;
-        sigsByOracle = await requestLeafSigs(leafScript, fallback.pubkeysHex);
-        usedFallbackLeaf = true;
+      leaves = this._disputeLeavesOf(pos).filter((l) => committed.has(l.leafHashHex));
+    }
+    const round1 = isV2
+      ? planDisputeRound1(primaryLeaf, leaves, oraclePubs)
+      : [{ leaf: primaryLeaf, pubkeysHex: oraclePubs }];
+    const sigsByLeaf = new Map();
+    await Promise.all(
+      round1.map(async ({ leaf, pubkeysHex }) => {
+        sigsByLeaf.set(leaf.leafHashHex, await requestLeafSigs(leaf.script, pubkeysHex));
+      })
+    );
+
+    // Round 2 (v2): the primary leaf if all its oracles are live, else the first committed leaf
+    // whose oracles all are; ask only those that have not signed that leaf yet.
+    let leafScript = primaryLeaf.script;
+    let controlBlockHex = primaryLeaf.controlBlockHex;
+    let sigsByOracle = sigsByLeaf.get(primaryLeaf.leafHashHex) || new Map();
+    let usedFallbackLeaf = false;
+    if (isV2) {
+      const plan = planDisputeRound2(primaryLeaf, leaves, sigsByLeaf);
+      if (plan) {
+        leafScript = plan.leaf.script;
+        controlBlockHex = plan.leaf.controlBlockHex;
+        sigsByOracle = plan.have;
+        if (plan.missing.length > 0) {
+          for (const [pk, sig] of await requestLeafSigs(leafScript, plan.missing)) sigsByOracle.set(pk, sig);
+        }
+        usedFallbackLeaf = plan.leaf.leafHashHex !== primaryLeaf.leafHashHex;
       }
     }
 

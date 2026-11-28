@@ -8,7 +8,7 @@
 use crate::bounty::WatchtowerRole;
 use crate::dispute::{
     assemble_dispute_tx_witness, build_watchtower_dispute_tx, dispute_leaves, leaf_request,
-    verified_signers, DEFAULT_DISPUTE_MINER_FEE_SATS,
+    plan_round1, plan_round2, verified_signers, DEFAULT_DISPUTE_MINER_FEE_SATS,
 };
 use crate::service::{WatchtowerReply, WatchtowerRequest, WatchtowerService};
 use crate::storage::WatchState;
@@ -680,76 +680,76 @@ pub async fn resolve_pending_disputes(
                 continue;
             }
         };
+        let mut reqs = vec![primary];
+        reqs.extend(leaves[1..].iter().filter_map(|spec| leaf_request(&built, dispute, spec).ok()));
 
-        // Round 1: every quorum oracle is asked to sign the primary leaf. Each one that signs
-        // locks this exact tx, so it will sign the same tx for another committed leaf.
+        // Round 1: each oracle signs the fixed tx for a leaf that contains its own key (the
+        // primary leaf if it is in it). A Nostracle refuses leaves without its key, so asking
+        // everyone for the primary leaf would hide the online oracles outside it.
         let all_oracles: Vec<String> = dispute
             .oracle_quorum
             .oracles
             .iter()
             .map(|o| o.pubkey.trim().to_lowercase())
             .collect();
-        let round1 = match request_dispute_signatures(
-            client,
-            own_pk,
-            &all_oracles,
-            threshold,
-            &primary.rpc_params,
-            Duration::from_secs(20),
-            "r1",
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("{}: Leaf 2 sign_dispute RPC failed: {e:#}", c.package.id);
-                continue;
+        let mut sigs_by_leaf: Vec<HashMap<String, String>> = vec![HashMap::new(); reqs.len()];
+        for (idx, pks) in plan_round1(&reqs, &all_oracles) {
+            match request_dispute_signatures(
+                client,
+                own_pk,
+                &pks,
+                pks.len(),
+                &reqs[idx].rpc_params,
+                Duration::from_secs(20),
+                &format!("r1l{idx}"),
+            )
+            .await
+            {
+                Ok(s) => sigs_by_leaf[idx] = s,
+                Err(e) => log::warn!("{}: Leaf 2 sign_dispute RPC failed (leaf {idx}): {e:#}", c.package.id),
             }
-        };
-        let signers = verified_signers(&primary, &round1);
-        let primary_ok = if primary.legacy_checksigadd {
-            primary.keys.iter().filter(|k| signers.contains_key(*k)).count() >= threshold
-        } else {
-            primary.keys.iter().all(|k| signers.contains_key(k))
-        };
+        }
+        let verified: Vec<HashMap<String, [u8; 64]>> = reqs
+            .iter()
+            .zip(&sigs_by_leaf)
+            .map(|(r, s)| verified_signers(r, s))
+            .collect();
 
-        // Round 2 (manifest v2): a primary oracle did not sign but k others did; ask those k
-        // to sign the same tx for their own committed leaf.
-        let (leaf, sigs) = if primary_ok {
-            (primary, round1)
-        } else {
-            let fallback = leaves[1..].iter().find_map(|spec| {
-                let req = leaf_request(&built, dispute, spec).ok()?;
-                (!req.legacy_checksigadd && req.keys.iter().all(|k| signers.contains_key(k))).then_some(req)
-            });
-            match fallback {
-                Some(fb) => {
-                    log::info!(
-                        "{}: primary dispute leaf incomplete; asking {} for their committed leaf",
-                        c.package.id,
-                        fb.keys.iter().map(|k| &k[..8]).collect::<Vec<_>>().join(", ")
-                    );
-                    match request_dispute_signatures(
-                        client,
-                        own_pk,
-                        &fb.keys,
-                        fb.keys.len(),
-                        &fb.rpc_params,
-                        Duration::from_secs(20),
-                        "r2",
-                    )
-                    .await
-                    {
-                        Ok(s) => (fb, s),
-                        Err(e) => {
-                            log::warn!("{}: Leaf 2 round-2 sign_dispute failed: {e:#}", c.package.id);
-                            continue;
-                        }
-                    }
-                }
-                None => (primary, round1),
-            }
+        // Round 2: the primary leaf if all its oracles are live, else the first committed leaf
+        // whose oracles all are; ask only those that have not signed that leaf yet.
+        let Some((idx, missing)) = plan_round2(&reqs, &verified, threshold) else {
+            log::warn!(
+                "{}: fewer than {threshold} Nostracles answered for any dispute leaf",
+                c.package.id
+            );
+            continue;
         };
+        let mut sigs = sigs_by_leaf[idx].clone();
+        if !missing.is_empty() {
+            log::info!(
+                "{}: asking {} to sign dispute leaf {idx}",
+                c.package.id,
+                missing.iter().map(|k| &k[..8]).collect::<Vec<_>>().join(", ")
+            );
+            match request_dispute_signatures(
+                client,
+                own_pk,
+                &missing,
+                missing.len(),
+                &reqs[idx].rpc_params,
+                Duration::from_secs(20),
+                "r2",
+            )
+            .await
+            {
+                Ok(s) => sigs.extend(s),
+                Err(e) => {
+                    log::warn!("{}: Leaf 2 round-2 sign_dispute failed: {e:#}", c.package.id);
+                    continue;
+                }
+            }
+        }
+        let leaf = reqs.swap_remove(idx);
 
         match assemble_dispute_tx_witness(&built, &leaf, threshold, &sigs) {
             Ok(final_tx) => {

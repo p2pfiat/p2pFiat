@@ -15,6 +15,7 @@ import {
   disputeLeavesFromTapTree,
   selectFallbackLeaf,
 } from "../src/contract.mjs";
+import { planDisputeRound1, planDisputeRound2 } from "../web/src/dispute-manifest.js";
 
 const enc = new TextEncoder();
 
@@ -136,3 +137,84 @@ const sigs = Object.fromEntries(
 assert.equal(assembleDisputeWitness(dtx, disputeClosure, sigs).signedCount, 3);
 
 console.log("[PASS] manifest v2: v1 unchanged, order-independent v2 hash, taptree leaves, fallback leaf spend");
+
+// --- 5. two-round signing against Nostracles that behave like nostracle#7 ---
+// A Nostracle signs only leaves that contain its own key, and offline ones never answer.
+// The old flow (everyone signs the primary leaf, then pick a leaf among those signers) could
+// never use a fallback leaf; the planned flow must find one whenever k oracles are live.
+function quorumFixture(n, k) {
+  const keys = Array.from({ length: n }, () => randomEvenKey());
+  const q = { threshold: k, oracles: keys.map((o) => ({ pubkey: o.pubHex })) };
+  const [u, l, srv] = [randomEvenKey(), randomEvenKey(), randomEvenKey()];
+  const { vtxoScript: vs, disputeClosure: dc } = buildDlcContractScript(u.pubXOnly, l.pubXOnly, srv.pubXOnly, 2048n, q);
+  const all = disputeLeavesFromTapTree({ tapTreeHex: hex.encode(vs.encode()), pkScriptHex: hex.encode(vs.pkScript), oracleQuorum: q });
+  const primaryHash = disputeLeafHashHex(hex.decode(dc.scriptHex));
+  const primary = all.find((x) => x.leafHashHex === primaryHash);
+  return { keys, pubs: keys.map((o) => o.pubHex.toLowerCase()), leaves: all, primary };
+}
+
+function signLike(fx, offline) {
+  // returns Map(pubkey -> sig) for the oracles in `pubs` that would sign `leaf`
+  return (leaf, pubs) => {
+    const out = new Map();
+    for (const pk of pubs) {
+      const i = fx.pubs.indexOf(pk);
+      if (offline.has(i) || !leaf.pubkeysHex.includes(pk)) continue; // offline, or refuses
+      out.set(pk, schnorrSign(fx.keys[i], hex.decode(leaf.leafHashHex)));
+    }
+    return out;
+  };
+}
+
+function runDispute(fx, offline) {
+  const sign = signLike(fx, offline);
+  const sigsByLeaf = new Map();
+  for (const { leaf, pubkeysHex } of planDisputeRound1(fx.primary, fx.leaves, fx.pubs)) {
+    sigsByLeaf.set(leaf.leafHashHex, sign(leaf, pubkeysHex));
+  }
+  const plan = planDisputeRound2(fx.primary, fx.leaves, sigsByLeaf);
+  if (!plan) return null;
+  const sigs = new Map(plan.have);
+  for (const [pk, sig] of sign(plan.leaf, plan.missing)) sigs.set(pk, sig);
+  return { leaf: plan.leaf, sigs, round2Asked: plan.missing.length };
+}
+
+function oldFlow(fx, offline) {
+  const signers = [...signLike(fx, offline)(fx.primary, fx.pubs).keys()];
+  return fx.primary.pubkeysHex.every((pk) => signers.includes(pk)) ? fx.primary : selectFallbackLeaf(fx.leaves, signers);
+}
+
+for (const [n, k, offline, expectLeaf] of [
+  [3, 2, [], "primary"],
+  [3, 2, [1], [0, 2]],
+  [3, 2, [0], [1, 2]],
+  [5, 3, [], "primary"],
+  [5, 3, [1], "any"],
+  [5, 3, [1, 3], [0, 2, 4]],
+  [5, 3, [0, 1], [2, 3, 4]],
+  [3, 2, [0, 1], null],
+  [5, 3, [0, 1, 2], null],
+]) {
+  const fx = quorumFixture(n, k);
+  const off = new Set(offline);
+  const res = runDispute(fx, off);
+  const label = `${k}-of-${n}, offline ${JSON.stringify(offline)}`;
+  if (expectLeaf === null) {
+    assert.equal(res, null, `${label}: fewer than k live oracles, no leaf`);
+    continue;
+  }
+  assert.ok(res, `${label}: a leaf is found`);
+  assert.ok(res.leaf.pubkeysHex.every((pk) => !off.has(fx.pubs.indexOf(pk))), `${label}: only live oracles`);
+  assert.equal(res.sigs.size, k, `${label}: all k oracles of the leaf signed`);
+  assert.ok(res.leaf.pubkeysHex.every((pk) => res.sigs.has(pk)), `${label}: signatures are for the leaf's keys`);
+  if (expectLeaf === "primary") {
+    assert.equal(res.leaf.leafHashHex, fx.primary.leafHashHex, `${label}: primary leaf`);
+    assert.equal(res.round2Asked, 0, `${label}: no round 2 needed`);
+  } else if (Array.isArray(expectLeaf)) {
+    assert.deepEqual([...res.leaf.pubkeysHex].sort(), expectLeaf.map((i) => fx.pubs[i]).sort(), `${label}: the live subset`);
+  }
+  if (offline.some((i) => fx.primary.pubkeysHex.includes(fx.pubs[i]))) {
+    assert.equal(oldFlow(fx, off), null, `${label}: the old flow found no leaf (the bug)`);
+  }
+}
+console.log("[PASS] manifest v2 two-round signing: oracles that refuse foreign leaves, any k live oracles suffice");
