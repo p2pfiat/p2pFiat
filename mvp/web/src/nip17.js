@@ -290,6 +290,7 @@ export class Nip17Peer {
     this.relays = [...relays];
     this.onRequest = onRequest || null;
     this.sockets = new Map();
+    this.lastActivity = new Map();
     this.seenWrapIds = new Set();
     this.pendingReqs = new Map();
     this.subId = `nip17-${hex.encode(randomBytes(4))}`;
@@ -310,11 +311,27 @@ export class Nip17Peer {
     if (this._healthTimer) return;
     const checkAll = () => {
       if (this.closed) return;
+      const now = Date.now();
       for (const relayUrl of this.relays) {
         const ws = this.sockets.get(relayUrl);
-        if (!ws || ws.readyState === 2 || ws.readyState === 3) {
+        const last = this.lastActivity.get(relayUrl) || 0;
+        const isZombie = ws && ws.readyState === 1 && last > 0 && now - last > 180_000;
+        if (!ws || ws.readyState === 2 || ws.readyState === 3 || isZombie) {
+          if (isZombie) {
+            try { ws.close(); } catch {}
+          }
           this.sockets.delete(relayUrl);
+          this.lastActivity.delete(relayUrl);
           this._connectSingle(relayUrl, 5000);
+        } else if (ws.readyState === 1 && now - last > 60_000) {
+          try {
+            const hbId = `hb-${(now % 100000).toString(36)}`;
+            ws.send(JSON.stringify(["REQ", hbId, { kinds: [KIND_GIFT_WRAP], "#p": [this.myKey.pubHex], limit: 1 }]));
+          } catch {
+            try { ws.close(); } catch {}
+            this.sockets.delete(relayUrl);
+            this._connectSingle(relayUrl, 5000);
+          }
         }
       }
     };
@@ -354,13 +371,27 @@ export class Nip17Peer {
             finish(false);
             return;
           }
+          this.lastActivity.set(relayUrl, Date.now());
           ws.send(JSON.stringify(["REQ", this.subId, filter]));
           finish(true);
         };
-        ws.onmessage = (msg) => this._handleMessage(msg.data);
+        ws.onmessage = (msg) => {
+          this.lastActivity.set(relayUrl, Date.now());
+          try {
+            const parsed = JSON.parse(String(msg.data));
+            if (Array.isArray(parsed) && parsed[0] === "EOSE" && typeof parsed[1] === "string" && parsed[1].startsWith("hb-")) {
+              ws.send(JSON.stringify(["CLOSE", parsed[1]]));
+              return;
+            }
+          } catch {}
+          this._handleMessage(msg.data);
+        };
         ws.onerror = () => finish(false);
         ws.onclose = () => {
-          if (this.sockets.get(relayUrl) === ws) this.sockets.delete(relayUrl);
+          if (this.sockets.get(relayUrl) === ws) {
+            this.sockets.delete(relayUrl);
+            this.lastActivity.delete(relayUrl);
+          }
           finish(false);
           if (!this.closed) {
             setTimeout(() => {
@@ -455,7 +486,7 @@ export class Nip17Peer {
     return wrap.id;
   }
 
-  async request(recipientPubHex, method, params = {}, timeoutMs = 15_000) {
+  async request(recipientPubHex, method, params = {}, timeoutMs = 25_000) {
     if (this._openCount() < Math.min(2, this.relays.length)) {
       await this.connect(4000);
     }
@@ -466,16 +497,46 @@ export class Nip17Peer {
     const payload = JSON.stringify({ type: "p2pfiat-rpc-req", reqId, method, params });
 
     return new Promise((resolve, reject) => {
+      let retryTimer = null;
+      const cleanup = () => {
+        clearTimeout(timer);
+        if (retryTimer) clearTimeout(retryTimer);
+      };
       const timer = setTimeout(() => {
+        cleanup();
         this.pendingReqs.delete(reqId);
         reject(new Error(`NIP-17 RPC timeout for ${method}`));
       }, timeoutMs);
-      this.pendingReqs.set(reqId, { resolve, reject, timer, expectedPeer: recipientPubHex });
+      this.pendingReqs.set(reqId, {
+        resolve: (val) => {
+          cleanup();
+          resolve(val);
+        },
+        reject: (err) => {
+          cleanup();
+          reject(err);
+        },
+        timer,
+        expectedPeer: recipientPubHex,
+      });
       this.sendWrapped(recipientPubHex, payload).catch((err) => {
-        clearTimeout(timer);
+        cleanup();
         this.pendingReqs.delete(reqId);
         reject(err);
       });
+      // If no reply arrives within 10s (e.g. relay dropped the event or tab just woke up),
+      // refresh any dead relays and re-send the same reqId once.
+      if (timeoutMs >= 16_000) {
+        retryTimer = setTimeout(async () => {
+          if (!this.pendingReqs.has(reqId) || this.closed) return;
+          try {
+            await this.connect(3000);
+            if (this.pendingReqs.has(reqId)) {
+              await this.sendWrapped(recipientPubHex, payload);
+            }
+          } catch {}
+        }, 10_000);
+      }
     });
   }
 

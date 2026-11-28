@@ -252,6 +252,7 @@ export class Nip17Peer {
     this.relays = [...relays];
     this.onRequest = onRequest || null;
     this.sockets = new Map();
+    this.lastActivity = new Map();
     this.seenWrapIds = new Set();
     this.pendingReqs = new Map();
     this.subId = `nip17-${hex.encode(randomBytes(4))}`;
@@ -263,11 +264,29 @@ export class Nip17Peer {
     if (this._healthTimer) return;
     this._healthTimer = setInterval(() => {
       if (this.closed) return;
+      const now = Date.now();
       for (const relayUrl of this.relays) {
         const ws = this.sockets.get(relayUrl);
-        if (!ws || ws.readyState === 2 || ws.readyState === 3) {
+        const last = this.lastActivity.get(relayUrl) || 0;
+        const isZombie = ws && ws.readyState === 1 && last > 0 && now - last > 180_000;
+        if (!ws || ws.readyState === 2 || ws.readyState === 3 || isZombie) {
+          if (isZombie) {
+            try { ws.close(); } catch {}
+          }
           this.sockets.delete(relayUrl);
+          this.lastActivity.delete(relayUrl);
           this._connectSingle(relayUrl, 5000);
+        } else if (ws.readyState === 1 && now - last > 60_000) {
+          // Lightweight Nostr keepalive: a 1-event REQ elicits an immediate EOSE from live relays,
+          // refreshing lastActivity and detecting half-open TCP sockets cleanly.
+          try {
+            const hbId = `hb-${(now % 100000).toString(36)}`;
+            ws.send(JSON.stringify(["REQ", hbId, { kinds: [KIND_GIFT_WRAP], "#p": [this.myKey.pubHex], limit: 1 }]));
+          } catch {
+            try { ws.close(); } catch {}
+            this.sockets.delete(relayUrl);
+            this._connectSingle(relayUrl, 5000);
+          }
         }
       }
     }, 30_000);
@@ -290,13 +309,27 @@ export class Nip17Peer {
         const ws = new WebSocket(relayUrl);
         this.sockets.set(relayUrl, ws);
         ws.onopen = () => {
+          this.lastActivity.set(relayUrl, Date.now());
           ws.send(JSON.stringify(["REQ", this.subId, filter]));
           finish(true);
         };
-        ws.onmessage = (msg) => this._handleMessage(msg.data);
+        ws.onmessage = (msg) => {
+          this.lastActivity.set(relayUrl, Date.now());
+          try {
+            const parsed = JSON.parse(String(msg.data));
+            if (Array.isArray(parsed) && parsed[0] === "EOSE" && typeof parsed[1] === "string" && parsed[1].startsWith("hb-")) {
+              ws.send(JSON.stringify(["CLOSE", parsed[1]]));
+              return;
+            }
+          } catch {}
+          this._handleMessage(msg.data);
+        };
         ws.onerror = () => finish(false);
         ws.onclose = () => {
-          this.sockets.delete(relayUrl);
+          if (this.sockets.get(relayUrl) === ws) {
+            this.sockets.delete(relayUrl);
+            this.lastActivity.delete(relayUrl);
+          }
           finish(false);
           if (!this.closed) {
             setTimeout(() => {
@@ -413,6 +446,10 @@ export class Nip17Peer {
 
   close() {
     this.closed = true;
+    if (this._healthTimer) {
+      clearInterval(this._healthTimer);
+      this._healthTimer = null;
+    }
     for (const pend of this.pendingReqs.values()) {
       clearTimeout(pend.timer);
       pend.reject(new Error("Nip17Peer closed"));
