@@ -344,13 +344,17 @@ export function getNostrRelays() {
     .map((s) => s.trim())
     .filter((s) => s.startsWith("wss://") || s.startsWith("ws://"));
   if (parsed.length === 0) return [...DEFAULT_RELAYS];
-  // Auto-upgrade legacy saved relay lists that predate wss://relay.primal.net
-  // so existing browser sessions never get stuck on slow/offline relays while private windows work.
-  if (
-    !parsed.includes("wss://relay.primal.net") &&
-    parsed.every((r) => ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.snort.social", "wss://nostr.bitcoiner.social"].includes(r))
-  ) {
-    return ["wss://relay.primal.net", "wss://nostr.oxtr.dev", ...parsed];
+  // Auto-upgrade legacy default relay lists (damus/nos.lol/oxtr/bitcoiner.social) that block
+  // kind:38384 or NIP-17 kind:1059 for new keys, preserving any custom user-added relays.
+  const LEGACY_RELAYS = new Set([
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+    "wss://nostr.oxtr.dev",
+    "wss://nostr.bitcoiner.social",
+  ]);
+  if (parsed.every((r) => LEGACY_RELAYS.has(r))) {
+    return [...DEFAULT_RELAYS];
   }
   return parsed;
 }

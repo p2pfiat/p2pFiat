@@ -14,10 +14,10 @@ import { schnorrSign } from "./crypto.mjs";
 export const OFFER_KIND = 38384;
 export const DEFAULT_RELAYS = [
   "wss://relay.primal.net",
-  "wss://nostr.oxtr.dev",
-  "wss://relay.damus.io",
-  "wss://nos.lol",
-  "wss://nostr.bitcoiner.social",
+  "wss://relay.snort.social",
+  "wss://relay.noswhere.com",
+  "wss://relay.satlantis.io",
+  "wss://relay.nostr.net",
 ];
 
 const enc = new TextEncoder();
