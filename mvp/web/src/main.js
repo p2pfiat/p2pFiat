@@ -1831,19 +1831,24 @@ async function refresh() {
 
     const selected = getSelectedLp();
     let lpOk = false;
-    try {
-      const health = await appWallet.fetchLpHealth(selected);
-      if (health.oracleQuorum?.oracles?.length) renderNostracles(health.oracleQuorum);
-      if (health.spotUsd) spots.USD = Number(health.spotUsd);
-      if (health.spotEur) spots.EUR = Number(health.spotEur);
-      const shownSpot = spots[activeCurrency] || spots.USD || 0;
-      $("spot-pill").textContent = `BTC ${curSym()}${shownSpot.toLocaleString()}`;
-      $("lp-status").textContent = `${health.lpName || selected.lpName}${selected.preferNip17 ? " (NIP-17)" : ""}: ${Number(health.arkBalance?.available || 0).toLocaleString()} sats`;
-      $("lp-status").className = "pill ok";
-      lpOk = true;
-    } catch {
-      $("lp-status").textContent = `${selected.lpName} offline`;
-      $("lp-status").className = "pill err";
+    if (!selected.url && !selected.pubkey) {
+      $("lp-status").textContent = "Scanning Nostr relays…";
+      $("lp-status").className = "pill muted-pill";
+    } else {
+      try {
+        const health = await appWallet.fetchLpHealth(selected);
+        if (health.oracleQuorum?.oracles?.length) renderNostracles(health.oracleQuorum);
+        if (health.spotUsd) spots.USD = Number(health.spotUsd);
+        if (health.spotEur) spots.EUR = Number(health.spotEur);
+        const shownSpot = spots[activeCurrency] || spots.USD || 0;
+        $("spot-pill").textContent = `BTC ${curSym()}${shownSpot.toLocaleString()}`;
+        $("lp-status").textContent = `${health.lpName || selected.lpName}${selected.preferNip17 ? " (NIP-17)" : ""}: ${Number(health.arkBalance?.available || 0).toLocaleString()} sats`;
+        $("lp-status").className = "pill ok";
+        lpOk = true;
+      } catch {
+        $("lp-status").textContent = `${selected.lpName} offline`;
+        $("lp-status").className = "pill err";
+      }
     }
 
     renderPositions();
@@ -1859,6 +1864,10 @@ async function fetchQuoteUi() {
   const amt = getActiveTradeNotionalFiat();
   if (amt <= 0) return;
   const selected = getSelectedLp();
+  if (!selected.url && !selected.pubkey) {
+    $("quote-box").textContent = "Scanning Nostr relays for live LP offers…";
+    return;
+  }
   const cur = activeCurrency;
   const side = activeSide;
   const sym = curSym(cur);
