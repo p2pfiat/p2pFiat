@@ -17,9 +17,14 @@ import {
   AUTO_ROLL_RETRY_MS,
   autoRollStatusLine,
   autoRollTermSecs,
+  chooseGuardSpot,
   describeAutoRollError,
+  GUARD_SOURCE_TIMEOUT_MS,
   isAutoRollDue,
   lpRelaysFromOffers,
+  parseFeedSpot,
+  peerSpotTargets,
+  PUBLIC_SPOT_FEEDS,
   spotFromHealth,
 } from "./autoroll.js";
 import {
@@ -1570,22 +1575,60 @@ function positionLpTarget(p) {
 
 // The ±2% guard needs a FRESH spot: `spots` is only filled at load and on user actions,
 // so after hours with the tab open it is stale and every LP roll quote looked like a >2% deviation.
-async function fetchFreshSpot(cur, p) {
-  const sources = [getSelectedLp(), positionLpTarget(p)];
-  let lastErr = null;
-  for (const src of sources) {
+// The spot must also be INDEPENDENT of the LP being rolled, else that LP is checked against
+// itself: take the median of other order-book LPs' /health and public exchange feeds, and fall
+// back to the position's own LP /health only when none of them answers (shown on the card).
+const autoRollGuard = new Map(); // positionId -> last chooseGuardSpot() result
+
+function withTimeout(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} timed out`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function fetchGuardSpot(cur, p) {
+  let offers = [];
+  try {
+    offers = orderBook.getOffers({});
+  } catch {}
+  const own = positionLpTarget(p);
+  const peers = peerSpotTargets(offers, own);
+  const peerJobs = peers.map(async (t) => {
+    const health = await withTimeout(appWallet.fetchLpHealth(t), GUARD_SOURCE_TIMEOUT_MS, `${t.lpName} health`);
+    return { name: t.lpName, spot: spotFromHealth(health, cur) };
+  });
+  const feedJobs = PUBLIC_SPOT_FEEDS.map(async (f) => {
+    const r = await fetch(f.url(cur), { signal: AbortSignal.timeout(GUARD_SOURCE_TIMEOUT_MS) });
+    if (!r.ok) throw new Error(`${f.name} HTTP ${r.status}`);
+    return { name: f.name, spot: parseFeedSpot(f, await r.json(), cur) };
+  });
+  const settled = await Promise.allSettled([...peerJobs, ...feedJobs]);
+  const independent = settled.filter((s) => s.status === "fulfilled").map((s) => s.value);
+
+  let guard = chooseGuardSpot({ independent });
+  let lastErr = settled.find((s) => s.status === "rejected")?.reason || null;
+  if (!guard) {
     try {
-      const health = await appWallet.fetchLpHealth(src);
-      const sp = spotFromHealth(health, cur);
-      if (sp > 0) {
-        spots[cur] = sp;
-        return sp;
-      }
+      const health = await withTimeout(appWallet.fetchLpHealth(own), GUARD_SOURCE_TIMEOUT_MS, "LP health");
+      guard = chooseGuardSpot({ selfSpot: spotFromHealth(health, cur) });
     } catch (e) {
       lastErr = e;
     }
   }
-  throw new Error(`no live ${cur} spot (LP health unreachable${lastErr?.message ? `: ${lastErr.message}` : ""})`);
+  if (!guard) {
+    throw new Error(`no live ${cur} spot (price sources unreachable${lastErr?.message ? `: ${lastErr.message}` : ""})`);
+  }
+  if (guard.selfOnly) {
+    console.warn(`[auto-roll] ${p.positionId}: no independent ${cur} spot — ${guard.note}`);
+  } else {
+    spots[cur] = guard.spot;
+  }
+  autoRollGuard.set(p.positionId, guard);
+  return guard;
 }
 
 function setAutoRollStatus(p, state, text) {
@@ -1601,7 +1644,9 @@ function renderAutoRollStatus() {
   const map = loadPositions();
   document.querySelectorAll("[data-autoroll-status]").forEach((el) => {
     const id = el.getAttribute("data-autoroll-status");
-    const line = hasLegacyDisputeLeaf(map[id]) ? null : autoRollStatusLine(map[id], autoRollStatus.get(id));
+    const line = hasLegacyDisputeLeaf(map[id])
+      ? null
+      : autoRollStatusLine(map[id], autoRollStatus.get(id), Date.now(), autoRollGuard.get(id));
     el.textContent = line ? line.text : "";
     el.className = `autoroll-status ${line ? line.tone : ""}`;
     el.hidden = !line;
@@ -1626,7 +1671,9 @@ async function checkAutoRolls() {
       const pCur = (p.currency || "USD").toUpperCase();
       try {
         setAutoRollStatus(p, "rolling", "");
-        const liveSpot = await fetchFreshSpot(pCur, p);
+        const guard = await fetchGuardSpot(pCur, p);
+        renderAutoRollStatus();
+        const liveSpot = guard.spot;
         const target = positionLpTarget(p);
         const rolled = await appWallet.rollPosition(p.positionId, {
           expectedSpot: liveSpot,
@@ -1641,7 +1688,10 @@ async function checkAutoRolls() {
           paidSats > 0
             ? `+${paidSats.toLocaleString()} sats yield paid to Available BTC`
             : `term reset (${fmtTimeLeft(autoRollTermSecs(p))})`;
-        showToast(`↻ Auto-rolled #${rolled.rollCount} at ${rSym}${rolled.openSpotUsd} — ${detail}`, 6000);
+        showToast(
+          `↻ Auto-rolled #${rolled.rollCount} at ${rSym}${rolled.openSpotUsd} — ${detail}${guard.selfOnly ? ` (${guard.note})` : ""}`,
+          6000
+        );
         await refresh();
       } catch (err) {
         const reason = describeAutoRollError(err);
