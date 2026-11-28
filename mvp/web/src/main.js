@@ -53,6 +53,7 @@ import {
   QUORUM_PRESETS,
   buildQuorumForPreset,
   pubkeyHexToNpub,
+  noLiveOfferText,
   setActiveNostraclePool,
   isQuorumPresetAvailable,
 } from "./offerbook.js";
@@ -1869,7 +1870,10 @@ async function refresh() {
     const selected = getSelectedLp();
     let lpOk = false;
     if (!selected.url && !selected.pubkey) {
-      $("lp-status").textContent = "Scanning Nostr relays…";
+      $("lp-status").textContent = noLiveOfferText({
+        answered: orderBook.relaysAnswered,
+        lastSeen: orderBook.getLastSeenLp(),
+      });
       $("lp-status").className = "pill muted-pill";
     } else {
       try {
@@ -1921,7 +1925,9 @@ async function fetchQuoteUi() {
   if (amt <= 0) return;
   const selected = getSelectedLp();
   if (!selected.url && !selected.pubkey) {
-    $("quote-box").textContent = "Scanning Nostr relays for live LP offers…";
+    $("quote-box").textContent = orderBook.relaysAnswered
+      ? `${noLiveOfferText({ answered: true, lastSeen: orderBook.getLastSeenLp() })}. Quotes appear as soon as an LP publishes again.`
+      : "Scanning Nostr relays for live LP offers…";
     return;
   }
   const cur = activeCurrency;
