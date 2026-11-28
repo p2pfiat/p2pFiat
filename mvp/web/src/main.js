@@ -1865,6 +1865,16 @@ async function refresh() {
       if (!autoOnboardInFlight) setIncomingBanner("", false);
     }
 
+    // Reconcile any locally checkpointed pending positions directly against the Arkade indexer
+    // (100% LP-independent: works even if the LP is offline after finalizing).
+    const pendingRes = await appWallet.reconcilePendingPositions().catch(() => ({ promotedCount: 0 }));
+    if (pendingRes?.promotedCount > 0) {
+      showToast(
+        `✓ Confirmed ${pendingRes.promotedCount} pending position${pendingRes.promotedCount === 1 ? "" : "s"} on Arkade`,
+        5500
+      );
+    }
+
     const selected = getSelectedLp();
     let lpOk = false;
     if (!selected.url && !selected.pubkey) {

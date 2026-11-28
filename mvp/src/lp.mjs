@@ -646,8 +646,17 @@ export async function createLpServer({
 
       return {
         positionId,
+        openedAt,
+        lpPubHex: lpKey.pubHex,
         contractAddress: contractScript.address("tark", serverXOnly).encode(),
         contractPkScriptHex: hex.encode(contractScript.pkScript),
+        contractTapTreeHex: hex.encode(contractScript.encode()),
+        settleScriptHex: hex.encode(settleClosure.script),
+        exitScriptHex: hex.encode(exitClosure.script),
+        disputeScriptHex: disputeClosure?.scriptHex || null,
+        disputeControlBlockHex,
+        disputeCsvSequence: disputeClosure?.csvSequence || null,
+        exitDelaySecs: Number(exitDelaySecs),
         arkTxB64: base64.encode(arkTx.toPSBT()),
         userCkB64: base64.encode(userCk.toPSBT()),
         exitSuite,
