@@ -29,7 +29,8 @@ export function spotFromHealth(health, currency = "USD") {
 /** NIP-17 relays an LP advertises in its current order-book offer (empty if none). */
 export function lpRelaysFromOffers(offers, lpPubkey) {
   if (!lpPubkey || !Array.isArray(offers)) return [];
-  const o = offers.find((x) => x && x.pubkey === lpPubkey);
+  const want = String(lpPubkey).toLowerCase();
+  const o = offers.find((x) => x && typeof x.pubkey === "string" && x.pubkey.toLowerCase() === want);
   return Array.isArray(o?.nip17Relays) ? o.nip17Relays.filter((r) => typeof r === "string" && r) : [];
 }
 

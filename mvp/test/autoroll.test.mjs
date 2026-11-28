@@ -37,6 +37,9 @@ test("LP NIP-17 relays come from that LP's order-book offer", () => {
   ];
   assert.deepEqual(lpRelaysFromOffers(offers, "aa"), ["wss://a"]);
   assert.deepEqual(lpRelaysFromOffers(offers, "cc"), []);
+  // hex pubkeys may arrive in mixed case
+  assert.deepEqual(lpRelaysFromOffers(offers, "BB"), ["wss://b"]);
+  assert.deepEqual(lpRelaysFromOffers([{ pubkey: "AA", nip17Relays: ["wss://x"] }], "aa"), ["wss://x"]);
   assert.deepEqual(lpRelaysFromOffers(null, "aa"), []);
 });
 
