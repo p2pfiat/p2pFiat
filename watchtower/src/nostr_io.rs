@@ -11,7 +11,7 @@ use crate::dispute::{
     plan_round1, plan_round2, verified_signers, DEFAULT_DISPUTE_MINER_FEE_SATS,
 };
 use crate::service::{WatchtowerReply, WatchtowerRequest, WatchtowerService};
-use crate::storage::WatchState;
+use crate::storage::{PendingDispute, WatchState};
 use anyhow::{anyhow, ensure, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -641,27 +641,39 @@ pub async fn resolve_pending_disputes(
         let Some(dispute) = &c.package.dispute else { continue };
         let Some(manifest) = &dispute.manifest else { continue };
 
+        // A Nostracle that signed a dispute tx for this coin refuses every other tx for it, so
+        // a retry must rebuild exactly the first attempt's tx: reuse its timestamp and spot.
         let cur = manifest.currency.trim().to_uppercase();
-        let live_spot = if let Some(&p) = spot_cache.get(&cur) {
-            p
+        let (dispute_ts, live_spot) = if let Some(p) = c.pending_dispute {
+            (p.dispute_timestamp, p.live_spot)
         } else {
-            match fetch_live_spot_price(http, &cur).await {
-                Ok(p) => {
-                    spot_cache.insert(cur.clone(), p);
-                    p
+            let live_spot = if let Some(&p) = spot_cache.get(&cur) {
+                p
+            } else {
+                match fetch_live_spot_price(http, &cur).await {
+                    Ok(p) => {
+                        spot_cache.insert(cur.clone(), p);
+                        p
+                    }
+                    Err(e) => {
+                        log::warn!("{}: Leaf 2 dispute skipped (no {cur} spot): {e:#}", c.package.id);
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    log::warn!("{}: Leaf 2 dispute skipped (no {cur} spot): {e:#}", c.package.id);
-                    continue;
-                }
+            };
+            let pending = PendingDispute { dispute_timestamp: now, live_spot };
+            if let Err(e) = wt.storage.update(&c.package.id, |w| w.pending_dispute = Some(pending)) {
+                log::warn!("{}: could not persist pending dispute: {e:#}", c.package.id);
+                continue;
             }
+            (now, live_spot)
         };
 
         let built = match build_watchtower_dispute_tx(
             dispute,
             &c.package.bounty,
             live_spot,
-            now,
+            dispute_ts,
             DEFAULT_DISPUTE_MINER_FEE_SATS,
         ) {
             Ok(b) => b,
@@ -714,6 +726,10 @@ pub async fn resolve_pending_disputes(
             .zip(&sigs_by_leaf)
             .map(|(r, s)| verified_signers(r, s))
             .collect();
+        if verified.iter().all(|m| m.is_empty()) {
+            // Nobody signed, so no Nostracle locked this tx: the next cycle may build a fresh one.
+            let _ = wt.storage.update(&c.package.id, |w| w.pending_dispute = None);
+        }
 
         // Round 2: the primary leaf if all its oracles are live, else the first committed leaf
         // whose oracles all are; ask only those that have not signed that leaf yet.

@@ -976,6 +976,23 @@ mod tests {
     }
 
     #[test]
+    fn same_timestamp_and_spot_rebuild_the_same_tx() {
+        // Retries must reuse the first attempt's inputs: a Nostracle locked to that txid
+        // refuses any other tx for the coin.
+        let (dispute, bounty, _) = make_v2_fixture();
+        let a = build_watchtower_dispute_tx(&dispute, &bounty, 97_100.5, 1_760_086_400, 350).unwrap();
+        let b = build_watchtower_dispute_tx(&dispute, &bounty, 97_100.5, 1_760_086_400, 350).unwrap();
+        assert_eq!(a.unsigned_tx.compute_txid(), b.unsigned_tx.compute_txid());
+        assert_eq!(a.rpc_params["raw_tx_hex"], b.rpc_params["raw_tx_hex"]);
+        let later = build_watchtower_dispute_tx(&dispute, &bounty, 97_100.5, 1_760_086_400 + 3_600, 350).unwrap();
+        assert_ne!(
+            later.unsigned_tx.compute_txid(),
+            a.unsigned_tx.compute_txid(),
+            "a new timestamp is a different tx, which locked Nostracles refuse"
+        );
+    }
+
+    #[test]
     fn dispute_leaves_only_offers_committed_leaves() {
         let (mut dispute, _, o) = make_v2_fixture();
         let rogue = csv_multisig_leaf(&[o[0], o[1]]);
