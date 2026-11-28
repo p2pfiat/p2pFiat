@@ -407,6 +407,23 @@ export class Nip17Peer {
     });
   }
 
+  async ensureRelays(extraRelays = []) {
+    if (!Array.isArray(extraRelays) || extraRelays.length === 0) return;
+    const toConnect = [];
+    for (const raw of extraRelays) {
+      const url = String(raw || "").trim();
+      if (!url.startsWith("wss://") && !url.startsWith("ws://")) continue;
+      if (!this.relays.includes(url)) this.relays.push(url);
+      const ws = this.sockets.get(url);
+      if (!ws || ws.readyState === 2 || ws.readyState === 3) {
+        toConnect.push(url);
+      }
+    }
+    if (toConnect.length > 0) {
+      await Promise.all(toConnect.map((u) => this._connectSingle(u, 3500)));
+    }
+  }
+
   async connect(timeoutMs = 5000) {
     if (this.relays.length === 0) return 0;
     this._startHealthCheck();

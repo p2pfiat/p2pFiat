@@ -345,7 +345,15 @@ export class Nip17Peer {
     });
   }
 
-  async connect(timeoutMs = 5000) {
+  getConnectedRelays() {
+    const out = [];
+    for (const [url, ws] of this.sockets.entries()) {
+      if (ws && ws.readyState === 1) out.push(url);
+    }
+    return out;
+  }
+
+  async connect(timeoutMs = 8000) {
     if (this.relays.length === 0) return 0;
     this._startHealthCheck();
     const attempts = this.relays.map((relayUrl) => this._connectSingle(relayUrl, timeoutMs));

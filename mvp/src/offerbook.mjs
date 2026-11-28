@@ -13,10 +13,10 @@ import { schnorrSign } from "./crypto.mjs";
 
 export const OFFER_KIND = 38384;
 export const DEFAULT_RELAYS = [
-  "wss://relay.damus.io",
-  "wss://nos.lol",
   "wss://relay.primal.net",
   "wss://nostr.oxtr.dev",
+  "wss://relay.damus.io",
+  "wss://nos.lol",
   "wss://nostr.bitcoiner.social",
 ];
 
@@ -105,6 +105,9 @@ export function createSignedOfferEvent(
       : offerPayload.endpointUrl
       ? ["http", "nostr-nip17"]
       : ["nostr-nip17"],
+    nip17Relays: Array.isArray(offerPayload.nip17Relays)
+      ? offerPayload.nip17Relays.filter((r) => typeof r === "string" && (r.startsWith("wss://") || r.startsWith("ws://")))
+      : [],
     oracleMode: offerPayload.oracleMode || "nostracle-quorum-2of3",
     oracleQuorum: offerPayload.oracleQuorum || DEFAULT_NOSTRACLE_QUORUM,
     proofMode: offerPayload.proofMode || "arkade-default-vtxo",
@@ -204,7 +207,7 @@ export function verifyOfferEvent(event, nowSecs = Math.floor(Date.now() / 1000))
 export async function publishOfferToRelays(
   event,
   relays = DEFAULT_RELAYS,
-  timeoutMs = 4500
+  timeoutMs = 9000
 ) {
   if (!relays || relays.length === 0) return { okRelays: [], failedRelays: [] };
 

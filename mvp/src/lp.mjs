@@ -187,6 +187,8 @@ export async function createLpServer({
     const events = [];
     const okRelaySet = new Set();
     const failedRelays = [];
+    const liveNip17Relays =
+      nip17Peer?.getConnectedRelays?.().length > 0 ? nip17Peer.getConnectedRelays() : relays;
 
     for (const pair of pairs) {
       const currency = pair.includes("-") ? pair.split("-")[1].toUpperCase() : "USD";
@@ -211,6 +213,7 @@ export async function createLpServer({
         termSecs: 86_400,
         endpointUrl,
         transports,
+        nip17Relays: liveNip17Relays,
         oracleQuorum,
       });
       latestOfferEvents[pair] = event;

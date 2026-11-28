@@ -11,10 +11,10 @@ import { hex, bech32 } from "@scure/base";
 
 export const OFFER_KIND = 38384;
 export const DEFAULT_RELAYS = [
-  "wss://relay.damus.io",
-  "wss://nos.lol",
   "wss://relay.primal.net",
   "wss://nostr.oxtr.dev",
+  "wss://relay.damus.io",
+  "wss://nos.lol",
   "wss://nostr.bitcoiner.social",
 ];
 

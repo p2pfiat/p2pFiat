@@ -26,6 +26,7 @@ import {
   addCustomNostracle,
   removeCustomNostracle,
   loadPositions,
+  savePositions,
   restorePositionsFromNostr,
   restoreFromBackupKey,
   createFreshNostrWallet,
@@ -141,6 +142,7 @@ function getSelectedLp() {
     lpName: chosen.lpName || chosen.pubkey.slice(0, 10),
     pubkey: chosen.pubkey,
     preferNip17: !chosen.endpointUrl,
+    relays: Array.isArray(chosen.nip17Relays) ? chosen.nip17Relays : [],
     fromOrderbook: true,
     offer: chosen,
   };

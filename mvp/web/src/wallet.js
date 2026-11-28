@@ -343,7 +343,16 @@ export function getNostrRelays() {
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s.startsWith("wss://") || s.startsWith("ws://"));
-  return parsed.length > 0 ? parsed : [...DEFAULT_RELAYS];
+  if (parsed.length === 0) return [...DEFAULT_RELAYS];
+  // Auto-upgrade legacy saved relay lists that predate wss://relay.primal.net
+  // so existing browser sessions never get stuck on slow/offline relays while private windows work.
+  if (
+    !parsed.includes("wss://relay.primal.net") &&
+    parsed.every((r) => ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.snort.social", "wss://nostr.bitcoiner.social"].includes(r))
+  ) {
+    return ["wss://relay.primal.net", "wss://nostr.oxtr.dev", ...parsed];
+  }
+  return parsed;
 }
 
 export function setNostrRelays(relaysOrStr) {
@@ -1434,7 +1443,7 @@ export class BrowserP2pFiatWallet {
 
   _normalizeTarget(targetOrUrl) {
     if (typeof targetOrUrl === "string") {
-      return { url: targetOrUrl, pubkey: null, preferNip17: false };
+      return { url: targetOrUrl, pubkey: null, preferNip17: false, relays: [] };
     }
     if (targetOrUrl && typeof targetOrUrl === "object") {
       return {
@@ -1442,9 +1451,10 @@ export class BrowserP2pFiatWallet {
         pubkey: targetOrUrl.pubkey || null,
         preferNip17: Boolean(targetOrUrl.preferNip17),
         lpName: targetOrUrl.lpName || "",
+        relays: Array.isArray(targetOrUrl.relays) ? targetOrUrl.relays : [],
       };
     }
-    return { url: getLpUrl(), pubkey: null, preferNip17: false };
+    return { url: getLpUrl(), pubkey: null, preferNip17: false, relays: [] };
   }
 
   async callLp(targetOrUrl, method, params = {}) {
@@ -1452,7 +1462,9 @@ export class BrowserP2pFiatWallet {
     const useNip17First = t.preferNip17 || (!t.url && Boolean(t.pubkey));
     if (useNip17First) {
       if (!t.pubkey) throw new Error("Missing LP pubkey for NIP-17 P2P transport");
-      return this.getNip17Peer().request(t.pubkey, method, params);
+      const peer = this.getNip17Peer();
+      if (t.relays?.length) await peer.ensureRelays(t.relays);
+      return peer.request(t.pubkey, method, params);
     }
     try {
       if (method === "health" || method === "offer" || method === "positions") {
