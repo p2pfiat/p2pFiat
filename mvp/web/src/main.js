@@ -61,6 +61,7 @@ import {
   fetchCuratedWatchtowerList,
 } from "./nostracle-client.js";
 import { hasLegacyDisputeLeaf, LEGACY_POSITION_TEXT } from "./dispute-witness.js";
+import { createOwnPayoutTracker } from "./own-payouts.js";
 import {
   fetchNostrProfile,
   publishNostrProfile,
@@ -90,6 +91,35 @@ let sendIsMax = false;
 let stableRecvPollTimer = null;
 let stableRecvBaselineSats = 0;
 let stableRecvBusy = false;
+
+// Own payouts (close payouts, yield paid out on a roll) raise the available balance just like
+// an incoming payment, but Auto-Stabilize must not lock them. Every balance reading goes
+// through noteAvailable(): the part of an increase that own payouts explain moves the
+// Auto-Stabilize baseline instead of counting as received.
+const ownPayouts = createOwnPayoutTracker();
+let ownPayoutOpsInFlight = 0;
+let lastSeenAvailSats = null;
+
+function noteAvailable(curAvail) {
+  // While a close/roll runs, its payout may land before we know its size: wait.
+  if (ownPayoutOpsInFlight > 0) return;
+  if (lastSeenAvailSats !== null && curAvail > lastSeenAvailSats) {
+    stableRecvBaselineSats += ownPayouts.absorb(curAvail - lastSeenAvailSats);
+  }
+  lastSeenAvailSats = curAvail;
+}
+
+/** Run a close/roll; its payout to the wallet (from `payoutOf(result)`) is not "received". */
+async function runOwnPayoutOp(fn, payoutOf) {
+  ownPayoutOpsInFlight++;
+  try {
+    const result = await fn();
+    ownPayouts.add(payoutOf(result));
+    return result;
+  } finally {
+    ownPayoutOpsInFlight--;
+  }
+}
 let vaultDirection = "vault-to-ark"; // "vault-to-ark" | "ark-to-vault"
 let vaultIsMax = false;
 const orderBook = new LocalOrderBook();
@@ -1111,7 +1141,7 @@ function renderPositions() {
       btn.disabled = true;
       btn.textContent = "Rolling…";
       try {
-        const rolled = await appWallet.rollPosition(id);
+        const rolled = await runOwnPayoutOp(() => appWallet.rollPosition(id), (r) => r?.lastRollUserSurplusSats);
         const rCur = (rolled.currency || "USD").toUpperCase();
         const rSym = curSym(rCur);
         const paidSats = Number(rolled.lastRollUserSurplusSats || 0);
@@ -1165,7 +1195,7 @@ function renderPositions() {
       btn.disabled = true;
       btn.textContent = "Closing…";
       try {
-        const closed = await appWallet.closePosition(id);
+        const closed = await runOwnPayoutOp(() => appWallet.closePosition(id), (r) => r?.userPayoutSats);
         showToast(`Closed ${id}: received ${closed.userPayoutSats} sats at $${closed.closeSpotUsd}`);
         await refresh();
       } catch (e) {
@@ -1675,11 +1705,15 @@ async function checkAutoRolls() {
         renderAutoRollStatus();
         const liveSpot = guard.spot;
         const target = positionLpTarget(p);
-        const rolled = await appWallet.rollPosition(p.positionId, {
-          expectedSpot: liveSpot,
-          maxSpotDriftPct: AUTO_ROLL_MAX_DRIFT_PCT,
-          relays: target.relays,
-        });
+        const rolled = await runOwnPayoutOp(
+          () =>
+            appWallet.rollPosition(p.positionId, {
+              expectedSpot: liveSpot,
+              maxSpotDriftPct: AUTO_ROLL_MAX_DRIFT_PCT,
+              relays: target.relays,
+            }),
+          (r) => r?.lastRollUserSurplusSats
+        );
         autoRollStatus.delete(p.positionId);
         autoRollLastAttempt.delete(p.positionId);
         const rSym = curSym((rolled.currency || pCur).toUpperCase());
@@ -1795,6 +1829,7 @@ async function refresh() {
     $("vault-addr").textContent = addrs.vaultAddress;
     renderReceiveQr();
     lastAvailSats = Number(bal.available || 0);
+    noteAvailable(lastAvailSats);
     lastVaultSats = Number(vaultBal.total || 0);
     $("avail-sats").textContent = `${lastAvailSats.toLocaleString()} sats`;
     $("vault-sats").textContent = `${lastVaultSats.toLocaleString()} sats`;
@@ -1973,6 +2008,7 @@ async function boot() {
   function startStableAutoReceive() {
     stopStableAutoReceive();
     stableRecvBaselineSats = lastAvailSats;
+    lastSeenAvailSats = lastAvailSats;
     const banner = $("stable-recv-banner");
     const cur = activeCurrency;
     const sym = curSym(cur);
@@ -1986,8 +2022,10 @@ async function boot() {
       }
       stableRecvBusy = true;
       try {
+        if (ownPayoutOpsInFlight > 0) return; // a close/roll is paying out to this wallet
         const bal = await appWallet.getBalance();
         const curAvail = Number(bal.available || 0);
+        noteAvailable(curAvail);
         const deltaSats = curAvail - stableRecvBaselineSats;
         if (deltaSats >= 1_000) {
           const sp = spots[cur] || spots.USD || 60000;
@@ -1997,6 +2035,7 @@ async function boot() {
             banner.innerHTML = `⏳ Received <strong>+${deltaSats.toLocaleString()} sats</strong> — auto-locking <strong>${fmtFiat(deltaFiat, cur)} Stable ${cur}</strong> via ${selected.lpName}…`;
             const pos = await appWallet.openPosition(deltaFiat, selected, selected.lpName, cur, "short");
             stableRecvBaselineSats = Number((await appWallet.getBalance()).available || 0);
+            lastSeenAvailSats = stableRecvBaselineSats;
             banner.innerHTML = `✅ Received +${deltaSats.toLocaleString()} sats → Auto-locked <strong>${fmtFiat(pos.notional ?? pos.notionalUsd, cur)} Stable ${cur}</strong>!`;
             showToast(`🛡 Auto-stabilized +${deltaSats.toLocaleString()} sats into ${fmtFiat(deltaFiat, cur)} Stable ${cur}!`, 5500);
             await refresh();
@@ -2402,7 +2441,10 @@ async function boot() {
           if (toClose.length === 0) throw new Error("No open Stable positions to liquidate");
           for (let i = 0; i < toClose.length; i++) {
             btn.textContent = `Closing Stable pos ${i + 1}/${toClose.length}…`;
-            const closed = await appWallet.closePosition(toClose[i].pos.positionId);
+            const closed = await runOwnPayoutOp(
+              () => appWallet.closePosition(toClose[i].pos.positionId),
+              (r) => r?.userPayoutSats
+            );
             liquidatedSats += Number(closed.userPayoutSats || 0);
           }
         }
