@@ -1664,7 +1664,7 @@ export class BrowserP2pFiatWallet {
     return pos;
   }
 
-  async rollPosition(positionId, { expectedSpot = 0, maxSpotDriftPct = 2.0 } = {}) {
+  async rollPosition(positionId, { expectedSpot = 0, maxSpotDriftPct = 2.0, relays = [] } = {}) {
     const map = loadPositions();
     const pos = map[positionId];
     if (!pos) throw new Error("Unknown position");
@@ -1672,6 +1672,9 @@ export class BrowserP2pFiatWallet {
       url: pos.lpUrl || (pos.lpTransport === "nostr-nip17" ? "" : getLpUrl()),
       pubkey: pos.lpPubkey || pos.lpPubHex || null,
       preferNip17: pos.lpTransport === "nostr-nip17",
+      // LP's advertised NIP-17 relays (from its order-book offer), so a roll still reaches an LP
+      // that listens on relays other than this wallet's defaults.
+      relays: Array.isArray(relays) ? relays : [],
     };
 
     const prop = await this.callLp(target, "roll/propose", {

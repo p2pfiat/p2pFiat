@@ -754,3 +754,17 @@ input[type="number"], input[type="text"], input[type="password"], .select-input 
     grid-template-columns: 1fr;
   }
 }
+.autoroll-status {
+  font-size: 0.74rem;
+  padding: 5px 9px;
+  margin-top: 6px;
+  border-radius: 8px;
+  color: var(--muted);
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+}
+.autoroll-status.warn {
+  color: var(--text);
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.35);
+}
