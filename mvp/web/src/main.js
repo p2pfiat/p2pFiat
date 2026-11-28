@@ -13,6 +13,16 @@
 import "./style.css";
 import QRCode from "qrcode";
 import {
+  AUTO_ROLL_MAX_DRIFT_PCT,
+  AUTO_ROLL_RETRY_MS,
+  autoRollStatusLine,
+  autoRollTermSecs,
+  describeAutoRollError,
+  isAutoRollDue,
+  lpRelaysFromOffers,
+  spotFromHealth,
+} from "./autoroll.js";
+import {
   BrowserP2pFiatWallet,
   getLpUrl,
   getNostrRelays,
@@ -995,12 +1005,14 @@ function renderPositions() {
                      }
                      <button class="link-btn" data-wt="${p.positionId}">Backup JSON</button>
                    </div>
-                 </div>`
+                 </div>
+                 <div data-autoroll-status="${p.positionId}" class="autoroll-status" hidden></div>`
               : ""
           }
         </div>`;
     })
     .join("");
+  renderAutoRollStatus();
 
   container.querySelectorAll("[data-copy-text]").forEach((el) => {
     el.onclick = async () => {
@@ -1019,10 +1031,13 @@ function renderPositions() {
       savePositions(map);
       showToast(
         cb.checked
-          ? `↻ Auto-Roll enabled for ${id} (rolls automatically at 50% term while wallet is open)`
+          ? `↻ Auto-Roll enabled for ${id} (rolls automatically at 50% term while this wallet tab is open)`
           : `Auto-Roll disabled for ${id}`,
         3500
       );
+      autoRollStatus.delete(id);
+      autoRollLastAttempt.delete(id);
+      renderAutoRollStatus();
       if (cb.checked) checkAutoRolls();
     };
   });
@@ -1478,44 +1493,102 @@ let autoOnboardInFlight = false;
 let autoRollInFlight = false;
 const autoRollLastAttempt = new Map();
 
+// Last auto-roll attempt per position: { state: "blocked"|"rolling", text, at }
+const autoRollStatus = new Map();
+
+function positionLpTarget(p) {
+  let offers = [];
+  try {
+    offers = orderBook.getOffers({});
+  } catch {}
+  return {
+    url: p.lpUrl || (p.lpTransport === "nostr-nip17" ? "" : getLpUrl()),
+    pubkey: p.lpPubkey || p.lpPubHex || null,
+    preferNip17: p.lpTransport === "nostr-nip17",
+    lpName: p.lpName || "LP",
+    relays: lpRelaysFromOffers(offers, p.lpPubkey || p.lpPubHex),
+  };
+}
+
+// The ±2% guard needs a FRESH spot: `spots` is only filled at load and on user actions,
+// so after hours with the tab open it is stale and every LP roll quote looked like a >2% deviation.
+async function fetchFreshSpot(cur, p) {
+  const sources = [getSelectedLp(), positionLpTarget(p)];
+  let lastErr = null;
+  for (const src of sources) {
+    try {
+      const health = await appWallet.fetchLpHealth(src);
+      const sp = spotFromHealth(health, cur);
+      if (sp > 0) {
+        spots[cur] = sp;
+        return sp;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(`no live ${cur} spot (LP health unreachable${lastErr?.message ? `: ${lastErr.message}` : ""})`);
+}
+
+function setAutoRollStatus(p, state, text) {
+  const prev = autoRollStatus.get(p.positionId);
+  autoRollStatus.set(p.positionId, { state, text, at: Date.now() });
+  if (state === "blocked" && prev?.text !== text) {
+    showToast(`⚠ Auto-Roll blocked for ${p.positionId}: ${text}`, 7000);
+  }
+  renderAutoRollStatus();
+}
+
+function renderAutoRollStatus() {
+  const map = loadPositions();
+  document.querySelectorAll("[data-autoroll-status]").forEach((el) => {
+    const id = el.getAttribute("data-autoroll-status");
+    const line = autoRollStatusLine(map[id], autoRollStatus.get(id));
+    el.textContent = line ? line.text : "";
+    el.className = `autoroll-status ${line ? line.tone : ""}`;
+    el.hidden = !line;
+  });
+}
+
 async function checkAutoRolls() {
   if (!appWallet || autoRollInFlight) return;
   const nowMs = Date.now();
   const nowSecs = Math.floor(nowMs / 1000);
-  const open = Object.values(loadPositions()).filter((p) => p.status === "open" && p.autoRoll === true);
-  if (open.length === 0) return;
+  const due = Object.values(loadPositions()).filter((p) => isAutoRollDue(p, nowSecs));
+  renderAutoRollStatus();
+  if (due.length === 0) return;
 
   autoRollInFlight = true;
   try {
-    for (const p of open) {
-      const termSecs = Math.max(60, Number(p.termSecs || 86_400));
-      const startTs = Number(p.lastRolledAt || p.openedAt || nowSecs);
-      const elapsed = nowSecs - startTs;
-      if (elapsed < termSecs * 0.5) continue;
-
+    for (const p of due) {
       const lastTry = autoRollLastAttempt.get(p.positionId) || 0;
-      if (nowMs - lastTry < 5 * 60_000) continue;
+      if (nowMs - lastTry < AUTO_ROLL_RETRY_MS) continue;
+      autoRollLastAttempt.set(p.positionId, nowMs);
 
       const pCur = (p.currency || "USD").toUpperCase();
-      const liveSpot = Number(spots[pCur] || 0);
-      if (liveSpot <= 0) continue; // Require live spot so ±2% price guardrail is always enforced
-
-      autoRollLastAttempt.set(p.positionId, nowMs);
       try {
+        setAutoRollStatus(p, "rolling", "");
+        const liveSpot = await fetchFreshSpot(pCur, p);
+        const target = positionLpTarget(p);
         const rolled = await appWallet.rollPosition(p.positionId, {
           expectedSpot: liveSpot,
-          maxSpotDriftPct: 2.0,
+          maxSpotDriftPct: AUTO_ROLL_MAX_DRIFT_PCT,
+          relays: target.relays,
         });
+        autoRollStatus.delete(p.positionId);
+        autoRollLastAttempt.delete(p.positionId);
         const rSym = curSym((rolled.currency || pCur).toUpperCase());
         const paidSats = Number(rolled.lastRollUserSurplusSats || 0);
         const detail =
           paidSats > 0
             ? `+${paidSats.toLocaleString()} sats yield paid to Available BTC`
-            : `term reset (${fmtTimeLeft(termSecs)})`;
+            : `term reset (${fmtTimeLeft(autoRollTermSecs(p))})`;
         showToast(`↻ Auto-rolled #${rolled.rollCount} at ${rSym}${rolled.openSpotUsd} — ${detail}`, 6000);
         await refresh();
       } catch (err) {
-        console.warn(`[auto-roll] ${p.positionId} skipped:`, err?.message || err);
+        const reason = describeAutoRollError(err);
+        console.warn(`[auto-roll] ${p.positionId} blocked (${reason.kind}):`, err?.message || err);
+        setAutoRollStatus(p, "blocked", reason.text);
       }
     }
   } finally {
@@ -2948,10 +3021,10 @@ async function boot() {
   }, 30 * 60_000);
 
   // Opt-in client-side Auto-Rollover (runs at 50% term elapsed while wallet is open)
+  // Runs in background tabs too (browsers throttle timers to ~1/min, which is enough):
+  // previously it only ran while the tab was visible, so a backgrounded wallet never rolled.
   setTimeout(checkAutoRolls, 12_000);
-  setInterval(() => {
-    if (document.visibilityState === "visible") checkAutoRolls();
-  }, 60_000);
+  setInterval(checkAutoRolls, 60_000);
 
   // Battery-friendly 10s local interest ticker (pauses automatically when tab is hidden)
   setInterval(() => {
