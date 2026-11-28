@@ -1025,6 +1025,15 @@ export async function createLpServer({
 
 // Run standalone if invoked directly (`node src/lp.mjs`)
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.meta.filename)) {
+  // Never let transient upstream Esplora / network timeouts inside SDK background pollers
+  // crash the 24/7 LP process (offchain Arkade RPCs only need the Arkade server + Nostr relays).
+  process.on("unhandledRejection", (reason) => {
+    console.warn(`  [LP unhandledRejection] ${reason?.message || reason}`);
+  });
+  process.on("uncaughtException", (err) => {
+    console.warn(`  [LP uncaughtException] ${err?.message || err}`);
+  });
+
   const enableHttp = process.env.LP_NO_HTTP !== "1" && process.env.LP_NO_HTTP !== "true";
   const port = Number(process.env.LP_PORT || 3456);
   const lpName = process.env.LP_NAME || "p2pFiat-LP";
