@@ -47,6 +47,8 @@ import {
   QUORUM_PRESETS,
   buildQuorumForPreset,
   pubkeyHexToNpub,
+  setActiveNostraclePool,
+  isQuorumPresetAvailable,
 } from "./offerbook.js";
 import {
   scanNostracleReputation,
@@ -316,14 +318,51 @@ function fmtAge(rep) {
   return `${rep.ageDays}d history`;
 }
 
-function renderNostracles() {
-  const presetId = getQuorumPreset();
-  const baseQ = buildQuorumForPreset(presetId);
+// Online Nostracles first, so quorums use live oracles; until the first relay scan the
+// whole pool counts as live.
+function syncActiveNostraclePool() {
   const pool = getEffectiveNostraclePool();
-  const q = { ...baseQ, oracles: pool.slice(0, Math.min(baseQ.total, pool.length)) };
-  const meta = QUORUM_PRESETS[presetId] || QUORUM_PRESETS["3-of-5"];
+  const scanned = Object.keys(nostracleRep).length > 0;
+  const online = scanned ? pool.filter((o) => nostracleRep[o.pubkey]?.online) : pool;
+  const ordered = [...online, ...pool.filter((o) => !online.includes(o))];
+  setActiveNostraclePool(ordered, online.length);
+  return { pool: ordered, liveCount: online.length, scanned };
+}
+
+const NOSTRACLE_RUN_YOUR_OWN_URL = "https://github.com/p2pfiat/nostracle#readme";
+
+function renderQuorumOptions(liveCount) {
   const sel = $("quorum-select");
-  if (sel) sel.value = presetId;
+  if (!sel) return;
+  for (const opt of sel.options) {
+    const meta = QUORUM_PRESETS[opt.value];
+    if (!meta) continue;
+    const ok = isQuorumPresetAvailable(opt.value, liveCount);
+    opt.disabled = !ok;
+    opt.textContent = ok
+      ? opt.dataset.label || opt.textContent
+      : `${opt.dataset.label || opt.textContent} — not enough Nostracles (${liveCount}/${meta.total} live), run your own`;
+  }
+  const hint = $("quorum-run-own");
+  if (hint) {
+    const blocked = [...sel.options].filter((o) => o.disabled).map((o) => o.value);
+    hint.hidden = blocked.length === 0;
+    if (blocked.length) {
+      hint.innerHTML = `${blocked.join(" and ")} need more live Nostracles than the ${liveCount} online now. ` +
+        `<a href="${NOSTRACLE_RUN_YOUR_OWN_URL}" target="_blank" rel="noopener">Run your own Nostracle</a> to add one.`;
+    }
+  }
+}
+
+function renderNostracles() {
+  const { pool, liveCount } = syncActiveNostraclePool();
+  renderQuorumOptions(liveCount);
+  const presetId = getQuorumPreset();
+  const baseQ = buildQuorumForPreset(presetId, pool);
+  const q = { ...baseQ, oracles: pool.slice(0, Math.min(baseQ.total, pool.length)) };
+  const meta = QUORUM_PRESETS[baseQ.preset] || QUORUM_PRESETS["2-of-3"];
+  const sel = $("quorum-select");
+  if (sel) sel.value = baseQ.preset;
   const note = $("quorum-note");
   const onlineInQuorum = q.oracles.filter((o) => nostracleRep[o.pubkey]?.online).length;
   const scanned = Object.keys(nostracleRep).length > 0;

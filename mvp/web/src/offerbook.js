@@ -38,27 +38,26 @@ export function pubkeyHexToNpub(pubHex) {
   return bech32.encode("npub", bech32.toWords(hex.decode(pubHex.trim())));
 }
 
+// Fallback pool when the curated NIP-51 directory (p2pfiat-nostracles) cannot be fetched:
+// the three live Nostracles from that directory. Never use small-scalar test keys here
+// (1·G, 2·G, … have publicly known private keys, so anyone could sign a dispute payout).
 export const NOSTRACLE_POOL = [
-  { name: "Nostracle-Demo", pubkey: "d048e2feb2d2edc0a07a3921b429676f8ea6160546b327b3f5efd7bbb395d580", feeSats: 100 },
-  { name: "Nostracle-2", pubkey: "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5", feeSats: 150 },
-  { name: "Nostracle-3", pubkey: "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9", feeSats: 200 },
-  { name: "Nostracle-4", pubkey: "e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13", feeSats: 250 },
-  { name: "Nostracle-5", pubkey: "2f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4", feeSats: 300 },
-  { name: "Nostracle-6", pubkey: "fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556", feeSats: 400 },
-  { name: "Nostracle-7", pubkey: "5cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc", feeSats: 500 },
+  { name: "Nostracle-1", pubkey: "32bf77878296c74d4ec5740a572b748c0a758d875aaf4429ccd268c1339b9e2a", feeSats: 100 },
+  { name: "Nostracle-2", pubkey: "4d6247e2c75922d662be9e97c55f775f42735d32d954366f4ac16d1e13e83bee", feeSats: 150 },
+  { name: "Nostracle-3", pubkey: "550a7fa2d48c5a5937f4b164d3377f7646b4617df3dc812d2bf9634e3dba2f68", feeSats: 200 },
 ].map((o) => ({ ...o, npub: pubkeyHexToNpub(o.pubkey) }));
 
 export const QUORUM_PRESETS = {
   "2-of-3": {
     threshold: 2,
     total: 3,
-    label: "2-of-3 (Light / Low cost)",
+    label: "2-of-3 (Default while 3 Nostracles are live)",
     note: "Tolerates 1 offline or 1 dishonest oracle. Lowest dispute zap cost.",
   },
   "3-of-5": {
     threshold: 3,
     total: 5,
-    label: "3-of-5 (Balanced — Recommended)",
+    label: "3-of-5 (Balanced)",
     note: "Tolerates 2 offline AND 2 dishonest oracles. Strong fee competition (cheapest 3 win).",
   },
   "4-of-7": {
@@ -69,17 +68,37 @@ export const QUORUM_PRESETS = {
   },
 };
 
-export function buildQuorumForPreset(presetId = "3-of-5") {
-  const p = QUORUM_PRESETS[presetId] || QUORUM_PRESETS["3-of-5"];
+export const DEFAULT_QUORUM_PRESET = "2-of-3";
+
+// The pool quorums are built from: the curated directory plus custom Nostracles, online
+// ones first (set by the UI after each relay scan), and how many of them are live.
+let activePool = NOSTRACLE_POOL;
+let availableCount = NOSTRACLE_POOL.length;
+
+export function setActiveNostraclePool(pool, liveCount = pool?.length || 0) {
+  if (Array.isArray(pool) && pool.length > 0) activePool = pool;
+  availableCount = Math.max(0, Number(liveCount) || 0);
+}
+
+/** A preset is selectable when enough Nostracles are live; 2-of-3 is always allowed. */
+export function isQuorumPresetAvailable(presetId, liveCount = availableCount) {
+  const p = QUORUM_PRESETS[presetId];
+  if (!p) return false;
+  return presetId === DEFAULT_QUORUM_PRESET || p.total <= liveCount;
+}
+
+export function buildQuorumForPreset(presetId = DEFAULT_QUORUM_PRESET, pool = activePool) {
+  const id = isQuorumPresetAvailable(presetId) ? presetId : DEFAULT_QUORUM_PRESET;
+  const p = QUORUM_PRESETS[id];
   return {
-    preset: presetId in QUORUM_PRESETS ? presetId : "3-of-5",
+    preset: id,
     threshold: p.threshold,
     total: p.total,
-    oracles: NOSTRACLE_POOL.slice(0, p.total),
+    oracles: pool.slice(0, p.total),
   };
 }
 
-export const DEFAULT_NOSTRACLE_QUORUM = buildQuorumForPreset("3-of-5");
+export const DEFAULT_NOSTRACLE_QUORUM = buildQuorumForPreset(DEFAULT_QUORUM_PRESET);
 
 function randomSubId() {
   const b = new Uint8Array(4);
