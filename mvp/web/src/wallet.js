@@ -78,22 +78,48 @@ const enc = new TextEncoder();
 const NUMS_INTERNAL_KEY_HEX =
   "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
 
+function kCombinations(items, k) {
+  const out = [];
+  const rec = (start, cur) => {
+    if (cur.length === k) {
+      out.push([...cur]);
+      return;
+    }
+    for (let i = start; i <= items.length - (k - cur.length); i++) {
+      cur.push(items[i]);
+      rec(i + 1, cur);
+      cur.pop();
+    }
+  };
+  rec(0, []);
+  return out;
+}
+
 function buildNostracleDisputeLeaf(oraclePubsHex, threshold, exitDelaySecs) {
   if (!Array.isArray(oraclePubsHex) || oraclePubsHex.length < 2) return null;
   const k = Number(threshold);
   if (!Number.isInteger(k) || k < 2 || k > oraclePubsHex.length) return null;
+  const normalized = oraclePubsHex.map((p) => p.trim().toLowerCase());
   const csvVal = (1 << 22) | Number(BigInt(exitDelaySecs) / 512n);
-  const ops = [csvVal, "CHECKSEQUENCEVERIFY", "DROP"];
-  oraclePubsHex.forEach((pubHex, idx) => {
-    ops.push(hex.decode(pubHex.trim()));
-    ops.push(idx === 0 ? "CHECKSIG" : "CHECKSIGADD");
+  const subsets = kCombinations(normalized, k);
+  const allLeaves = subsets.map((subsetPubs) => {
+    const encoded = CSVMultisigTapscript.encode({
+      timelock: { type: "seconds", value: BigInt(exitDelaySecs) },
+      pubkeys: subsetPubs.map((p) => hex.decode(p)),
+    });
+    return {
+      script: encoded.script,
+      scriptHex: hex.encode(encoded.script),
+      oraclePubsHex: subsetPubs,
+    };
   });
-  ops.push(k, "GREATERTHANOREQUAL");
-  const script = btc.Script.encode(ops);
+  const primary = allLeaves[0];
   return {
-    script,
-    scriptHex: hex.encode(script),
-    oraclePubsHex: oraclePubsHex.map((p) => p.trim().toLowerCase()),
+    script: primary.script,
+    scriptHex: primary.scriptHex,
+    oraclePubsHex: primary.oraclePubsHex,
+    allOraclePubsHex: normalized,
+    allLeaves,
     threshold: k,
     csvSequence: csvVal,
   };
@@ -1097,7 +1123,11 @@ export class BrowserP2pFiatWallet {
             )
           : null;
       const contractLeaves = [settleClosure.script, exitClosure.script];
-      if (disputeClosure) contractLeaves.push(disputeClosure.script);
+      if (disputeClosure?.allLeaves?.length) {
+        for (const leaf of disputeClosure.allLeaves) contractLeaves.push(leaf.script);
+      } else if (disputeClosure) {
+        contractLeaves.push(disputeClosure.script);
+      }
       const contractScript = new VtxoScript(contractLeaves);
       const disputeControlBlockHex = disputeClosure
         ? hex.encode(
@@ -2075,11 +2105,23 @@ export class BrowserP2pFiatWallet {
       );
     }
 
-    // BIP-342 OP_CHECKSIGADD witness stack: reverse order of pubkeys in script, empty byte for non-signers
+    // Assemble Tapscript witness stack:
+    // - Legacy OP_CHECKSIGADD (0xba): reverse order of all n pubkeys with empty bytes for non-signers.
+    // - arkd-native CSVMultisigTapscript (CHECKSIGVERIFY/CHECKSIG): reverse order of the k signing pubkeys only.
+    const usesChecksigAdd = disputeScript.includes(0xba);
     const witnessStack = [];
-    for (let i = oracles.length - 1; i >= 0; i--) {
-      const sig = sigsByOracle.get(oracles[i].pubkey.toLowerCase());
-      witnessStack.push(sig || new Uint8Array(0));
+    if (usesChecksigAdd) {
+      for (let i = oracles.length - 1; i >= 0; i--) {
+        const sig = sigsByOracle.get(oracles[i].pubkey.toLowerCase());
+        witnessStack.push(sig || new Uint8Array(0));
+      }
+    } else {
+      const targetPubs = oracles.slice(0, threshold).map((o) => o.pubkey.toLowerCase());
+      for (let i = targetPubs.length - 1; i >= 0; i--) {
+        const sig = sigsByOracle.get(targetPubs[i]);
+        if (!sig) throw new Error(`Missing required oracle signature for CSVMultisig dispute leaf`);
+        witnessStack.push(sig);
+      }
     }
     witnessStack.push(disputeScript, hex.decode(pos.disputeControlBlockHex));
     tx.updateInput(0, { finalScriptWitness: witnessStack });

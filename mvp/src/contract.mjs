@@ -109,13 +109,35 @@ export function buildWatchtowerBountyScript(bountySpec) {
 }
 
 /**
- * Build a BIP-342 Tapscript `k-of-n` Nostracle On-Demand Dispute Leaf:
- *   `<exitDelaySecs> OP_CHECKSEQUENCEVERIFY OP_DROP`
- *   `<oracle_1> OP_CHECKSIG <oracle_2> OP_CHECKSIGADD ... <oracle_n> OP_CHECKSIGADD <k> OP_GREATERTHANOREQUAL`
+ * Generate all k-element combinations of `items` (preserving order).
+ * Used to encode a k-of-n Nostracle dispute quorum as arkd-native `CSVMultisigTapscript`
+ * leaves (e.g. 2-of-3 = 3 leaves, 3-of-5 = 10 leaves) because `arkd` only accepts standard
+ * ark-lib Closure opcodes (`CHECKSIGVERIFY`/`CHECKSIG`) and rejects `OP_CHECKSIGADD`.
+ */
+function kCombinations(items, k) {
+  const out = [];
+  const rec = (start, cur) => {
+    if (cur.length === k) {
+      out.push([...cur]);
+      return;
+    }
+    for (let i = start; i <= items.length - (k - cur.length); i++) {
+      cur.push(items[i]);
+      rec(i + 1, cur);
+      cur.pop();
+    }
+  };
+  rec(0, []);
+  return out;
+}
+
+/**
+ * Build arkd-compatible `k-of-n` Nostracle On-Demand Dispute Leaves using standard
+ * `CSVMultisigTapscript` closures:
+ *   `<exitDelaySecs> OP_CHECKSEQUENCEVERIFY OP_DROP <oracle_i1> OP_CHECKSIGVERIFY ... <oracle_ik> OP_CHECKSIG`
  *
- * Allows either party (or a Watchtower) to close a long-term (7d/30d/90d) contract
- * at ANY time if the counterparty goes offline or BTC drops >= 50%, with zero
- * cherry-picking risk because the quorum signs the live spot price at exit time `T`.
+ * Every leaf is 100% accepted by `arkd` (`VtxoScript` taptree parser) during offchain
+ * `open`, `roll`, and `close`, AND 100% pure Bitcoin L1 Tapscript + Bark Miniscript compatible.
  */
 export function buildNostracleDisputeLeaf(oraclePubsHex, threshold, exitDelaySecs) {
   if (!Array.isArray(oraclePubsHex) || oraclePubsHex.length < 2) {
@@ -125,18 +147,27 @@ export function buildNostracleDisputeLeaf(oraclePubsHex, threshold, exitDelaySec
   if (!Number.isInteger(k) || k < 2 || k > oraclePubsHex.length) {
     throw new Error(`Invalid quorum threshold ${k} for ${oraclePubsHex.length} oracles`);
   }
+  const normalized = oraclePubsHex.map((p) => p.trim().toLowerCase());
   const csvVal = (1 << 22) | Number(BigInt(exitDelaySecs) / 512n);
-  const ops = [csvVal, "CHECKSEQUENCEVERIFY", "DROP"];
-  oraclePubsHex.forEach((pubHex, idx) => {
-    ops.push(hex.decode(pubHex.trim()));
-    ops.push(idx === 0 ? "CHECKSIG" : "CHECKSIGADD");
+  const subsets = kCombinations(normalized, k);
+  const allLeaves = subsets.map((subsetPubs) => {
+    const encoded = CSVMultisigTapscript.encode({
+      timelock: { type: "seconds", value: BigInt(exitDelaySecs) },
+      pubkeys: subsetPubs.map((p) => hex.decode(p)),
+    });
+    return {
+      script: encoded.script,
+      scriptHex: hex.encode(encoded.script),
+      oraclePubsHex: subsetPubs,
+    };
   });
-  ops.push(k, "GREATERTHANOREQUAL");
-  const script = btc.Script.encode(ops);
+  const primary = allLeaves[0];
   return {
-    script,
-    scriptHex: hex.encode(script),
-    oraclePubsHex: oraclePubsHex.map((p) => p.trim().toLowerCase()),
+    script: primary.script,
+    scriptHex: primary.scriptHex,
+    oraclePubsHex: primary.oraclePubsHex,
+    allOraclePubsHex: normalized,
+    allLeaves,
     threshold: k,
     csvSequence: csvVal,
   };
@@ -144,8 +175,8 @@ export function buildNostracleDisputeLeaf(oraclePubsHex, threshold, exitDelaySec
 
 /**
  * Build a Design 1 Arkade DLC VtxoScript compatible with live `mutinynet.arkade.sh`
- * (time-based `CSV(unilateralExitDelay)` on the exit leaf, plus optional 3rd leaf
- * for `k-of-n` Nostracle On-Demand Dispute / Anytime Exit).
+ * (time-based `CSV(unilateralExitDelay)` on the exit leaf, plus optional `k-of-n`
+ * Nostracle On-Demand Dispute `CSVMultisigTapscript` subset leaves).
  */
 export function buildDlcContractScript(
   userPubXOnly,
@@ -169,7 +200,9 @@ export function buildDlcContractScript(
       oracleQuorum.threshold,
       exitDelaySecs
     );
-    leaves.push(disputeClosure.script);
+    for (const leaf of disputeClosure.allLeaves) {
+      leaves.push(leaf.script);
+    }
   }
   const vtxoScript = new VtxoScript(leaves);
   return { vtxoScript, settleClosure, exitClosure, disputeClosure };
