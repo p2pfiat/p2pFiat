@@ -625,14 +625,44 @@ function tickInterest() {
   if ($("vault-fiat")) $("vault-fiat").textContent = `≈ ${fmtFiat(vaultFiat, activeCurrency)}`;
   const longBox = $("long-tier-box");
   if (longBox) {
-    longBox.classList.toggle("hidden", longCount === 0);
+    longBox.classList.remove("hidden");
+    const sym = curSym();
+    const x0 = 30;
+    const x1 = 330;
+    const yBottom = 78;
+    const yTop = 10; // 2.0x sats theoretical collateral-pool cap
+    const setVisible = (id, show) => {
+      const el = $(id);
+      if (el) el.style.display = show ? "" : "none";
+    };
+    const manageBtn = $("long-manage-btn");
+
+    // Exact inverse-DLC sats multiplier: M(P) = clamp(2 - P_entry / P, 0, 2)
+    // Y maps [0x, 2x] sats linearly onto [yBottom, yTop], so 1x is always at y = 44 and 1.5x at y = 27.
+    const multToY = (m) => yBottom - (Math.min(2, Math.max(0, m)) / 2) * (yBottom - yTop);
+    const buildCurvePoints = (pStart, pEnd, entryP, pToX, steps = 16) => {
+      const pts = [];
+      for (let i = 0; i <= steps; i++) {
+        const p = pStart + ((pEnd - pStart) * i) / steps;
+        const m = p > 0 ? Math.max(0, Math.min(2, 2 - entryP / p)) : 0;
+        pts.push(`${pToX(p).toFixed(1)},${multToY(m).toFixed(1)}`);
+      }
+      return pts;
+    };
+
+    const y1x = multToY(1).toFixed(1);
+    const y15x = multToY(1.5).toFixed(1);
+
     if (longCount > 0) {
+      if (manageBtn) {
+        manageBtn.textContent = "Manage";
+        manageBtn.dataset.mode = "manage";
+      }
       const longPnl = longEquityActive - longCostActive;
       const longPnlSats = longSatsTotal - longInitSatsTotal;
       const longPnlPct = longCostActive > 0 ? (longPnl / longCostActive) * 100 : 0;
       const sign = longPnl >= 0 ? "+" : "-";
       const sSign = longPnlSats >= 0 ? "+" : "-";
-      const sym = curSym();
       if ($("long-sats")) $("long-sats").textContent = `${longSatsTotal.toLocaleString()} sats`;
       if ($("long-fiat")) $("long-fiat").textContent = `≈ ${fmtFiat(longEquityActive, activeCurrency)}`;
       const lr = $("long-return");
@@ -640,44 +670,51 @@ function tickInterest() {
         lr.textContent = `${sign}${sym}${Math.abs(longPnl).toFixed(2)} (${sign}${Math.abs(longPnlPct).toFixed(1)}%) · ${sSign}${Math.abs(longPnlSats).toLocaleString()} sats`;
         lr.className = `interest-sub ${longPnl >= 0 ? "accent-green" : "accent-red"}`;
       }
-      // Dynamic diagonal 2x payoff SVG:
-      // Below entry -> X runs Liq (0.5x) to 1.25x Entry (extra breathing room between Liq and Entry).
-      // Above entry -> X scales up smoothly to at most 2x Entry so the green line extends past Now.
       const denom = Math.max(1, longInitSatsTotal);
       const avgEntry = Math.round(longWeightedEntrySum / denom);
       const avgLiq = Math.round(longWeightedLiqSum / denom);
       const nowSpot = Math.round(activeSpot || avgEntry);
-      const maxP =
-        nowSpot <= avgEntry
-          ? Math.round(avgEntry * 1.25)
-          : Math.round(Math.max(avgEntry * 1.25, Math.min(avgEntry * 2, nowSpot * 1.15)));
+      const maxP = Math.round(Math.max(avgEntry * 2.0, nowSpot * 1.15));
       const span = Math.max(1, maxP - avgLiq);
-      const entryRatio = Math.min(0.9, Math.max(0.1, (avgEntry - avgLiq) / span));
-      const nowRatio = Math.min(1, Math.max(0, (nowSpot - avgLiq) / span));
-      const x0 = 8;
-      const x1 = 312;
-      const yBottom = 60;
-      const yTop = 6;
-      const entryX = (x0 + entryRatio * (x1 - x0)).toFixed(1);
-      const entryY = (yBottom - entryRatio * (yBottom - yTop)).toFixed(1);
-      const nowX = (x0 + nowRatio * (x1 - x0)).toFixed(1);
-      const nowY = (yBottom - nowRatio * (yBottom - yTop)).toFixed(1);
+      const priceToX = (p) => x0 + Math.min(1, Math.max(0, (p - avgLiq) / span)) * (x1 - x0);
+      const entryX = priceToX(avgEntry).toFixed(1);
+      const nowX = priceToX(nowSpot).toFixed(1);
+      const nowMult = nowSpot > 0 ? Math.max(0, Math.min(2, 2 - avgEntry / nowSpot)) : 1;
+      const nowY = multToY(nowMult).toFixed(1);
       const isUp = nowSpot >= avgEntry;
       const strokeCol = isUp ? "#22c55e" : "#ef4444";
       const haloCol = isUp ? "rgba(34,197,94,0.28)" : "rgba(239,68,68,0.28)";
 
-      $("long-loss-poly")?.setAttribute("points", `${x0},${yBottom} ${entryX},${entryY} ${entryX},${yBottom}`);
-      $("long-gain-poly")?.setAttribute("points", `${entryX},${entryY} ${x1},${yTop} ${x1},${yBottom} ${entryX},${yBottom}`);
-      $("long-be-line")?.setAttribute("y1", entryY);
-      $("long-be-line")?.setAttribute("y2", entryY);
+      const lossPts = buildCurvePoints(avgLiq, avgEntry, avgEntry, priceToX, 14);
+      const gainPts = buildCurvePoints(avgEntry, maxP, avgEntry, priceToX, 18);
+      $("long-loss-line")?.setAttribute("points", lossPts.join(" "));
+      $("long-gain-line")?.setAttribute("points", gainPts.join(" "));
+      $("long-loss-poly")?.setAttribute("points", `${lossPts.join(" ")} ${entryX},${yBottom} ${x0},${yBottom}`);
+      $("long-gain-poly")?.setAttribute("points", `${gainPts.join(" ")} ${x1},${yBottom} ${entryX},${yBottom}`);
+
+      $("long-be-line")?.setAttribute("y1", y1x);
+      $("long-be-line")?.setAttribute("y2", y1x);
+
+      const p15x = avgEntry * 2.0; // Price where sats payout reaches 1.5x (2 - 1/2 = 1.5)
+      const x15 = priceToX(p15x).toFixed(1);
+      $("long-15x-h")?.setAttribute("x2", x15);
+      $("long-15x-h")?.setAttribute("y1", y15x);
+      $("long-15x-h")?.setAttribute("y2", y15x);
+      $("long-15x-v")?.setAttribute("x1", x15);
+      $("long-15x-v")?.setAttribute("x2", x15);
+      $("long-15x-v")?.setAttribute("y1", y15x);
+      $("long-15x-dot")?.setAttribute("cx", x15);
+      $("long-15x-dot")?.setAttribute("cy", y15x);
+      setVisible("long-15x-h", true);
+      setVisible("long-15x-v", true);
+      setVisible("long-15x-dot", true);
+
       $("long-entry-guide")?.setAttribute("x1", entryX);
       $("long-entry-guide")?.setAttribute("x2", entryX);
-      $("long-loss-line")?.setAttribute("x2", entryX);
-      $("long-loss-line")?.setAttribute("y2", entryY);
-      $("long-gain-line")?.setAttribute("x1", entryX);
-      $("long-gain-line")?.setAttribute("y1", entryY);
       $("long-entry-dot")?.setAttribute("cx", entryX);
-      $("long-entry-dot")?.setAttribute("cy", entryY);
+      $("long-entry-dot")?.setAttribute("cy", y1x);
+      setVisible("long-entry-guide", true);
+      setVisible("long-entry-dot", true);
 
       const dot = $("long-now-dot");
       const halo = $("long-now-halo");
@@ -708,12 +745,12 @@ function tickInterest() {
           midLbl.className = "";
           midLbl.style.color = "var(--accent)";
           midLbl.style.fontWeight = "600";
-          rightLbl.textContent = `Now ${sym}${nowSpot.toLocaleString()}`;
+          rightLbl.textContent = `Now ${sym}${nowSpot.toLocaleString()} (${nowMult.toFixed(2)}× sats)`;
           rightLbl.className = "accent-green";
           rightLbl.style.color = "";
           rightLbl.style.fontWeight = "700";
         } else {
-          midLbl.textContent = `Now ${sym}${nowSpot.toLocaleString()}`;
+          midLbl.textContent = `Now ${sym}${nowSpot.toLocaleString()} (${nowMult.toFixed(2)}× sats)`;
           midLbl.className = "accent-red";
           midLbl.style.color = "";
           midLbl.style.fontWeight = "700";
@@ -722,6 +759,81 @@ function tickInterest() {
           rightLbl.style.color = "var(--accent)";
           rightLbl.style.fontWeight = "600";
         }
+      }
+    } else {
+      // Honest sats-multiplier preview curve when no 2x Long BTC position is open:
+      // M(P) = 2 - P_now / P  -> 0x at Liq (-50%), 1x at Now, 1.5x sats at 2x BTC (+100%), max <2x sats cap.
+      if (manageBtn) {
+        manageBtn.textContent = "Go Long BTC";
+        manageBtn.dataset.mode = "open-long";
+      }
+      if ($("long-sats")) $("long-sats").textContent = "0 sats";
+      if ($("long-fiat")) $("long-fiat").textContent = `≈ ${fmtFiat(0, activeCurrency)}`;
+      const lr = $("long-return");
+      if (lr) {
+        lr.textContent = "Sats multiplier: 0× at -50% · 1.5× at +100% · cap 2×";
+        lr.className = "interest-sub muted";
+      }
+      const refSpot = Math.round(activeSpot || 70_000);
+      const hasSpot = activeSpot > 0;
+      const liqP = Math.round(refSpot * 0.5);
+      const p15x = Math.round(refSpot * 2.0); // Exact price where sats payout = 1.5x
+      const span = Math.max(1, p15x - liqP);
+      const priceToX = (p) => x0 + Math.min(1, Math.max(0, (p - liqP) / span)) * (x1 - x0);
+      const xNow = priceToX(refSpot).toFixed(1);
+      const x15 = String(x1);
+
+      const lossPts = buildCurvePoints(liqP, refSpot, refSpot, priceToX, 14);
+      const gainPts = buildCurvePoints(refSpot, p15x, refSpot, priceToX, 18);
+      $("long-loss-line")?.setAttribute("points", lossPts.join(" "));
+      $("long-gain-line")?.setAttribute("points", gainPts.join(" "));
+      $("long-loss-poly")?.setAttribute("points", `${lossPts.join(" ")} ${xNow},${yBottom} ${x0},${yBottom}`);
+      $("long-gain-poly")?.setAttribute("points", `${gainPts.join(" ")} ${x15},${yBottom} ${xNow},${yBottom}`);
+
+      $("long-be-line")?.setAttribute("y1", y1x);
+      $("long-be-line")?.setAttribute("y2", y1x);
+      $("long-15x-h")?.setAttribute("x2", x15);
+      $("long-15x-h")?.setAttribute("y1", y15x);
+      $("long-15x-h")?.setAttribute("y2", y15x);
+      $("long-15x-v")?.setAttribute("x1", x15);
+      $("long-15x-v")?.setAttribute("x2", x15);
+      $("long-15x-v")?.setAttribute("y1", y15x);
+      $("long-15x-dot")?.setAttribute("cx", x15);
+      $("long-15x-dot")?.setAttribute("cy", y15x);
+      setVisible("long-15x-h", true);
+      setVisible("long-15x-v", true);
+      setVisible("long-15x-dot", true);
+      setVisible("long-entry-guide", false);
+      setVisible("long-entry-dot", false);
+
+      $("long-now-guide")?.setAttribute("x1", xNow);
+      $("long-now-guide")?.setAttribute("y1", String(yTop));
+      $("long-now-guide")?.setAttribute("x2", xNow);
+      $("long-now-guide")?.setAttribute("y2", String(yBottom));
+      $("long-now-guide")?.setAttribute("stroke", "#f7931a");
+      $("long-now-halo")?.setAttribute("cx", xNow);
+      $("long-now-halo")?.setAttribute("cy", y1x);
+      $("long-now-halo")?.setAttribute("fill", "rgba(247,147,26,0.28)");
+      $("long-now-dot")?.setAttribute("cx", xNow);
+      $("long-now-dot")?.setAttribute("cy", y1x);
+      $("long-now-dot")?.setAttribute("fill", "#f7931a");
+
+      if ($("long-lbl-liq")) {
+        $("long-lbl-liq").textContent = hasSpot ? `Liq ${sym}${liqP.toLocaleString()}` : "Liq -50%";
+      }
+      const midLbl = $("long-lbl-mid");
+      if (midLbl) {
+        midLbl.textContent = hasSpot ? `Now ${sym}${refSpot.toLocaleString()} (1×)` : "Now (1×)";
+        midLbl.className = "";
+        midLbl.style.color = "var(--accent)";
+        midLbl.style.fontWeight = "700";
+      }
+      const rightLbl = $("long-lbl-right");
+      if (rightLbl) {
+        rightLbl.textContent = hasSpot ? `1.5× sats @ ${sym}${p15x.toLocaleString()}` : "1.5× sats (+100%)";
+        rightLbl.className = "accent-green";
+        rightLbl.style.color = "";
+        rightLbl.style.fontWeight = "700";
       }
     }
   }
@@ -1294,15 +1406,34 @@ function renderHistory(txs) {
       });
     }
   }
+  const net = String(appWallet?.info?.network || "mutinynet").toLowerCase();
+  const isMainnet = net === "bitcoin" || net === "mainnet";
+  const arkExplorerBase = isMainnet ? "https://arkade.space/tx/" : "https://explorer.mutinynet.arkade.sh/tx/";
+  const l1ExplorerBase = isMainnet ? "https://mempool.space/tx/" : "https://mutinynet.com/tx/";
   box.innerHTML = list
     .map((tx) => {
       const isRecv = String(tx.type || "").toUpperCase().includes("RECEIVED");
       const amt = Number(tx.amount || 0);
-      const id = tx.key?.arkTxid || tx.key?.commitmentTxid || tx.key?.boardingTxid || "";
+      const arkId = tx.key?.arkTxid || "";
+      const commitId = tx.key?.commitmentTxid || "";
+      const boardId = tx.key?.boardingTxid || "";
+      const id = arkId || commitId || boardId;
+      const isHexTxid = /^[0-9a-f]{64}$/i.test(id);
+      const explorerUrl = isHexTxid
+        ? arkId || commitId
+          ? `${arkExplorerBase}${encodeURIComponent(id)}`
+          : `${l1ExplorerBase}${encodeURIComponent(id)}`
+        : "";
+      const explorerTitle = arkId || commitId ? "View on Arkade Explorer" : "View on Bitcoin Explorer";
       const posMeta = id ? posByTx.get(id) : null;
       const label = posMeta ? posMeta.label : isRecv ? "↓ Received" : "↑ Sent";
       const labelCls = posMeta ? posMeta.cls : isRecv ? "accent-green" : "";
       const when = tx.createdAt ? new Date(tx.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+      const txidHtml = id
+        ? explorerUrl
+          ? `<div class="muted"><a class="tx-link" href="${explorerUrl}" target="_blank" rel="noopener noreferrer" title="${explorerTitle}"><code>${id.slice(0, 10)}… ↗</code></a></div>`
+          : `<div class="muted"><code>${escapeHtml(id.slice(0, 10))}…</code></div>`
+        : "";
       return `
         <div class="tx-row">
           <div>
@@ -1311,7 +1442,7 @@ function renderHistory(txs) {
           </div>
           <div style="text-align:right">
             <strong class="${isRecv ? "accent-green" : ""}">${isRecv ? "+" : "-"}${amt.toLocaleString()} sats</strong>
-            ${id ? `<div class="muted"><code>${id.slice(0, 10)}…</code></div>` : ""}
+            ${txidHtml}
           </div>
         </div>`;
     })
@@ -1720,6 +1851,17 @@ async function boot() {
   };
   if ($("long-manage-btn")) {
     $("long-manage-btn").onclick = () => {
+      if ($("long-manage-btn").dataset.mode === "open-long") {
+        // Switch Lock card to 2x Long BTC, open it, and scroll into view.
+        const longTab = $("side-long");
+        if (longTab && activeSide !== "long") {
+          longTab.click();
+        }
+        setSectionOpen("lock-body", true);
+        $("lock-card")?.scrollIntoView({ behavior: "smooth", block: "center" });
+        $("usd-input")?.focus();
+        return;
+      }
       setSectionOpen("positions-body", true);
       $("positions-card")?.scrollIntoView({ behavior: "smooth", block: "start" });
     };

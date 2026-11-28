@@ -165,22 +165,22 @@
 
         <div id="vault-drawer-slot" class="drawer-slot"></div>
 
-        <div id="long-tier-box" class="tier-box tier-long hidden" style="margin-top:8px;flex-direction:column;align-items:stretch;gap:10px">
+        <div id="long-tier-box" class="tier-box tier-long" style="margin-top:8px;flex-direction:column;align-items:stretch;gap:10px">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
             <div class="tier-info">
               <div class="tier-label">🚀 2× Long BTC</div>
-              <span id="long-return" class="interest-sub">+$0.00 (+0.0%) · +0 sats</span>
+              <span id="long-return" class="interest-sub muted">2× BTC upside · Liq at -50% · Self-custody DLC</span>
             </div>
             <div class="tier-right">
               <strong id="long-sats" class="tier-amount">0 sats</strong>
               <div id="long-fiat" class="muted tier-sub">≈ $0.00</div>
               <div class="mini-actions">
-                <button id="long-manage-btn" class="arrow-pill">Manage</button>
+                <button id="long-manage-btn" class="arrow-pill" data-mode="open-long">Go Long BTC</button>
               </div>
             </div>
           </div>
           <div class="long-gauge">
-            <svg id="long-payoff-svg" class="long-payoff-svg" viewBox="0 0 320 70" preserveAspectRatio="none" aria-label="2x Long BTC Payoff Chart">
+            <svg id="long-payoff-svg" class="long-payoff-svg" viewBox="0 0 340 88" aria-label="2x Long BTC Sats Payoff Chart">
               <defs>
                 <linearGradient id="longLossGrad" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stop-color="#ef4444" stop-opacity="0.32" />
@@ -191,21 +191,31 @@
                   <stop offset="100%" stop-color="#22c55e" stop-opacity="0.03" />
                 </linearGradient>
               </defs>
-              <polygon id="long-loss-poly" points="8,60 211,24 211,60" fill="url(#longLossGrad)" />
-              <polygon id="long-gain-poly" points="211,24 312,6 312,60 211,60" fill="url(#longGainGrad)" />
-              <line id="long-be-line" x1="8" y1="24" x2="312" y2="24" stroke="rgba(139,155,180,0.28)" stroke-width="1" stroke-dasharray="3,3" />
-              <line id="long-entry-guide" x1="211" y1="6" x2="211" y2="60" stroke="#f7931a" stroke-width="1.6" stroke-dasharray="3,2" />
-              <line id="long-loss-line" x1="8" y1="60" x2="211" y2="24" stroke="#ef4444" stroke-width="2" stroke-linecap="round" />
-              <line id="long-gain-line" x1="211" y1="24" x2="312" y2="6" stroke="#22c55e" stroke-width="2" stroke-linecap="round" />
-              <circle id="long-entry-dot" cx="211" cy="24" r="3.5" fill="#f7931a" stroke="#0b0f17" stroke-width="1.2" />
-              <line id="long-now-guide" x1="211" y1="6" x2="211" y2="60" stroke="#22c55e" stroke-width="1.8" />
-              <circle id="long-now-halo" cx="211" cy="24" r="8" fill="rgba(34,197,94,0.28)" />
-              <circle id="long-now-dot" cx="211" cy="24" r="4.5" fill="#22c55e" stroke="#0b0f17" stroke-width="1.5" />
+              <line id="long-y-axis" x1="30" y1="10" x2="30" y2="78" stroke="rgba(139,155,180,0.45)" stroke-width="1" />
+              <line id="long-x-axis" x1="30" y1="78" x2="330" y2="78" stroke="rgba(139,155,180,0.35)" stroke-width="1" />
+              <polygon id="long-loss-poly" points="30,78 130,44 130,78" fill="url(#longLossGrad)" />
+              <polygon id="long-gain-poly" points="130,44 330,27 330,78 130,78" fill="url(#longGainGrad)" />
+              <line id="long-cap-line" x1="30" y1="10" x2="330" y2="10" stroke="rgba(139,155,180,0.25)" stroke-width="1" stroke-dasharray="2,3" />
+              <line id="long-be-line" x1="30" y1="44" x2="330" y2="44" stroke="rgba(139,155,180,0.38)" stroke-width="1" stroke-dasharray="3,3" />
+              <line id="long-15x-h" x1="30" y1="27" x2="330" y2="27" stroke="rgba(34,197,94,0.32)" stroke-width="1" stroke-dasharray="2,3" />
+              <line id="long-15x-v" x1="330" y1="27" x2="330" y2="78" stroke="rgba(34,197,94,0.32)" stroke-width="1" stroke-dasharray="2,3" />
+              <text id="long-y-lbl-0x" x="25" y="80" text-anchor="end" font-size="8.5" font-weight="600" fill="#ef4444">0×</text>
+              <text id="long-y-lbl-1x" x="25" y="47" text-anchor="end" font-size="8.5" font-weight="600" fill="#94a3b8">1×</text>
+              <text id="long-y-lbl-15x" x="25" y="30" text-anchor="end" font-size="8.5" font-weight="600" fill="#22c55e">1.5×</text>
+              <text id="long-y-lbl-2x" x="25" y="13" text-anchor="end" font-size="8.5" font-weight="600" fill="#64748b">2×</text>
+              <line id="long-entry-guide" x1="130" y1="10" x2="130" y2="78" stroke="#f7931a" stroke-width="1.5" stroke-dasharray="3,2" />
+              <polyline id="long-loss-line" points="30,78 130,44" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              <polyline id="long-gain-line" points="130,44 330,27" fill="none" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+              <circle id="long-15x-dot" cx="330" cy="27" r="3" fill="#22c55e" stroke="#0b0f17" stroke-width="1" />
+              <circle id="long-entry-dot" cx="130" cy="44" r="3.5" fill="#f7931a" stroke="#0b0f17" stroke-width="1.2" />
+              <line id="long-now-guide" x1="130" y1="10" x2="130" y2="78" stroke="#22c55e" stroke-width="1.8" />
+              <circle id="long-now-halo" cx="130" cy="44" r="7.5" fill="rgba(34,197,94,0.28)" />
+              <circle id="long-now-dot" cx="130" cy="44" r="4.2" fill="#22c55e" stroke="#0b0f17" stroke-width="1.5" />
             </svg>
             <div id="long-gauge-labels" class="long-gauge-labels">
               <span id="long-lbl-liq" class="accent-red">Liq —</span>
-              <span id="long-lbl-mid" class="muted">Entry —</span>
-              <span id="long-lbl-right" style="font-weight:700">Now —</span>
+              <span id="long-lbl-mid" class="muted">Now —</span>
+              <span id="long-lbl-right" style="font-weight:700">1.5× sats —</span>
             </div>
           </div>
         </div>
