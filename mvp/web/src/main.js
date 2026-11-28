@@ -2610,8 +2610,55 @@ async function boot() {
     .catch(() => {});
   await refresh();
 
-  // Mutinynet instant onboarding faucet: run immediately after initial balance check
-  // (do NOT wait for orderbook PoF or quote RPC!) so new testers see the pending banner right away.
+  // Mutinynet instant $10 Stable USD onboarding:
+  // 1. Request exact sats for $10 USD (+ small buffer) from LP-Home's testnet faucet.
+  // 2. Wait for the instant Arkade VTXO to appear, then automatically co-sign & lock $10.00 Stable USD!
+  const runMutinynetOnboarding = async (banner, faucetFlag) => {
+    if (banner) {
+      banner.innerHTML =
+        "⏳ <strong>Pending $10.00 free Mutinynet Stable USD…</strong> (1/2 receiving test sats from LP-Home)";
+      banner.classList.remove("hidden");
+    }
+    const res = await appWallet.requestMutinynetFaucet();
+    if (!res?.ok) {
+      banner?.classList.add("hidden");
+      return;
+    }
+    const targetUsd = Number(res.targetUsd || 10);
+    const minExpectedSats = Math.floor(Number(res.amountSats || 10_000) * 0.9);
+    // Poll briefly until the Arkade indexer reflects the newly received VTXO
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const vtxos = await appWallet.wallet.getVtxos().catch(() => []);
+      if (vtxos.some((v) => Number(v.value || 0) >= minExpectedSats)) break;
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    await refresh();
+
+    if (banner) {
+      banner.innerHTML =
+        `⏳ <strong>Pending $${targetUsd.toFixed(2)} free Mutinynet Stable USD…</strong> (2/2 locking into self-custody DLC)`;
+    }
+    try {
+      const lpTarget = {
+        url: "",
+        pubkey: res.lpPubHex,
+        preferNip17: true,
+        lpName: "LP-Home",
+      };
+      await appWallet.openPosition(targetUsd, lpTarget, "LP-Home", "USD", "short");
+      banner?.classList.add("hidden");
+      showToast(`🎉 Welcome! Your $${targetUsd.toFixed(2)} self-custody Stable USD is live and earning yield!`, 6500);
+      await refresh();
+    } catch (lockErr) {
+      banner?.classList.add("hidden");
+      showToast(
+        `🎁 Received ${Number(res.amountSats).toLocaleString()} test sats! Auto-lock skipped (${lockErr?.message || "retry"}) — click ↑ To USD to lock $${targetUsd}.`,
+        6500
+      );
+      await refresh();
+    }
+  };
+
   (async () => {
     try {
       const net = String(appWallet?.info?.network || "mutinynet").toLowerCase();
@@ -2628,11 +2675,6 @@ async function boot() {
         !hasOpenPositions
       ) {
         const banner = $("faucet-pending-banner");
-        if (banner) {
-          banner.innerHTML =
-            "⏳ <strong>Pending 20,000 free Mutinynet testnet sats…</strong> Requesting instant Arkade VTXO from LP-Home.";
-          banner.classList.remove("hidden");
-        }
         const balNow = await appWallet.getBalance().catch(() => ({ boarding: 0, available: 0 }));
         if (Number(balNow.available || 0) > 0 || Number(balNow.boarding || 0) > 0) {
           banner?.classList.add("hidden");
@@ -2640,27 +2682,17 @@ async function boot() {
         }
         localStorage.setItem(faucetFlag, "1");
         try {
-          const res = await appWallet.requestMutinynetFaucet();
-          banner?.classList.add("hidden");
-          if (res?.ok) {
-            showToast("🎉 Received 20,000 free Mutinynet testnet sats — ready to test!", 6000);
-            await refresh();
-          }
+          await runMutinynetOnboarding(banner, faucetFlag);
         } catch (err) {
           localStorage.removeItem(faucetFlag);
           if (banner) {
-            banner.innerHTML = `⚠ Faucet delayed (${escapeHtml(err?.message || "timeout")}) — <button id="faucet-retry-btn" class="btn small secondary" style="margin-left:6px">Retry 20k sats</button>`;
+            banner.innerHTML = `⚠ Free $10 USD delayed (${escapeHtml(err?.message || "timeout")}) — <button id="faucet-retry-btn" class="btn small secondary" style="margin-left:6px">Retry $10 USD</button>`;
             $("faucet-retry-btn").onclick = async () => {
-              banner.innerHTML = "⏳ <strong>Pending 20,000 free Mutinynet testnet sats…</strong> Retrying…";
+              localStorage.setItem(faucetFlag, "1");
               try {
-                const r = await appWallet.requestMutinynetFaucet();
-                banner.classList.add("hidden");
-                if (r?.ok) {
-                  localStorage.setItem(faucetFlag, "1");
-                  showToast("🎉 Received 20,000 free Mutinynet testnet sats!", 6000);
-                  await refresh();
-                }
+                await runMutinynetOnboarding(banner, faucetFlag);
               } catch (e2) {
+                localStorage.removeItem(faucetFlag);
                 banner.innerHTML = `⚠ Faucet error: ${escapeHtml(e2?.message || "retry later")}`;
               }
             };

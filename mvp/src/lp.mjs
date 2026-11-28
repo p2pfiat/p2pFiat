@@ -245,24 +245,33 @@ export async function createLpServer({
       if (prev) {
         throw new RpcError(409, `Faucet already claimed for this identity (txid ${prev.txid})`);
       }
-      const FAUCET_SATS = 20_000;
-      const MIN_LP_RESERVE_SATS = 50_000;
-      const bal = await wallet.getBalance();
-      if (Number(bal.available || 0) < FAUCET_SATS + MIN_LP_RESERVE_SATS) {
+      const FAUCET_USD = 10;
+      const MIN_LP_RESERVE_SATS = 20_000;
+      const [spot, bal] = await Promise.all([fetchBtcSpot("USD"), wallet.getBalance()]);
+      const effectiveSpot = spot.price * (1 - spreadBps / 10_000);
+      // Compute exact sats needed for $10 Stable USD + 500-sat volatility/spread buffer, clamped to [5k, 35k].
+      const rawNeeded = Math.ceil((FAUCET_USD / effectiveSpot) * 1e8) + 500;
+      const faucetSats = Math.max(5_000, Math.min(35_000, rawNeeded));
+      // Ensure LP has enough liquidity for both the faucet grant AND matching the user's $10 DLC open.
+      if (Number(bal.available || 0) < faucetSats * 2 + MIN_LP_RESERVE_SATS) {
         throw new RpcError(503, "LP faucet reserve low — try again shortly");
       }
-      const txid = await wallet.send({ address: arkAddress, amount: FAUCET_SATS });
+      const txid = await wallet.send({ address: arkAddress, amount: faucetSats });
       store.update((st) => {
         if (!st.faucetClaims) st.faucetClaims = {};
         st.faucetClaims[claimKey] = {
           txid,
           arkAddress,
-          amountSats: FAUCET_SATS,
+          amountSats: faucetSats,
+          targetUsd: FAUCET_USD,
+          spotUsd: spot.price,
           claimedAt: Math.floor(Date.now() / 1000),
         };
       });
-      console.log(`  LP faucet      : sent ${FAUCET_SATS} instant Arkade sats -> ${arkAddress.slice(0, 18)}… (${txid})`);
-      return { ok: true, txid, amountSats: FAUCET_SATS, arkAddress };
+      console.log(
+        `  LP faucet      : sent ${faucetSats} sats ($${FAUCET_USD} @ $${spot.price}) -> ${arkAddress.slice(0, 18)}… (${txid})`
+      );
+      return { ok: true, txid, amountSats: faucetSats, targetUsd: FAUCET_USD, spotUsd: spot.price, arkAddress };
     }
 
     if (method === "health") {
