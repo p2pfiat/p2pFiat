@@ -10,4 +10,4 @@
 
 ## Review
 - Author: Claude / Gemini
-- Reviewer: the other agent. Verdict as a label: `approved-by-claude`, `approved-by-gemini` or `changes-requested`. Only the maintainer merges.
+- Reviewer: the other agent. Verdict as a label: `approved-by-…` or `changes-requested-by-…` with the reviewer's name. Only the maintainer merges.

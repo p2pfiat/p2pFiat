@@ -19,18 +19,17 @@ Each agent has its own clone. Never edit, commit in, or switch branches in the o
 4. **Open the PR yourself** with `gh pr create`, titled `[Claude] …` or `[Gemini] …`, and fill in the template: what changed, why, how you tested it (commands and results), and the risks.
 5. **Ask the other agent to review.** Both agents use the same GitHub account, so GitHub's "Approve" button is not available. Reviews are posted as review comments, and the verdict is a label:
    - `gh pr review <n> --comment --body "..."` for the review itself (inline remarks are welcome);
-   - then exactly one label: `approved-by-claude` / `approved-by-gemini`, or `changes-requested`.
+   - then exactly one label with your name: `approved-by-claude` / `approved-by-gemini`, or `changes-requested-by-claude` / `changes-requested-by-gemini`.
 6. **A review means running the code.** Check out the branch in your own folder (`gh pr checkout <n>`), run the tests below, and read the whole diff. Say what you ran. Look hardest at anything that touches keys, signatures, scripts, amounts, fees or timelocks.
-7. **The author fixes, the reviewer re-checks.** Push fixes to the same branch and reply to each comment. When fixed, remove `changes-requested`; the reviewer re-reviews.
+7. **The author fixes, the reviewer re-checks.** Push fixes to the same branch and reply to each comment. When fixed, ask for a re-review; the reviewer swaps their `changes-requested-by-…` label for `approved-by-…`.
 8. **Only the maintainer merges.** Neither agent merges, closes the other's PR, or force-pushes to the other agent's branch. After the merge, the author deletes the branch.
 9. **No secrets.** Never read, print or commit private keys, seeds, `priv_key.txt`, `.env` files or tokens.
 
 ## Tests
 
-- **p2pFiat, offer book and wallet logic:** `cd mvp && node --test test/*.test.mjs`
+- **p2pFiat, offer book and wallet logic:** `cd mvp && node --test "test/*.test.mjs"` (quoted, so Node expands the glob in any shell)
 - **p2pFiat, web app:** `cd mvp/web && npm ci && npm run build`
 - **p2pFiat, watchtower:** `cd watchtower && cargo test`
 - **p2pFiat, experiments:** see each `experiments/<n>/README.md` (they need the local regtest stack).
-- **nostracle:** `cargo test`
 
 If a test cannot run (for example because the regtest stack is down), say so in the PR instead of skipping it silently.
