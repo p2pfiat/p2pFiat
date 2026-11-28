@@ -116,6 +116,41 @@ function parseNostracleQuorumEnv() {
   return { threshold: Math.min(2, oracles.length), oracles };
 }
 
+/**
+ * Parse optional extra LP offer tiers (`LP_EXTRA_OFFERS`), comma-separated as
+ * `<termSecs>:<fundingRateBpsPerDay>[:<spreadBps>]` (e.g. `3600:0.27` for a 1h ~1% APR tier).
+ * Always starts with the primary tier and deduplicates by `termSecs`.
+ */
+export function parseOfferTiers(
+  raw,
+  { termSecs = 86_400, fundingRateBpsPerDay = 3, spreadBps = 1 } = {}
+) {
+  const primary = {
+    termSecs: Math.max(60, Math.round(Number(termSecs) || 86_400)),
+    fundingRateBpsPerDay: Number(fundingRateBpsPerDay),
+    spreadBps: Math.max(0, Number(spreadBps)),
+  };
+  const tiers = [primary];
+  const seenTerms = new Set([primary.termSecs]);
+  const text = String(raw || "").trim();
+  if (!text) return tiers;
+  for (const part of text.split(",")) {
+    const item = part.trim();
+    if (!item) continue;
+    const [tStr, fStr, sStr] = item.split(":").map((s) => s.trim());
+    const t = Math.round(Number(tStr));
+    const f = Number(fStr);
+    const s = sStr !== undefined && sStr !== "" ? Number(sStr) : primary.spreadBps;
+    if (!Number.isFinite(t) || t < 60) continue;
+    if (!Number.isFinite(f)) continue;
+    if (!Number.isFinite(s) || s < 0) continue;
+    if (seenTerms.has(t)) continue;
+    seenTerms.add(t);
+    tiers.push({ termSecs: t, fundingRateBpsPerDay: f, spreadBps: s });
+  }
+  return tiers;
+}
+
 export async function createLpServer({
   port = 3456,
   enableHttp = true,
@@ -125,11 +160,25 @@ export async function createLpServer({
   pairs = ["BTC-USD", "BTC-EUR"],
   spreadBps = Number(process.env.LP_SPREAD_BPS || 1),
   fundingRateBpsPerDay = Number(process.env.LP_FUNDING_BPS || 3),
+  termSecs: defaultTermSecs = Number(process.env.LP_TERM_SECS || 86_400),
+  offerTiers = parseOfferTiers(process.env.LP_EXTRA_OFFERS, {
+    termSecs: Number(process.env.LP_TERM_SECS || 86_400),
+    fundingRateBpsPerDay: Number(process.env.LP_FUNDING_BPS || 3),
+    spreadBps: Number(process.env.LP_SPREAD_BPS || 1),
+  }),
   oracleQuorum = parseNostracleQuorumEnv(),
   relays = [],
   publicUrl,
   publishIntervalMs = 45_000,
 } = {}) {
+  const tiers =
+    Array.isArray(offerTiers) && offerTiers.length > 0
+      ? offerTiers
+      : [{ termSecs: defaultTermSecs, fundingRateBpsPerDay, spreadBps }];
+  const findTierForTerm = (reqTermSecs) => {
+    const n = Number(reqTermSecs);
+    return tiers.find((t) => t.termSecs === n) || tiers[0];
+  };
   const store = new JsonStore(path.join(dataDir, "lp.json"), {
     lpKeyHex: null,
     quotes: {},
@@ -193,35 +242,45 @@ export async function createLpServer({
     for (const pair of pairs) {
       const currency = pair.includes("-") ? pair.split("-")[1].toUpperCase() : "USD";
       const spotPrice = spotsByCur[currency] || spotUsd.price;
-      const bidPrice = Math.round(spotPrice * (1 - spreadBps / 10_000));
-      const askPrice = Math.round(spotPrice * (1 + spreadBps / 10_000));
-      const event = createSignedOfferEvent(lpKey, {
-        lpName,
-        pair,
-        currency,
-        spotPrice,
-        spotUsd: spotPrice,
-        bidPrice,
-        askPrice,
-        bidUsd: bidPrice,
-        askUsd: askPrice,
-        spreadBps,
-        fundingRateBpsPerDay,
-        minNotionalUsd: 1,
-        maxNotionalUsd: 100,
-        availableLiquiditySats: Number(bal.available || 0),
-        termSecs: 86_400,
-        endpointUrl,
-        transports,
-        nip17Relays: liveNip17Relays,
-        oracleQuorum,
-      });
-      latestOfferEvents[pair] = event;
-      events.push(event);
-      if (relays.length > 0) {
-        const res = await publishOfferToRelays(event, relays);
-        for (const r of res.okRelays) okRelaySet.add(r);
-        failedRelays.push(...res.failedRelays);
+      for (const tier of tiers) {
+        const bidPrice = Math.round(spotPrice * (1 - tier.spreadBps / 10_000));
+        const askPrice = Math.round(spotPrice * (1 + tier.spreadBps / 10_000));
+        const dTag =
+          tier.termSecs === 86_400
+            ? `p2pfiat:v1:${pair}:arkade-mutinynet`
+            : `p2pfiat:v1:${pair}:arkade-mutinynet:${tier.termSecs}s`;
+        const event = createSignedOfferEvent(lpKey, {
+          lpName,
+          pair,
+          currency,
+          dTag,
+          spotPrice,
+          spotUsd: spotPrice,
+          bidPrice,
+          askPrice,
+          bidUsd: bidPrice,
+          askUsd: askPrice,
+          spreadBps: tier.spreadBps,
+          fundingRateBpsPerDay: tier.fundingRateBpsPerDay,
+          minNotionalUsd: 1,
+          maxNotionalUsd: 100,
+          availableLiquiditySats: Number(bal.available || 0),
+          termSecs: tier.termSecs,
+          endpointUrl,
+          transports,
+          nip17Relays: liveNip17Relays,
+          oracleQuorum,
+        });
+        if (!latestOfferEvents[pair] || tier.termSecs === tiers[0].termSecs) {
+          latestOfferEvents[pair] = event;
+        }
+        latestOfferEvents[`${pair}:${tier.termSecs}`] = event;
+        events.push(event);
+        if (relays.length > 0) {
+          const res = await publishOfferToRelays(event, relays);
+          for (const r of res.okRelays) okRelaySet.add(r);
+          failedRelays.push(...res.failedRelays);
+        }
       }
     }
     return {
@@ -290,6 +349,7 @@ export async function createLpServer({
         pairs,
         spreadBps,
         fundingRateBpsPerDay,
+        offerTiers: tiers,
         oracleQuorum,
         relays,
         transports: [
@@ -327,16 +387,17 @@ export async function createLpServer({
       const side = String(body.side || "short").toLowerCase() === "long" ? "long" : "short";
       const pair = `BTC-${currency}`;
       const notional = Number(body.notional ?? body.notionalUsd);
-      const termSecs = Number(body.termSecs || 86_400);
+      const termSecs = Number(body.termSecs || tiers[0].termSecs);
       if (!Number.isFinite(notional) || notional <= 0) {
         throw new RpcError(400, "notional must be > 0");
       }
+      const tier = findTierForTerm(termSecs);
       const spot = await fetchBtcSpot(currency);
       const effectiveSpot =
         side === "long"
-          ? Math.round(spot.price * (1 + spreadBps / 10_000))
-          : Math.round(spot.price * (1 - spreadBps / 10_000));
-      const sideFundingBps = side === "long" ? -fundingRateBpsPerDay : fundingRateBpsPerDay;
+          ? Math.round(spot.price * (1 + tier.spreadBps / 10_000))
+          : Math.round(spot.price * (1 - tier.spreadBps / 10_000));
+      const sideFundingBps = side === "long" ? -tier.fundingRateBpsPerDay : tier.fundingRateBpsPerDay;
       const userCollateralSats = Math.max(1_000, Math.round((notional / effectiveSpot) * 1e8));
       const lpCollateralSats = userCollateralSats;
       const quote = {
@@ -352,7 +413,7 @@ export async function createLpServer({
         spotPrice: spot.price,
         spotUsd: spot.price,
         effectiveSpotUsd: effectiveSpot,
-        spreadBps,
+        spreadBps: tier.spreadBps,
         termSecs,
         fundingRateBpsPerDay: sideFundingBps,
         userCollateralSats,
@@ -700,7 +761,8 @@ export async function createLpServer({
       const ckUnsignedB64 = base64.encode(ck.toPSBT());
       const lpCkSig = schnorrSign(lpKey, ckHash);
 
-      const termSecs = Number(body.termSecs || 86_400);
+      const termSecs = Number(body.termSecs || pos.termSecs || tiers[0].termSecs);
+      const rollTier = findTierForTerm(termSecs);
       const primaryOracle = (pos.oracleQuorum || oracleQuorum)?.oracles?.[0];
       const oracleEventId = `btc${cur.toLowerCase()}-${Math.floor(Date.now() / 1000) + termSecs}`;
       const refundLockTime = Math.floor(Date.now() / 1000) + 7 * 86_400;
@@ -732,7 +794,8 @@ export async function createLpServer({
         newTotalCollateralSats: Number(newTotal),
         userSurplusSats: Number(userSurplus),
         lpSurplusSats: Number(lpSurplus),
-        newFundingRateBpsPerDay: side === "long" ? -fundingRateBpsPerDay : fundingRateBpsPerDay,
+        termSecs,
+        newFundingRateBpsPerDay: side === "long" ? -rollTier.fundingRateBpsPerDay : rollTier.fundingRateBpsPerDay,
         ckUnsignedB64,
         lpCkSig,
         settleLeafHash,
@@ -747,7 +810,8 @@ export async function createLpServer({
         newTotalCollateralSats: Number(newTotal),
         userSurplusSats: Number(userSurplus),
         lpSurplusSats: Number(lpSurplus),
-        fundingRateBpsPerDay,
+        termSecs,
+        fundingRateBpsPerDay: rollTier.fundingRateBpsPerDay,
         arkTxB64: base64.encode(arkTx.toPSBT()),
         ckB64: ckUnsignedB64,
         exitSuite,
@@ -774,6 +838,7 @@ export async function createLpServer({
         p.openSpotUsd = pend.rollSpotUsd;
         p.openSpotPrice = pend.rollSpotUsd;
         p.totalCollateralSats = pend.newTotalCollateralSats;
+        p.termSecs = pend.termSecs;
         p.fundingRateBpsPerDay = pend.newFundingRateBpsPerDay;
         p.lastRolledAt = Math.floor(Date.now() / 1000);
         p.rollCount = Number(p.rollCount || 0) + 1;
@@ -1042,6 +1107,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.met
   const lpName = process.env.LP_NAME || "p2pFiat-LP";
   const spreadBps = Number(process.env.LP_SPREAD_BPS || 1);
   const fundingRateBpsPerDay = Number(process.env.LP_FUNDING_BPS || 3);
+  const termSecs = Number(process.env.LP_TERM_SECS || 86_400);
+  const offerTiers = parseOfferTiers(process.env.LP_EXTRA_OFFERS, {
+    termSecs,
+    fundingRateBpsPerDay,
+    spreadBps,
+  });
   const publicUrl = process.env.LP_PUBLIC_URL || undefined;
   const dataDir = process.env.LP_DATA_DIR ? path.resolve(process.env.LP_DATA_DIR) : undefined;
   const relays =
@@ -1058,11 +1129,16 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.met
     lpName,
     spreadBps,
     fundingRateBpsPerDay,
+    termSecs,
+    offerTiers,
     publicUrl,
     relays,
   });
+  const tierSummary = offerTiers
+    .map((t) => `${t.termSecs >= 86_400 ? `${Math.round(t.termSecs / 86_400)}d` : `${Math.round(t.termSecs / 3600)}h`}@${t.fundingRateBpsPerDay}bps/d`)
+    .join(", ");
   console.log(
-    `p2pFiat LP ready (${lp.lpName}, spread=${spreadBps}bps, yield=${fundingRateBpsPerDay}bps/day)`
+    `p2pFiat LP ready (${lp.lpName}, spread=${spreadBps}bps, tiers=[${tierSummary}])`
   );
   console.log(`  HTTP endpoint  : ${lp.url || "DISABLED (serverless NIP-17 P2P mode)"}`);
   console.log(`  LP pubkey      : ${lp.lpKey.pubHex}`);

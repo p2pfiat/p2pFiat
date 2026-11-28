@@ -12,7 +12,7 @@ import {
   buildOnDemandDisputeTx,
   assembleDisputeWitness,
 } from "../src/contract.mjs";
-import { parseDisputeLeaf, buildDisputeWitnessSigs } from "../web/src/dispute-witness.js";
+import { parseDisputeLeaf, buildDisputeWitnessSigs, hasLegacyDisputeLeaf, LEGACY_POSITION_TEXT } from "../web/src/dispute-witness.js";
 
 const csvLeaf = (keys) =>
   CSVMultisigTapscript.encode({
@@ -98,3 +98,15 @@ const node = assembleDisputeWitness(dtx, disputeClosure, Object.fromEntries(
 assert.deepEqual(web.sigs, node.witnessStack.slice(0, 3), "web and Node witnesses must match");
 
 console.log("[PASS] web dispute witness: 0xba-safe parse, order, missing signer, legacy, matches Node");
+
+// Legacy positions: the dispute leaf arkd rejected with "failed to parse taptree field"
+// (taken from a real Mutinynet position opened before the CSVMultisig switch).
+const realLegacyLeaf =
+  "03040040b2752032bf77878296c74d4ec5740a572b748c0a758d875aaf4429ccd268c1339b9e2aac204d6247e2c75922d662be9e97c55f775f42735d32d954366f4ac16d1e13e83beeba20550a7fa2d48c5a5937f4b164d3377f7646b4617df3dc812d2bf9634e3dba2f68ba52a2";
+assert.equal(hasLegacyDisputeLeaf({ disputeScriptHex: realLegacyLeaf }), true, "real OP_CHECKSIGADD leaf is legacy");
+const k3 = [randomEvenKey(), randomEvenKey(), randomEvenKey()];
+assert.equal(hasLegacyDisputeLeaf({ disputeScriptHex: hex.encode(csvLeaf(k3)) }), false, "CSVMultisig leaf is not legacy");
+assert.equal(hasLegacyDisputeLeaf({}), false, "no dispute leaf: not legacy");
+assert.equal(hasLegacyDisputeLeaf({ disputeScriptHex: "zz" }), false, "unparseable: not flagged");
+assert.match(LEGACY_POSITION_TEXT, /L1/);
+console.log("[PASS] legacy OP_CHECKSIGADD positions detected (real leaf), CSVMultisig not flagged");

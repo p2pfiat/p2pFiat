@@ -46,7 +46,7 @@ import {
   nip44Decrypt,
 } from "./nip17.js";
 import { computeKormirOutcomePoint } from "./nostracle-client.js";
-import { buildDisputeWitnessSigs } from "./dispute-witness.js";
+import { buildDisputeWitnessSigs, hasLegacyDisputeLeaf, LEGACY_POSITION_TEXT } from "./dispute-witness.js";
 import {
   getOrCreateNostrAccount,
   getActiveIdentity,
@@ -1453,12 +1453,14 @@ export class BrowserP2pFiatWallet {
       return { url: targetOrUrl, pubkey: null, preferNip17: false, relays: [] };
     }
     if (targetOrUrl && typeof targetOrUrl === "object") {
+      const termSecs = Number(targetOrUrl.termSecs || targetOrUrl.offer?.termSecs || 0);
       return {
         url: targetOrUrl.url || "",
         pubkey: targetOrUrl.pubkey || null,
         preferNip17: Boolean(targetOrUrl.preferNip17),
         lpName: targetOrUrl.lpName || "",
         relays: Array.isArray(targetOrUrl.relays) ? targetOrUrl.relays : [],
+        ...(Number.isFinite(termSecs) && termSecs > 0 ? { termSecs } : {}),
       };
     }
     return { url: getLpUrl(), pubkey: null, preferNip17: false, relays: [] };
@@ -1493,11 +1495,13 @@ export class BrowserP2pFiatWallet {
   }
 
   async requestQuote(notional, target = getLpUrl(), currency = "USD", side = "short") {
-    return this.callLp(target, "quote", {
+    const t = this._normalizeTarget(target);
+    return this.callLp(t, "quote", {
       currency: String(currency || "USD").toUpperCase(),
       side: side === "long" ? "long" : "short",
       notional,
       notionalUsd: notional,
+      ...(t.termSecs ? { termSecs: t.termSecs } : {}),
     });
   }
 
@@ -1669,6 +1673,7 @@ export class BrowserP2pFiatWallet {
     const map = loadPositions();
     const pos = map[positionId];
     if (!pos) throw new Error("Unknown position");
+    if (hasLegacyDisputeLeaf(pos)) throw new Error(LEGACY_POSITION_TEXT);
     const target = {
       url: pos.lpUrl || (pos.lpTransport === "nostr-nip17" ? "" : getLpUrl()),
       pubkey: pos.lpPubkey || pos.lpPubHex || null,
@@ -1790,6 +1795,7 @@ export class BrowserP2pFiatWallet {
     const map = loadPositions();
     const pos = map[positionId];
     if (!pos) throw new Error("Unknown position");
+    if (hasLegacyDisputeLeaf(pos)) throw new Error(LEGACY_POSITION_TEXT);
     const target = {
       url: pos.lpUrl || (pos.lpTransport === "nostr-nip17" ? "" : getLpUrl()),
       pubkey: pos.lpPubkey || pos.lpPubHex || null,
