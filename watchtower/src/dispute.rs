@@ -499,6 +499,55 @@ pub fn assemble_dispute_tx_witness(
     Ok(final_tx)
 }
 
+/// Round 1 of a dispute: which leaf (index into `leaves`, primary first) each oracle is asked
+/// to sign. A Nostracle only signs a leaf that contains its own key, so asking every oracle for
+/// the primary leaf would make the online oracles outside it look offline. Each oracle gets the
+/// primary leaf if it holds the oracle's key, else the first leaf that does. All requests are
+/// for the same fixed tx, which the Nostracle txid lock allows across leaves. Oracles in no
+/// leaf are left out.
+pub fn plan_round1(leaves: &[DisputeLeafRequest], oracles: &[String]) -> Vec<(usize, Vec<String>)> {
+    let mut groups: Vec<(usize, Vec<String>)> = Vec::new();
+    for raw in oracles {
+        let pk = raw.trim().to_lowercase();
+        let Some(idx) = leaves.iter().position(|l| l.keys.contains(&pk)) else { continue };
+        match groups.iter_mut().find(|(i, _)| *i == idx) {
+            Some((_, pks)) => pks.push(pk),
+            None => groups.push((idx, vec![pk])),
+        }
+    }
+    groups.sort_by_key(|(i, _)| *i);
+    groups
+}
+
+/// After round 1: every oracle with a verified signature for any leaf is live. Pick the primary
+/// leaf (index 0) if all its oracles are live, else the first leaf whose oracles all are.
+/// `verified_by_leaf[i]` holds the verified signatures for `leaves[i]`. Returns the chosen leaf
+/// index and the oracles of that leaf that still have to sign it, or None when no leaf has all
+/// its oracles live. A legacy CHECKSIGADD primary leaf only needs `threshold` signers.
+pub fn plan_round2(
+    leaves: &[DisputeLeafRequest],
+    verified_by_leaf: &[HashMap<String, [u8; 64]>],
+    threshold: usize,
+) -> Option<(usize, Vec<String>)> {
+    let primary = leaves.first()?;
+    if primary.legacy_checksigadd {
+        let have = verified_by_leaf.first().map(|m| m.len()).unwrap_or(0);
+        return (have >= threshold).then(|| (0, Vec::new()));
+    }
+    let live: std::collections::HashSet<&String> = verified_by_leaf.iter().flat_map(|m| m.keys()).collect();
+    let idx = leaves
+        .iter()
+        .position(|l| !l.legacy_checksigadd && l.keys.iter().all(|k| live.contains(k)))?;
+    let have = verified_by_leaf.get(idx);
+    let missing = leaves[idx]
+        .keys
+        .iter()
+        .filter(|k| !have.is_some_and(|m| m.contains_key(*k)))
+        .cloned()
+        .collect();
+    Some((idx, missing))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +905,74 @@ mod tests {
         assert_eq!(tx.input[0].witness.len(), 5);
         // Round-1 signatures are for the other leaf and must not be accepted here
         assert!(assemble_dispute_tx_witness(&built, &fb, 3, &round1).is_err());
+    }
+
+    /// A Nostracle (nostracle#7) signs only a leaf that contains its own key; offline ones
+    /// never answer. Returns the signatures `asked` would give for `leaf`.
+    fn nostracle_answers(
+        leaf: &DisputeLeafRequest,
+        asked: &[String],
+        o: &[Keypair],
+        pks: &[String],
+        offline: &[usize],
+    ) -> HashMap<String, String> {
+        let who: Vec<&Keypair> = asked
+            .iter()
+            .filter_map(|pk| {
+                let i = pks.iter().position(|p| p == pk)?;
+                (!offline.contains(&i) && leaf.keys.contains(pk)).then_some(&o[i])
+            })
+            .collect();
+        sign_all(leaf, &who)
+    }
+
+    #[test]
+    fn rounds_work_with_nostracles_that_only_sign_their_own_leaves() {
+        let (dispute, bounty, o) = make_v2_fixture();
+        let built = build_watchtower_dispute_tx(&dispute, &bounty, 100_000.0, 1_760_086_400, 350).unwrap();
+        let reqs: Vec<DisputeLeafRequest> = dispute_leaves(&dispute)
+            .iter()
+            .map(|l| leaf_request(&built, &dispute, l).unwrap())
+            .collect();
+        let pks: Vec<String> = o.iter().map(|k| k.x_only_public_key().0.to_string()).collect();
+
+        // The old flow: everyone is asked for the primary leaf (#1,#2,#3) while #2 is offline.
+        // #4 and #5 refuse a leaf without their key, so no other leaf can be completed.
+        let old = verified_signers(&reqs[0], &nostracle_answers(&reqs[0], &pks, &o, &pks, &[1]));
+        assert!(reqs[1..].iter().all(|l| !l.keys.iter().all(|k| old.contains_key(k))));
+
+        for (offline, expect) in [
+            (vec![], Some(0usize)),
+            (vec![1], None),
+            (vec![1, 3], None),
+            (vec![0, 1, 2], None),
+        ] {
+            let mut sigs_by_leaf: Vec<HashMap<String, String>> = vec![HashMap::new(); reqs.len()];
+            for (idx, asked) in plan_round1(&reqs, &pks) {
+                sigs_by_leaf[idx] = nostracle_answers(&reqs[idx], &asked, &o, &pks, &offline);
+            }
+            let verified: Vec<HashMap<String, [u8; 64]>> =
+                reqs.iter().zip(&sigs_by_leaf).map(|(r, s)| verified_signers(r, s)).collect();
+            let plan = plan_round2(&reqs, &verified, 3);
+            if offline.len() > 2 {
+                assert!(plan.is_none(), "offline {offline:?}: fewer than 3 live, no leaf");
+                continue;
+            }
+            let (idx, missing) = plan.expect("3 or more live oracles form a leaf");
+            if let Some(want) = expect {
+                assert_eq!(idx, want, "all online: primary leaf");
+                assert!(missing.is_empty(), "all online: no round 2");
+            }
+            assert!(
+                reqs[idx].keys.iter().all(|k| !offline.iter().any(|i| &pks[*i] == k)),
+                "offline {offline:?}: chosen leaf uses only live oracles"
+            );
+            let mut sigs = sigs_by_leaf[idx].clone();
+            sigs.extend(nostracle_answers(&reqs[idx], &missing, &o, &pks, &offline));
+            let tx = assemble_dispute_tx_witness(&built, &reqs[idx], 3, &sigs).unwrap();
+            assert_eq!(tx.compute_txid(), built.unsigned_tx.compute_txid(), "same tx in both rounds");
+            assert_eq!(tx.input[0].witness.len(), 5);
+        }
     }
 
     #[test]
