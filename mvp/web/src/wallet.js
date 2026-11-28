@@ -36,6 +36,8 @@ import {
   withLegacyReadRelays,
   computeEventId,
   buildQuorumForPreset,
+  DEFAULT_QUORUM_PRESET,
+  isQuorumPresetAvailable,
   buildP2pOrderEvent,
   publishOfferEvent,
 } from "./offerbook.js";
@@ -400,13 +402,14 @@ export function setWatchtowerPubkey(val) {
   return lower;
 }
 
+/** The saved quorum preset, or 2-of-3 when none is saved or too few Nostracles are live for it. */
 export function getQuorumPreset() {
-  return localStorage.getItem(LS_QUORUM_PRESET) || "3-of-5";
+  const saved = localStorage.getItem(LS_QUORUM_PRESET) || DEFAULT_QUORUM_PRESET;
+  return isQuorumPresetAvailable(saved) ? saved : DEFAULT_QUORUM_PRESET;
 }
 
 export function setQuorumPreset(preset) {
-  const valid = ["2-of-3", "3-of-5", "4-of-7"];
-  const chosen = valid.includes(preset) ? preset : "3-of-5";
+  const chosen = isQuorumPresetAvailable(preset) ? preset : DEFAULT_QUORUM_PRESET;
   localStorage.setItem(LS_QUORUM_PRESET, chosen);
   return chosen;
 }

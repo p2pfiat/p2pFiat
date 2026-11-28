@@ -523,10 +523,11 @@
             <div class="field">
               <label id="nostracles-label">Nostracle Dispute Quorum (wallet default — locked per position at open)</label>
               <select id="quorum-select" class="select-input">
-                <option value="2-of-3">2-of-3 — Light / Low cost (tolerates 1 offline or 1 dishonest)</option>
-                <option value="3-of-5" selected>3-of-5 — Balanced ★ (tolerates 2 offline &amp; 2 dishonest; fee competition)</option>
-                <option value="4-of-7">4-of-7 — Max Security (tolerates 3 offline &amp; 3 dishonest; strongest fee competition)</option>
+                <option value="2-of-3" selected data-label="2-of-3 — Default ★ (tolerates 1 offline or 1 dishonest)">2-of-3 — Default ★ (tolerates 1 offline or 1 dishonest)</option>
+                <option value="3-of-5" data-label="3-of-5 — Balanced (tolerates 2 offline &amp; 2 dishonest; fee competition)">3-of-5 — Balanced (tolerates 2 offline &amp; 2 dishonest; fee competition)</option>
+                <option value="4-of-7" data-label="4-of-7 — Max Security (tolerates 3 offline &amp; 3 dishonest; strongest fee competition)">4-of-7 — Max Security (tolerates 3 offline &amp; 3 dishonest; strongest fee competition)</option>
               </select>
+              <div id="quorum-run-own" class="muted" style="margin:6px 0 0;font-size:0.8rem" hidden></div>
               <div id="quorum-note" class="muted" style="margin:6px 0 8px"></div>
               <div id="nostracles-box" class="nostracle-list"></div>
               <div class="copy-row" style="margin-top:8px">
