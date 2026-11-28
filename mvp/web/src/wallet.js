@@ -36,6 +36,8 @@ import {
   withLegacyReadRelays,
   computeEventId,
   buildQuorumForPreset,
+  DEFAULT_QUORUM_PRESET,
+  isQuorumPresetAvailable,
   buildP2pOrderEvent,
   publishOfferEvent,
 } from "./offerbook.js";
@@ -46,7 +48,12 @@ import {
   nip44Decrypt,
 } from "./nip17.js";
 import { computeKormirOutcomePoint } from "./nostracle-client.js";
-import { buildDisputeWitnessSigs, parseDisputeLeaf } from "./dispute-witness.js";
+import {
+  buildDisputeWitnessSigs,
+  hasLegacyDisputeLeaf,
+  LEGACY_POSITION_TEXT,
+  parseDisputeLeaf,
+} from "./dispute-witness.js";
 import {
   computeDisputeManifestHash,
   disputeLeafHashesHex,
@@ -385,13 +392,14 @@ export function setWatchtowerPubkey(val) {
   return lower;
 }
 
+/** The saved quorum preset, or 2-of-3 when none is saved or too few Nostracles are live for it. */
 export function getQuorumPreset() {
-  return localStorage.getItem(LS_QUORUM_PRESET) || "3-of-5";
+  const saved = localStorage.getItem(LS_QUORUM_PRESET) || DEFAULT_QUORUM_PRESET;
+  return isQuorumPresetAvailable(saved) ? saved : DEFAULT_QUORUM_PRESET;
 }
 
 export function setQuorumPreset(preset) {
-  const valid = ["2-of-3", "3-of-5", "4-of-7"];
-  const chosen = valid.includes(preset) ? preset : "3-of-5";
+  const chosen = isQuorumPresetAvailable(preset) ? preset : DEFAULT_QUORUM_PRESET;
   localStorage.setItem(LS_QUORUM_PRESET, chosen);
   return chosen;
 }
@@ -1447,12 +1455,14 @@ export class BrowserP2pFiatWallet {
       return { url: targetOrUrl, pubkey: null, preferNip17: false, relays: [] };
     }
     if (targetOrUrl && typeof targetOrUrl === "object") {
+      const termSecs = Number(targetOrUrl.termSecs || targetOrUrl.offer?.termSecs || 0);
       return {
         url: targetOrUrl.url || "",
         pubkey: targetOrUrl.pubkey || null,
         preferNip17: Boolean(targetOrUrl.preferNip17),
         lpName: targetOrUrl.lpName || "",
         relays: Array.isArray(targetOrUrl.relays) ? targetOrUrl.relays : [],
+        ...(Number.isFinite(termSecs) && termSecs > 0 ? { termSecs } : {}),
       };
     }
     return { url: getLpUrl(), pubkey: null, preferNip17: false, relays: [] };
@@ -1487,11 +1497,13 @@ export class BrowserP2pFiatWallet {
   }
 
   async requestQuote(notional, target = getLpUrl(), currency = "USD", side = "short") {
-    return this.callLp(target, "quote", {
+    const t = this._normalizeTarget(target);
+    return this.callLp(t, "quote", {
       currency: String(currency || "USD").toUpperCase(),
       side: side === "long" ? "long" : "short",
       notional,
       notionalUsd: notional,
+      ...(t.termSecs ? { termSecs: t.termSecs } : {}),
     });
   }
 
@@ -1663,6 +1675,7 @@ export class BrowserP2pFiatWallet {
     const map = loadPositions();
     const pos = map[positionId];
     if (!pos) throw new Error("Unknown position");
+    if (hasLegacyDisputeLeaf(pos)) throw new Error(LEGACY_POSITION_TEXT);
     const target = {
       url: pos.lpUrl || (pos.lpTransport === "nostr-nip17" ? "" : getLpUrl()),
       pubkey: pos.lpPubkey || pos.lpPubHex || null,
@@ -1784,6 +1797,7 @@ export class BrowserP2pFiatWallet {
     const map = loadPositions();
     const pos = map[positionId];
     if (!pos) throw new Error("Unknown position");
+    if (hasLegacyDisputeLeaf(pos)) throw new Error(LEGACY_POSITION_TEXT);
     const target = {
       url: pos.lpUrl || (pos.lpTransport === "nostr-nip17" ? "" : getLpUrl()),
       pubkey: pos.lpPubkey || pos.lpPubHex || null,

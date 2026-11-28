@@ -26,6 +26,115 @@ export function spotFromHealth(health, currency = "USD") {
   return Number.isFinite(v) && v > 0 ? v : 0;
 }
 
+// ── Independent price source for the ±2% guard ─────────────────────────────
+// The guard compares the LP's roll quote with a "live" spot. If that spot came from the
+// same LP's /health, the LP would be checked against itself. So the guard spot comes from
+// sources the rolled LP does not control: other order-book LPs and public exchange feeds.
+// The LP's own /health is used only when nothing else answers, and the UI says so.
+
+export const GUARD_MAX_PEER_LPS = 3;
+export const GUARD_SOURCE_TIMEOUT_MS = 5_000;
+
+const normUrl = (u) => String(u || "").trim().replace(/\/+$/, "").toLowerCase();
+const normKey = (k) => String(k || "").trim().toLowerCase();
+
+/**
+ * Other order-book LPs whose /health can serve as an independent spot: HTTP endpoint only,
+ * one per pubkey, never the position's own LP (matched by pubkey or by URL).
+ */
+export function peerSpotTargets(offers, own = {}, max = GUARD_MAX_PEER_LPS) {
+  if (!Array.isArray(offers)) return [];
+  // The own LP may be known by pubkey, by URL, or both; an offer matching either one
+  // also marks its other identifier as "own" (same LP under a second endpoint or key).
+  const ownKeys = new Set([normKey(own.pubkey)].filter(Boolean));
+  const ownUrls = new Set([normUrl(own.url)].filter(Boolean));
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const o of offers) {
+      const key = normKey(o?.pubkey);
+      const url = normUrl(o?.endpointUrl);
+      if ((key && ownKeys.has(key)) || (url && ownUrls.has(url))) {
+        if (key && !ownKeys.has(key)) (ownKeys.add(key), (grew = true));
+        if (url && !ownUrls.has(url)) (ownUrls.add(url), (grew = true));
+      }
+    }
+  }
+  const seenKeys = new Set();
+  const seenUrls = new Set();
+  const out = [];
+  for (const o of offers) {
+    if (out.length >= max) break;
+    const key = normKey(o?.pubkey);
+    const url = normUrl(o?.endpointUrl);
+    if (!key || !url) continue;
+    if (ownKeys.has(key) || ownUrls.has(url)) continue;
+    if (seenKeys.has(key) || seenUrls.has(url)) continue;
+    seenKeys.add(key);
+    seenUrls.add(url);
+    out.push({ url: o.endpointUrl, pubkey: o.pubkey, lpName: o.lpName || key.slice(0, 10) });
+  }
+  return out;
+}
+
+/** Public BTC spot feeds that answer browser requests (CORS checked 2026-11-28). */
+export const PUBLIC_SPOT_FEEDS = [
+  {
+    name: "Coinbase",
+    url: (cur) => `https://api.coinbase.com/v2/prices/BTC-${cur}/spot`,
+    parse: (j) => Number(j?.data?.amount),
+  },
+  {
+    name: "Kraken",
+    url: (cur) => `https://api.kraken.com/0/public/Ticker?pair=XBT${cur}`,
+    parse: (j, cur) => {
+      const res = j?.result;
+      if (!res || typeof res !== "object") return NaN;
+      const entry = res[`XXBTZ${cur}`] || Object.values(res)[0];
+      return Number(entry?.c?.[0]);
+    },
+  },
+];
+
+/** Parse a feed response into a positive spot, or 0 when unusable. */
+export function parseFeedSpot(feed, json, currency = "USD") {
+  try {
+    const v = feed.parse(json, String(currency || "USD").toUpperCase());
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export function medianOf(values) {
+  const xs = values.filter((v) => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+  if (xs.length === 0) return 0;
+  const mid = Math.floor(xs.length / 2);
+  return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2;
+}
+
+/**
+ * Pick the spot the guard compares the roll quote with.
+ *  - `independent`: [{ name, spot }] from peer LPs and public feeds (failed ones may carry spot 0);
+ *  - `selfSpot`: the position's own LP /health spot, used only when no independent source answered.
+ * Returns { spot, selfOnly, sources, note } or null when there is no spot at all.
+ */
+export function chooseGuardSpot({ independent = [], selfSpot = 0 } = {}) {
+  const ok = independent.filter((s) => Number.isFinite(s?.spot) && s.spot > 0);
+  if (ok.length > 0) {
+    const names = ok.map((s) => s.name);
+    return {
+      spot: medianOf(ok.map((s) => s.spot)),
+      selfOnly: false,
+      sources: names,
+      note: `guard: median of ${names.join(", ")}`,
+    };
+  }
+  if (Number.isFinite(selfSpot) && selfSpot > 0) {
+    return { spot: selfSpot, selfOnly: true, sources: ["own LP"], note: "guard: LP self-quote only" };
+  }
+  return null;
+}
+
 /** NIP-17 relays an LP advertises in its current order-book offer (empty if none). */
 export function lpRelaysFromOffers(offers, lpPubkey) {
   if (!lpPubkey || !Array.isArray(offers)) return [];
@@ -62,21 +171,29 @@ export function fmtShortDuration(secs) {
 /**
  * One-line status for a position card with Auto-Roll on.
  * `status` is the last attempt record: { state: "blocked"|"rolling", text, at (ms) }.
+ * `guard` is the last chooseGuardSpot() result for this position; when the guard fell back
+ * to the LP's own quote, the line says so ("guard: LP self-quote only") and turns to a warning.
  */
-export function autoRollStatusLine(p, status, nowMs = Date.now()) {
+export function autoRollStatusLine(p, status, nowMs = Date.now(), guard = null) {
   if (!p || p.status !== "open" || p.autoRoll !== true) return null;
+  const selfOnly = guard?.selfOnly === true;
+  const tail = selfOnly ? ` · ${guard.note}` : "";
+  const infoTone = selfOnly ? "warn" : "info";
   const nowSecs = Math.floor(nowMs / 1000);
   const dueAt = autoRollDueAt(p, nowSecs);
   if (nowSecs < dueAt) {
-    return { tone: "info", text: `↻ Auto-Roll scheduled in ${fmtShortDuration(dueAt - nowSecs)} (keep this tab open)` };
+    return {
+      tone: infoTone,
+      text: `↻ Auto-Roll scheduled in ${fmtShortDuration(dueAt - nowSecs)} (keep this tab open)${tail}`,
+    };
   }
-  if (status?.state === "rolling") return { tone: "info", text: "↻ Auto-Roll in progress…" };
+  if (status?.state === "rolling") return { tone: infoTone, text: `↻ Auto-Roll in progress…${tail}` };
   if (status?.state === "blocked") {
     const retryIn = Math.max(0, Math.ceil((status.at + AUTO_ROLL_RETRY_MS - nowMs) / 1000));
     return {
       tone: "warn",
-      text: `⚠ Auto-Roll blocked: ${status.text}${retryIn > 0 ? ` · retry in ${fmtShortDuration(retryIn)}` : " · retrying now"}`,
+      text: `⚠ Auto-Roll blocked: ${status.text}${retryIn > 0 ? ` · retry in ${fmtShortDuration(retryIn)}` : " · retrying now"}${tail}`,
     };
   }
-  return { tone: "info", text: "↻ Auto-Roll due — will roll within a minute" };
+  return { tone: infoTone, text: `↻ Auto-Roll due — will roll within a minute${tail}` };
 }

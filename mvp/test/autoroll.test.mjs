@@ -4,9 +4,14 @@ import {
   AUTO_ROLL_RETRY_MS,
   autoRollDueAt,
   autoRollStatusLine,
+  chooseGuardSpot,
   describeAutoRollError,
   isAutoRollDue,
   lpRelaysFromOffers,
+  medianOf,
+  parseFeedSpot,
+  peerSpotTargets,
+  PUBLIC_SPOT_FEEDS,
   spotFromHealth,
 } from "../web/src/autoroll.js";
 
@@ -68,4 +73,79 @@ test("status line: scheduled, due, blocked with retry countdown", () => {
   assert.equal(autoRollStatusLine(pos({ autoRoll: false }), null, nowDue), null);
   // 11h 59m 50s rounds to 12h, never "11h 60m"
   assert.match(autoRollStatusLine(pos(), null, (T0 + 43_200 - 43_190) * 1000).text, /scheduled in 12h \(/);
+});
+
+test("guard peers exclude the position's own LP by pubkey and by URL", () => {
+  const offers = [
+    { pubkey: "AA", endpointUrl: "https://lp-a.example/", lpName: "A" }, // own LP (case differs)
+    { pubkey: "bb", endpointUrl: "https://lp-b.example", lpName: "B" },
+    { pubkey: "bb", endpointUrl: "https://lp-b2.example", lpName: "B again" }, // same LP twice
+    { pubkey: "cc", endpointUrl: "https://LP-A.example", lpName: "A under another key" }, // own URL
+    { pubkey: "dd", nip17Relays: ["wss://r"], lpName: "nostr-only" }, // no /health URL
+    { pubkey: "ee", endpointUrl: "https://lp-e.example", lpName: "E" },
+    { pubkey: "ff", endpointUrl: "https://lp-f.example", lpName: "F" },
+    { pubkey: "gg", endpointUrl: "https://lp-g.example", lpName: "G" },
+  ];
+  const peers = peerSpotTargets(offers, { pubkey: "aa", url: "https://lp-a.example" });
+  assert.deepEqual(peers.map((t) => t.lpName), ["B", "E", "F"]); // capped at 3
+  assert.ok(peers.every((t) => t.pubkey.toLowerCase() !== "aa"));
+  // own LP known only by URL (no pubkey on the position): its second endpoint "B again" is excluded too
+  assert.deepEqual(
+    peerSpotTargets(offers, { url: "https://lp-b.example/" }, 10).map((t) => t.lpName),
+    ["A", "E", "F", "G"] // "A under another key" shares lp-a's URL, so it is a duplicate of A
+  );
+  assert.deepEqual(peerSpotTargets(null, {}), []);
+});
+
+test("public feed responses parse to a spot, junk to 0", () => {
+  const [coinbase, kraken] = PUBLIC_SPOT_FEEDS;
+  assert.equal(parseFeedSpot(coinbase, { data: { amount: "95123.45" } }, "USD"), 95_123.45);
+  assert.equal(parseFeedSpot(kraken, { result: { XXBTZEUR: { c: ["88000.1", "0.1"] } } }, "eur"), 88_000.1);
+  assert.equal(parseFeedSpot(kraken, { result: { XBTUSD: { c: ["95000", "1"] } } }, "USD"), 95_000);
+  assert.equal(parseFeedSpot(coinbase, { errors: [{ id: "not_found" }] }, "USD"), 0);
+  assert.equal(parseFeedSpot(kraken, { error: ["EQuery:Unknown asset pair"], result: {} }, "USD"), 0);
+  assert.equal(parseFeedSpot(kraken, null, "USD"), 0);
+  assert.match(coinbase.url("EUR"), /BTC-EUR\/spot$/);
+  assert.match(kraken.url("USD"), /pair=XBTUSD$/);
+});
+
+test("guard spot is the median of independent sources; self-quote only as a last resort", () => {
+  assert.equal(medianOf([3, 1, 2]), 2);
+  assert.equal(medianOf([4, 1, 0, NaN, 2, 3]), 2.5);
+  assert.equal(medianOf([]), 0);
+
+  // a single LP lying about the price cannot move the median of three sources
+  const g = chooseGuardSpot({
+    independent: [
+      { name: "LP B", spot: 120_000 },
+      { name: "Coinbase", spot: 95_000 },
+      { name: "Kraken", spot: 95_100 },
+      { name: "LP C", spot: 0 }, // answered without a spot for this currency
+    ],
+    selfSpot: 50_000,
+  });
+  assert.equal(g.spot, 95_100);
+  assert.equal(g.selfOnly, false);
+  assert.deepEqual(g.sources, ["LP B", "Coinbase", "Kraken"]);
+  assert.doesNotMatch(g.note, /self/);
+
+  const self = chooseGuardSpot({ independent: [{ name: "Coinbase", spot: 0 }], selfSpot: 95_000 });
+  assert.deepEqual(self, { spot: 95_000, selfOnly: true, sources: ["own LP"], note: "guard: LP self-quote only" });
+  assert.equal(chooseGuardSpot({ independent: [], selfSpot: 0 }), null);
+  assert.equal(chooseGuardSpot(), null);
+});
+
+test("status line says when the guard fell back to the LP's self-quote", () => {
+  const selfGuard = chooseGuardSpot({ selfSpot: 95_000 });
+  const indep = chooseGuardSpot({ independent: [{ name: "Coinbase", spot: 95_000 }] });
+  const nowBefore = (T0 + 40_000) * 1000;
+  const sched = autoRollStatusLine(pos(), null, nowBefore, selfGuard);
+  assert.equal(sched.tone, "warn");
+  assert.match(sched.text, /scheduled in 53m .* · guard: LP self-quote only$/);
+  const ok = autoRollStatusLine(pos(), null, nowBefore, indep);
+  assert.equal(ok.tone, "info");
+  assert.doesNotMatch(ok.text, /guard/);
+  const nowDue = (T0 + 50_000) * 1000;
+  const blocked = autoRollStatusLine(pos(), { state: "blocked", text: "x", at: nowDue }, nowDue, selfGuard);
+  assert.match(blocked.text, /Auto-Roll blocked: x · retry in 5m · guard: LP self-quote only$/);
 });

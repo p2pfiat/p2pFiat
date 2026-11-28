@@ -17,9 +17,14 @@ import {
   AUTO_ROLL_RETRY_MS,
   autoRollStatusLine,
   autoRollTermSecs,
+  chooseGuardSpot,
   describeAutoRollError,
+  GUARD_SOURCE_TIMEOUT_MS,
   isAutoRollDue,
   lpRelaysFromOffers,
+  parseFeedSpot,
+  peerSpotTargets,
+  PUBLIC_SPOT_FEEDS,
   spotFromHealth,
 } from "./autoroll.js";
 import {
@@ -47,12 +52,15 @@ import {
   QUORUM_PRESETS,
   buildQuorumForPreset,
   pubkeyHexToNpub,
+  setActiveNostraclePool,
+  isQuorumPresetAvailable,
 } from "./offerbook.js";
 import {
   scanNostracleReputation,
   fetchCuratedNostracleList,
   fetchCuratedWatchtowerList,
 } from "./nostracle-client.js";
+import { hasLegacyDisputeLeaf, LEGACY_POSITION_TEXT } from "./dispute-witness.js";
 import {
   fetchNostrProfile,
   publishNostrProfile,
@@ -86,7 +94,18 @@ let vaultDirection = "vault-to-ark"; // "vault-to-ark" | "ark-to-vault"
 let vaultIsMax = false;
 const orderBook = new LocalOrderBook();
 let relaySub = null;
-let manualLpPubkey = null;
+let manualOfferKey = null;
+
+function offerKeyOf(o) {
+  return o?.offerKey || `${o?.pubkey || ""}:${o?.dTag || o?.pair || ""}`;
+}
+
+function fmtTermShort(secs) {
+  const s = Math.max(60, Math.round(Number(secs || 86_400)));
+  if (s < 3600) return `${Math.max(1, Math.round(s / 60))}m`;
+  if (s < 86_400) return `${Math.max(1, Math.round(s / 3600))}h`;
+  return `${Math.max(1, Math.round(s / 86_400))}d`;
+}
 
 function curSym(cur = activeCurrency) {
   return String(cur || "USD").toUpperCase() === "EUR" ? "€" : "$";
@@ -146,11 +165,13 @@ function getSelectedLp() {
     return { url: getLpUrl(), lpName: "Fallback LP", pubkey: null, fromOrderbook: false };
   }
   const chosen =
-    (manualLpPubkey && offers.find((o) => o.pubkey === manualLpPubkey)) || offers[0];
+    (manualOfferKey && offers.find((o) => offerKeyOf(o) === manualOfferKey)) || offers[0];
   return {
     url: chosen.endpointUrl || "",
     lpName: chosen.lpName || chosen.pubkey.slice(0, 10),
     pubkey: chosen.pubkey,
+    offerKey: offerKeyOf(chosen),
+    termSecs: Number(chosen.termSecs || 86_400),
     preferNip17: !chosen.endpointUrl,
     relays: Array.isArray(chosen.nip17Relays) ? chosen.nip17Relays : [],
     fromOrderbook: true,
@@ -302,14 +323,51 @@ function fmtAge(rep) {
   return `${rep.ageDays}d history`;
 }
 
-function renderNostracles() {
-  const presetId = getQuorumPreset();
-  const baseQ = buildQuorumForPreset(presetId);
+// Online Nostracles first, so quorums use live oracles; until the first relay scan the
+// whole pool counts as live.
+function syncActiveNostraclePool() {
   const pool = getEffectiveNostraclePool();
-  const q = { ...baseQ, oracles: pool.slice(0, Math.min(baseQ.total, pool.length)) };
-  const meta = QUORUM_PRESETS[presetId] || QUORUM_PRESETS["3-of-5"];
+  const scanned = Object.keys(nostracleRep).length > 0;
+  const online = scanned ? pool.filter((o) => nostracleRep[o.pubkey]?.online) : pool;
+  const ordered = [...online, ...pool.filter((o) => !online.includes(o))];
+  setActiveNostraclePool(ordered, online.length);
+  return { pool: ordered, liveCount: online.length, scanned };
+}
+
+const NOSTRACLE_RUN_YOUR_OWN_URL = "https://github.com/p2pfiat/nostracle#readme";
+
+function renderQuorumOptions(liveCount) {
   const sel = $("quorum-select");
-  if (sel) sel.value = presetId;
+  if (!sel) return;
+  for (const opt of sel.options) {
+    const meta = QUORUM_PRESETS[opt.value];
+    if (!meta) continue;
+    const ok = isQuorumPresetAvailable(opt.value, liveCount);
+    opt.disabled = !ok;
+    opt.textContent = ok
+      ? opt.dataset.label || opt.textContent
+      : `${opt.dataset.label || opt.textContent} — not enough Nostracles (${liveCount}/${meta.total} live), run your own`;
+  }
+  const hint = $("quorum-run-own");
+  if (hint) {
+    const blocked = [...sel.options].filter((o) => o.disabled).map((o) => o.value);
+    hint.hidden = blocked.length === 0;
+    if (blocked.length) {
+      hint.innerHTML = `${blocked.join(" and ")} need more live Nostracles than the ${liveCount} online now. ` +
+        `<a href="${NOSTRACLE_RUN_YOUR_OWN_URL}" target="_blank" rel="noopener">Run your own Nostracle</a> to add one.`;
+    }
+  }
+}
+
+function renderNostracles() {
+  const { pool, liveCount } = syncActiveNostraclePool();
+  renderQuorumOptions(liveCount);
+  const presetId = getQuorumPreset();
+  const baseQ = buildQuorumForPreset(presetId, pool);
+  const q = { ...baseQ, oracles: pool.slice(0, Math.min(baseQ.total, pool.length)) };
+  const meta = QUORUM_PRESETS[baseQ.preset] || QUORUM_PRESETS["2-of-3"];
+  const sel = $("quorum-select");
+  if (sel) sel.value = baseQ.preset;
   const note = $("quorum-note");
   const onlineInQuorum = q.oracles.filter((o) => nostracleRep[o.pubkey]?.online).length;
   const scanned = Object.keys(nostracleRep).length > 0;
@@ -391,7 +449,7 @@ function renderOrderBook() {
     `;
   }
 
-  $("ob-auto-btn").textContent = manualLpPubkey ? "Switch to Auto Best" : "Auto Best ✓";
+  $("ob-auto-btn").textContent = manualOfferKey ? "Switch to Auto Best" : "Auto Best ✓";
 
   const obToggle = $("ob-toggle-btn");
   if (obToggle) {
@@ -409,8 +467,9 @@ function renderOrderBook() {
 
   container.innerHTML = offers
     .map((o, idx) => {
+      const oKey = offerKeyOf(o);
       const isBest = idx === 0 && o.canFill;
-      const isSelected = selected.pubkey === o.pubkey;
+      const isSelected = selected.offerKey ? selected.offerKey === oKey : selected.pubkey === o.pubkey;
       const pofBadge = o.pofVerified
         ? o.verifiedLiquiditySats > 0
           ? `<span class="pill ok">✓ PoF ${o.verifiedLiquiditySats.toLocaleString()} sats</span>`
@@ -434,13 +493,12 @@ function renderOrderBook() {
       const shownRate =
         activeSide === "long" ? -Number(o.fundingRateBpsPerDay || 0) : Number(o.fundingRateBpsPerDay || 0);
       const rateLabel = activeSide === "long" ? "Funding" : "Yield";
-      const termDays = Math.max(1, Math.round(Number(o.termSecs || 86_400) / 86_400));
-      const termTxt = `${termDays}d`;
+      const termTxt = fmtTermShort(o.termSecs);
       const metaLine = isP2p
         ? `Exact ${fmtFiat(o.exactNotional ?? o.minNotionalUsd, o.currency)} · Term <strong>${termTxt}</strong> · Match → <strong>${takerSideLabel}</strong> · ${fmtYield(-Number(o.fundingRateBpsPerDay || 0))}`
         : `Entry <strong>${sym}${entryPrice.toLocaleString()}</strong> · Term <strong>${termTxt}</strong> · <span class="${shownRate >= 0 ? "accent-green" : "accent-red"}">${rateLabel} ${fmtYield(shownRate)}</span> · ${o.pofVerified ? `Max VTXO ${Number(o.maxVtxoSats).toLocaleString()} sats` : `Claimed ${Number(o.availableLiquiditySats).toLocaleString()} sats`}`;
       return `
-        <div class="ob-row ${isSelected ? "selected" : ""}" data-pubkey="${o.pubkey}">
+        <div class="ob-row ${isSelected ? "selected" : ""}" data-offer-key="${oKey}">
           <div class="ob-row-top">
             <span><strong>${o.lpName || "LP"}</strong>${isMine ? ` <span class="muted">(You)</span>` : ""} <code>${o.pubkey.slice(0, 8)}…</code></span>
             <span class="ob-pills">
@@ -455,15 +513,15 @@ function renderOrderBook() {
     })
     .join("");
 
-  container.querySelectorAll("[data-pubkey]").forEach((row) => {
+  container.querySelectorAll("[data-offer-key]").forEach((row) => {
     row.onclick = () => {
-      const pk = row.getAttribute("data-pubkey");
-      const clicked = offers.find((o) => o.pubkey === pk);
-      if (clicked?.makerType === "p2p" && appWallet?.nostrKey?.pubHex === pk) {
+      const oKey = row.getAttribute("data-offer-key");
+      const clicked = offers.find((o) => offerKeyOf(o) === oKey);
+      if (clicked?.makerType === "p2p" && appWallet?.nostrKey?.pubHex === clicked.pubkey) {
         showToast("This is your own live P2P order — waiting for a peer to match it");
         return;
       }
-      manualLpPubkey = pk;
+      manualOfferKey = oKey;
       if (clicked?.makerType === "p2p") {
         activeSide = clicked.takerSide === "long" ? "long" : "short";
         if (clicked.exactNotional) $("usd-input").value = clicked.exactNotional;
@@ -984,18 +1042,23 @@ function renderPositions() {
               : ""
           }
           ${
+            isOpen && hasLegacyDisputeLeaf(p)
+              ? `<div class="autoroll-status warn">⚠ ${LEGACY_POSITION_TEXT}</div>`
+              : ""
+          }
+          ${
             isOpen
               ? `<div class="action-row">
-                   <button class="btn ${rollHint?.urgent || rollHint?.good ? "primary" : "secondary"} small" data-roll="${p.positionId}">Roll Position</button>
-                   <button class="btn danger small" data-close="${p.positionId}">Close at Spot</button>
+                   <button class="btn ${rollHint?.urgent || rollHint?.good ? "primary" : "secondary"} small" data-roll="${p.positionId}" ${hasLegacyDisputeLeaf(p) ? "disabled" : ""}>Roll Position</button>
+                   <button class="btn danger small" data-close="${p.positionId}" ${hasLegacyDisputeLeaf(p) ? "disabled" : ""}>Close at Spot</button>
                  </div>
                  <div class="wt-footer">
                    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
                      ${wtStatusHtml}
-                     <label class="autoroll-toggle" title="Automatically roll when 50% of the contract term has elapsed (while wallet is open, with ±2% spot verification)">
+                     ${hasLegacyDisputeLeaf(p) ? "" : `<label class="autoroll-toggle" title="Automatically roll when 50% of the contract term has elapsed (while wallet is open, with ±2% spot verification)">
                        <input type="checkbox" data-autoroll="${p.positionId}" ${p.autoRoll ? "checked" : ""} />
                        <span>Auto-Roll (50%)</span>
-                     </label>
+                     </label>`}
                    </div>
                    <div style="display:flex;gap:10px;align-items:center">
                      ${
@@ -1512,22 +1575,60 @@ function positionLpTarget(p) {
 
 // The ±2% guard needs a FRESH spot: `spots` is only filled at load and on user actions,
 // so after hours with the tab open it is stale and every LP roll quote looked like a >2% deviation.
-async function fetchFreshSpot(cur, p) {
-  const sources = [getSelectedLp(), positionLpTarget(p)];
-  let lastErr = null;
-  for (const src of sources) {
+// The spot must also be INDEPENDENT of the LP being rolled, else that LP is checked against
+// itself: take the median of other order-book LPs' /health and public exchange feeds, and fall
+// back to the position's own LP /health only when none of them answers (shown on the card).
+const autoRollGuard = new Map(); // positionId -> last chooseGuardSpot() result
+
+function withTimeout(promise, ms, what) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} timed out`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function fetchGuardSpot(cur, p) {
+  let offers = [];
+  try {
+    offers = orderBook.getOffers({});
+  } catch {}
+  const own = positionLpTarget(p);
+  const peers = peerSpotTargets(offers, own);
+  const peerJobs = peers.map(async (t) => {
+    const health = await withTimeout(appWallet.fetchLpHealth(t), GUARD_SOURCE_TIMEOUT_MS, `${t.lpName} health`);
+    return { name: t.lpName, spot: spotFromHealth(health, cur) };
+  });
+  const feedJobs = PUBLIC_SPOT_FEEDS.map(async (f) => {
+    const r = await fetch(f.url(cur), { signal: AbortSignal.timeout(GUARD_SOURCE_TIMEOUT_MS) });
+    if (!r.ok) throw new Error(`${f.name} HTTP ${r.status}`);
+    return { name: f.name, spot: parseFeedSpot(f, await r.json(), cur) };
+  });
+  const settled = await Promise.allSettled([...peerJobs, ...feedJobs]);
+  const independent = settled.filter((s) => s.status === "fulfilled").map((s) => s.value);
+
+  let guard = chooseGuardSpot({ independent });
+  let lastErr = settled.find((s) => s.status === "rejected")?.reason || null;
+  if (!guard) {
     try {
-      const health = await appWallet.fetchLpHealth(src);
-      const sp = spotFromHealth(health, cur);
-      if (sp > 0) {
-        spots[cur] = sp;
-        return sp;
-      }
+      const health = await withTimeout(appWallet.fetchLpHealth(own), GUARD_SOURCE_TIMEOUT_MS, "LP health");
+      guard = chooseGuardSpot({ selfSpot: spotFromHealth(health, cur) });
     } catch (e) {
       lastErr = e;
     }
   }
-  throw new Error(`no live ${cur} spot (LP health unreachable${lastErr?.message ? `: ${lastErr.message}` : ""})`);
+  if (!guard) {
+    throw new Error(`no live ${cur} spot (price sources unreachable${lastErr?.message ? `: ${lastErr.message}` : ""})`);
+  }
+  if (guard.selfOnly) {
+    console.warn(`[auto-roll] ${p.positionId}: no independent ${cur} spot — ${guard.note}`);
+  } else {
+    spots[cur] = guard.spot;
+  }
+  autoRollGuard.set(p.positionId, guard);
+  return guard;
 }
 
 function setAutoRollStatus(p, state, text) {
@@ -1543,7 +1644,9 @@ function renderAutoRollStatus() {
   const map = loadPositions();
   document.querySelectorAll("[data-autoroll-status]").forEach((el) => {
     const id = el.getAttribute("data-autoroll-status");
-    const line = autoRollStatusLine(map[id], autoRollStatus.get(id));
+    const line = hasLegacyDisputeLeaf(map[id])
+      ? null
+      : autoRollStatusLine(map[id], autoRollStatus.get(id), Date.now(), autoRollGuard.get(id));
     el.textContent = line ? line.text : "";
     el.className = `autoroll-status ${line ? line.tone : ""}`;
     el.hidden = !line;
@@ -1554,7 +1657,7 @@ async function checkAutoRolls() {
   if (!appWallet || autoRollInFlight) return;
   const nowMs = Date.now();
   const nowSecs = Math.floor(nowMs / 1000);
-  const due = Object.values(loadPositions()).filter((p) => isAutoRollDue(p, nowSecs));
+  const due = Object.values(loadPositions()).filter((p) => isAutoRollDue(p, nowSecs) && !hasLegacyDisputeLeaf(p));
   renderAutoRollStatus();
   if (due.length === 0) return;
 
@@ -1568,7 +1671,9 @@ async function checkAutoRolls() {
       const pCur = (p.currency || "USD").toUpperCase();
       try {
         setAutoRollStatus(p, "rolling", "");
-        const liveSpot = await fetchFreshSpot(pCur, p);
+        const guard = await fetchGuardSpot(pCur, p);
+        renderAutoRollStatus();
+        const liveSpot = guard.spot;
         const target = positionLpTarget(p);
         const rolled = await appWallet.rollPosition(p.positionId, {
           expectedSpot: liveSpot,
@@ -1583,7 +1688,10 @@ async function checkAutoRolls() {
           paidSats > 0
             ? `+${paidSats.toLocaleString()} sats yield paid to Available BTC`
             : `term reset (${fmtTimeLeft(autoRollTermSecs(p))})`;
-        showToast(`↻ Auto-rolled #${rolled.rollCount} at ${rSym}${rolled.openSpotUsd} — ${detail}`, 6000);
+        showToast(
+          `↻ Auto-rolled #${rolled.rollCount} at ${rSym}${rolled.openSpotUsd} — ${detail}${guard.selfOnly ? ` (${guard.note})` : ""}`,
+          6000
+        );
         await refresh();
       } catch (err) {
         const reason = describeAutoRollError(err);
@@ -1770,10 +1878,9 @@ async function fetchQuoteUi() {
     const spreadPct = (spreadBps / 100).toFixed(2);
     const notionalFiat = Number(q.notional ?? q.notionalUsd ?? (side === "long" ? (amt / 1e8) * sp : amt));
     const termSecs = Number(q.termSecs ?? selected.termSecs ?? 86400);
-    const termDays = Math.max(1, Math.round(termSecs / 86400));
-    const termLabel = termDays === 1 ? "1d" : `${termDays}d`;
+    const termLabel = fmtTermShort(termSecs);
     const entryFeeFiat = notionalFiat * (spreadBps / 10_000);
-    const termYieldFiat = notionalFiat * (funding / 10_000) * termDays;
+    const termYieldFiat = notionalFiat * (funding / 10_000) * (termSecs / 86_400);
     const netTermFiat = termYieldFiat - entryFeeFiat;
     const fmtSmallFiat = (v) => {
       const abs = Math.abs(v);
@@ -2376,7 +2483,7 @@ async function boot() {
     fetchQuoteUi();
   };
   $("ob-auto-btn").onclick = () => {
-    manualLpPubkey = null;
+    manualOfferKey = null;
     renderOrderBook();
     refresh();
     fetchQuoteUi();
@@ -2410,7 +2517,7 @@ async function boot() {
   document.querySelectorAll(".cur-btn").forEach((btn) => {
     btn.onclick = () => {
       activeCurrency = btn.getAttribute("data-cur") || "USD";
-      manualLpPubkey = null;
+      manualOfferKey = null;
       applyCurrencyUi();
       renderOrderBook();
       tickInterest();
