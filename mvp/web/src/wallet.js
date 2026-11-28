@@ -48,6 +48,7 @@ import {
   nip44Decrypt,
 } from "./nip17.js";
 import { computeKormirOutcomePoint } from "./nostracle-client.js";
+import { mergeRecoveredLpPositions } from "./position-sync.js";
 import {
   buildDisputeWitnessSigs,
   hasLegacyDisputeLeaf,
@@ -1520,6 +1521,26 @@ export class BrowserP2pFiatWallet {
     return this.callLp(target, "health");
   }
 
+  /**
+   * Recover any finalized open positions held by `target` LP for this wallet's `userKey.pubHex`
+   * that are missing from `localStorage` (e.g. after a missed NIP-17 `open/finalize` reply).
+   */
+  async syncPositionsFromLp(target = getLpUrl()) {
+    const t = this._normalizeTarget(target);
+    if (!t.url && !t.pubkey) return { recoveredCount: 0, recoveredIds: [] };
+    const res = await this.callLp(t, "positions", {
+      userPubHex: this.userKey.pubHex,
+      status: "open",
+    });
+    const { merged, recoveredCount, recoveredIds } = mergeRecoveredLpPositions(
+      loadPositions(),
+      res?.positions || [],
+      { userPubHex: this.userKey.pubHex, target: t }
+    );
+    if (recoveredCount > 0) savePositions(merged);
+    return { recoveredCount, recoveredIds };
+  }
+
   async requestQuote(notional, target = getLpUrl(), currency = "USD", side = "short") {
     const t = this._normalizeTarget(target);
     return this.callLp(t, "quote", {
@@ -1610,13 +1631,37 @@ export class BrowserP2pFiatWallet {
       preSignedRefundSigHex = hex.encode(schnorrSign(this.userKey, refHash));
     }
 
-    const pos = await this.callLp(t, "open/finalize", {
-      positionId: prop.positionId,
-      signedArkTxB64: base64.encode(arkTx.toPSBT()),
-      signedUserCkB64: base64.encode(userCk.toPSBT()),
-      userManifestSigHex: preSignedManifest?.user_manifest_sig_hex || undefined,
-      userRefundSigHex: preSignedRefundSigHex || undefined,
-    });
+    let pos;
+    try {
+      pos = await this.callLp(t, "open/finalize", {
+        positionId: prop.positionId,
+        signedArkTxB64: base64.encode(arkTx.toPSBT()),
+        signedUserCkB64: base64.encode(userCk.toPSBT()),
+        userManifestSigHex: preSignedManifest?.user_manifest_sig_hex || undefined,
+        userRefundSigHex: preSignedRefundSigHex || undefined,
+      });
+    } catch (finErr) {
+      // If `open/finalize` succeeded on Arkade but the NIP-17 reply timed out,
+      // check whether the LP already recorded this finalized position so the user never loses it.
+      try {
+        const check = await this.callLp(t, "positions", {
+          userPubHex: this.userKey.pubHex,
+          positionId: prop.positionId,
+        });
+        const recovered = (check?.positions || []).find(
+          (p) =>
+            p?.positionId === prop.positionId &&
+            String(p?.userPubHex || "").toLowerCase() === this.userKey.pubHex.toLowerCase()
+        );
+        if (recovered) {
+          pos = recovered;
+        } else {
+          throw finErr;
+        }
+      } catch {
+        throw finErr;
+      }
+    }
     pos.lpUrl = t.url || "";
     pos.lpPubkey = t.pubkey || q.lpPubkey || pos.lpPubHex || null;
     pos.lpName = lpName || t.lpName || q.lpName || "LP";

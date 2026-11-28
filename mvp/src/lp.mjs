@@ -151,6 +151,40 @@ export function parseOfferTiers(
   return tiers;
 }
 
+/**
+ * Filter stored LP positions for the `positions` RPC so NIP-17 callers can query
+ * only their own positions (staying well within NIP-44's 65 KB plaintext limit).
+ */
+export function filterPositionsQuery(positions, query = {}) {
+  let list = Array.isArray(positions) ? [...positions] : [];
+  const reqUser = String(query?.userPubHex || "").trim().toLowerCase();
+  const reqId = String(query?.positionId || "").trim();
+  const reqTxid = String(query?.vtxoTxid || "").trim().toLowerCase();
+  const reqStatus = String(query?.status || "").trim().toLowerCase();
+  if (reqUser) {
+    list = list.filter((p) => String(p?.userPubHex || "").toLowerCase() === reqUser);
+  }
+  if (reqId) {
+    list = list.filter((p) => p?.positionId === reqId);
+  }
+  if (reqTxid) {
+    list = list.filter(
+      (p) =>
+        String(p?.vtxoTxid || "").toLowerCase() === reqTxid ||
+        String(p?.prevVtxoTxid || "").toLowerCase() === reqTxid
+    );
+  }
+  if (reqStatus) {
+    list = list.filter((p) => String(p?.status || "").toLowerCase() === reqStatus);
+  }
+  list.sort((a, b) => Number(b?.openedAt || 0) - Number(a?.openedAt || 0));
+  const limit = Number(query?.limit || 0);
+  if (Number.isInteger(limit) && limit > 0) {
+    list = list.slice(0, limit);
+  }
+  return list;
+}
+
 export async function createLpServer({
   port = 3456,
   enableHttp = true,
@@ -376,7 +410,7 @@ export async function createLpServer({
     }
 
     if (method === "positions") {
-      return { positions: Object.values(store.read().positions) };
+      return { positions: filterPositionsQuery(Object.values(store.read().positions), body) };
     }
 
     if (method === "quote") {
@@ -658,6 +692,7 @@ export async function createLpServer({
         openSpotPrice: pend.quote.spotPrice ?? pend.quote.spotUsd,
         openSpotUsd: pend.quote.spotPrice ?? pend.quote.spotUsd,
         spreadBps: pend.quote.spreadBps,
+        termSecs: Number(pend.quote.termSecs || tiers[0].termSecs),
         fundingRateBpsPerDay: pend.quote.fundingRateBpsPerDay,
         oracleQuorum: pend.quote.oracleQuorum || oracleQuorum,
         userCollateralSats: pend.quote.userCollateralSats,
