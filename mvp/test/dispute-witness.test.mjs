@@ -58,6 +58,18 @@ assert.equal(legacyOut.kind, "checksigadd");
 assert.equal(legacyOut.sigs.length, 3);
 assert.equal(legacyOut.sigs[1].length, 0, "non-signer slot is empty");
 
+// 4b. Scripts that only look like a dispute leaf are refused, not guessed at.
+const csv = (1 << 22) | 4;
+const pk = (i) => keys[i].pubXOnly;
+for (const [name, ops] of [
+  ["stray 32-byte push", [csv, "CHECKSEQUENCEVERIFY", "DROP", new Uint8Array(32).fill(9), "DROP", pk(0), "CHECKSIGVERIFY", pk(1), "CHECKSIG"]],
+  ["hashlock instead of key", [csv, "CHECKSEQUENCEVERIFY", "DROP", "SHA256", new Uint8Array(32).fill(9), "EQUALVERIFY", pk(0), "CHECKSIGVERIFY", pk(1), "CHECKSIG"]],
+  ["trailing ops", [csv, "CHECKSEQUENCEVERIFY", "DROP", pk(0), "CHECKSIGVERIFY", pk(1), "CHECKSIG", "VERIFY"]],
+  ["no CSV prefix", [pk(0), "CHECKSIGVERIFY", pk(1), "CHECKSIG"]],
+]) {
+  assert.throws(() => parseDisputeLeaf(btc.Script.encode(ops)), /Unrecognised dispute leaf/, name);
+}
+
 // 5. Same witness as the Node builder for a real 3-of-5 contract's manifest (primary) leaf.
 const oracles = Array.from({ length: 5 }, () => randomEvenKey());
 const quorum = { threshold: 3, oracles: oracles.map((o) => ({ pubkey: o.pubHex })) };

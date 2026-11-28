@@ -11,20 +11,38 @@ import { hex } from "@scure/base";
  * can contain the byte 0xba (OP_CHECKSIGADD), which made byte search misclassify
  * about a third of 3-key CSVMultisig leaves.
  */
+const SIG_OPS = new Set(["CHECKSIG", "CHECKSIGVERIFY", "CHECKSIGADD"]);
+
 export function parseDisputeLeaf(disputeScript) {
   const ops = btc.Script.decode(disputeScript);
-  const pubkeysHex = ops
-    .filter((op) => op instanceof Uint8Array && op.length === 32)
-    .map((op) => hex.encode(op));
-  if (pubkeysHex.length < 2) throw new Error("Dispute leaf has fewer than 2 oracle keys");
-  const kind = ops.includes("CHECKSIGADD") ? "checksigadd" : "csvmultisig";
-  if (kind === "csvmultisig") {
-    const checks = ops.filter((op) => op === "CHECKSIGVERIFY" || op === "CHECKSIG");
-    if (checks.length !== pubkeysHex.length || ops[ops.length - 1] !== "CHECKSIG") {
-      throw new Error("Unrecognised dispute leaf script");
+  const unrecognised = () => new Error("Unrecognised dispute leaf script");
+  if (ops[1] !== "CHECKSEQUENCEVERIFY" || ops[2] !== "DROP") throw unrecognised();
+  // Every 32-byte push must be a key consumed by the signature opcode right after it,
+  // and every signature opcode must consume such a key.
+  const pubkeysHex = [];
+  const sigOps = [];
+  for (let i = 3; i < ops.length; i++) {
+    const op = ops[i];
+    if (op instanceof Uint8Array && op.length === 32) {
+      if (!SIG_OPS.has(ops[i + 1])) throw unrecognised();
+      pubkeysHex.push(hex.encode(op));
+      sigOps.push(ops[++i]);
+    } else if (SIG_OPS.has(op)) {
+      throw unrecognised();
     }
   }
-  return { kind, pubkeysHex };
+  if (pubkeysHex.length < 2) throw new Error("Dispute leaf has fewer than 2 oracle keys");
+  const last = ops.length - 1;
+  if (sigOps.includes("CHECKSIGADD")) {
+    // <pk_1> CHECKSIG <pk_i> CHECKSIGADD ... <k> GREATERTHANOREQUAL
+    if (sigOps[0] !== "CHECKSIG" || sigOps.slice(1).some((op) => op !== "CHECKSIGADD")) throw unrecognised();
+    if (ops[last] !== "GREATERTHANOREQUAL" || last !== 3 + 2 * pubkeysHex.length + 1) throw unrecognised();
+    return { kind: "checksigadd", pubkeysHex };
+  }
+  // <pk_1> CHECKSIGVERIFY ... <pk_k> CHECKSIG, nothing after
+  if (sigOps.slice(0, -1).some((op) => op !== "CHECKSIGVERIFY") || sigOps.at(-1) !== "CHECKSIG") throw unrecognised();
+  if (last !== 3 + 2 * pubkeysHex.length - 1) throw unrecognised();
+  return { kind: "csvmultisig", pubkeysHex };
 }
 
 /**
