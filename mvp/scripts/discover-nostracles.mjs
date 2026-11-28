@@ -4,12 +4,9 @@
  *   node mvp/scripts/discover-nostracles.mjs
  */
 import { bech32, hex } from "@scure/base";
+import { DEFAULT_RELAYS } from "../src/offerbook.mjs";
 
-const RELAYS = [
-  "wss://relay.damus.io",
-  "wss://nos.lol",
-  "wss://relay.primal.net",
-];
+const RELAYS = DEFAULT_RELAYS;
 
 function hexToNpub(pubHex) {
   return bech32.encode("npub", bech32.toWords(hex.decode(pubHex)));

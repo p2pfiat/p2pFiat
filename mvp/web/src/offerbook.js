@@ -12,11 +12,25 @@ import { hex, bech32 } from "@scure/base";
 export const OFFER_KIND = 38384;
 export const DEFAULT_RELAYS = [
   "wss://relay.primal.net",
-  "wss://nostr.oxtr.dev",
+  "wss://relay.snort.social",
+  "wss://relay.noswhere.com",
+  "wss://relay.satlantis.io",
+  "wss://relay.nostr.net",
+];
+// Retired default relays kept for read-fallback (wallet seed backups & profiles)
+// and automatic localStorage migration.
+export const LEGACY_RELAYS = [
   "wss://relay.damus.io",
   "wss://nos.lol",
+  "wss://nostr.oxtr.dev",
   "wss://nostr.bitcoiner.social",
 ];
+
+/** Return `relays` (or `DEFAULT_RELAYS`) unioned with retired `LEGACY_RELAYS` for read-fallback. */
+export function withLegacyReadRelays(relays) {
+  const base = Array.isArray(relays) && relays.length > 0 ? relays : DEFAULT_RELAYS;
+  return [...new Set([...base, ...LEGACY_RELAYS])];
+}
 
 const enc = new TextEncoder();
 

@@ -14,7 +14,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { extract as hkdfExtract, expand as hkdfExpand } from "@noble/hashes/hkdf.js";
 import { hex, bech32 } from "@scure/base";
-import { computeEventId, DEFAULT_RELAYS, pubkeyHexToNpub, publishOfferEvent } from "./offerbook.js";
+import { computeEventId, DEFAULT_RELAYS, withLegacyReadRelays, pubkeyHexToNpub, publishOfferEvent } from "./offerbook.js";
 import { getConversationKey, nip44Decrypt } from "./nip17.js";
 
 const LS_NOSTR_PRIVKEY = "p2pfiat_nostr_privkey_hex";
@@ -163,10 +163,10 @@ export function getActiveIdentity() {
 
 /**
  * Fetch the latest NIP-44 encrypted portable wallet seed (`kind: 30078`, `d: "p2pfiat-wallet-seed-v1"`)
- * for `pubkeyHex` from Nostr relays.
+ * for `pubkeyHex` from Nostr relays (including retired legacy relays for migration reads).
  */
 export async function fetchEncryptedWalletSeed(pubkeyHex, relays = DEFAULT_RELAYS, timeoutMs = 4000) {
-  const list = Array.isArray(relays) && relays.length > 0 ? relays : DEFAULT_RELAYS;
+  const list = withLegacyReadRelays(relays);
   let latest = null;
   await Promise.all(
     list.map(
@@ -256,6 +256,11 @@ export async function loginWithNip07Extension(relays = DEFAULT_RELAYS) {
       throw new Error("Encrypted Nostr wallet seed is malformed");
     }
     walletSeedHex = parsed.walletSeedHex.toLowerCase();
+    // Best-effort republish the already-signed seed backup event to the current relay set
+    // so backups fetched from retired legacy relays self-migrate to the new defaults.
+    if (existing.id && existing.sig) {
+      publishOfferEvent(existing, relays).catch(() => {});
+    }
   } else {
     walletSeedHex = generateRandomNostrKey().privHex;
     createdNew = true;
@@ -314,6 +319,11 @@ export async function tryDecryptCloudWalletSeedWithNsec(nsecAccount, relays = DE
     if (parsed?.walletSeedHex && /^[0-9a-f]{64}$/i.test(parsed.walletSeedHex)) {
       const seed = parsed.walletSeedHex.toLowerCase();
       localStorage.setItem(LS_WALLET_SEED, seed);
+      // Best-effort republish the already-signed seed backup event to the current relay set
+      // so backups fetched from retired legacy relays self-migrate to the new defaults.
+      if (existing.id && existing.sig) {
+        publishOfferEvent(existing, relays).catch(() => {});
+      }
       return seed;
     }
   } catch {}
@@ -412,7 +422,7 @@ export function resetNostrAccount() {
  * Fetch the latest NIP-01 `kind: 0` metadata profile for `pubkeyHex` across relays.
  */
 export async function fetchNostrProfile(pubkeyHex, relays = DEFAULT_RELAYS, timeoutMs = 3500) {
-  const list = Array.isArray(relays) && relays.length > 0 ? relays : DEFAULT_RELAYS;
+  const list = withLegacyReadRelays(relays);
   let latestEvent = null;
 
   await Promise.all(

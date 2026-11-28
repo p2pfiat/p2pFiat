@@ -11,14 +11,9 @@
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bech32, hex } from "@scure/base";
+import { DEFAULT_RELAYS } from "../src/offerbook.mjs";
 
-const RELAYS = [
-  "wss://relay.damus.io",
-  "wss://nos.lol",
-  "wss://relay.primal.net",
-  "wss://nostr.oxtr.dev",
-  "wss://nostr.bitcoiner.social",
-];
+const RELAYS = DEFAULT_RELAYS;
 const LIST_D_TAG = "p2pfiat-watchtowers";
 const enc = new TextEncoder();
 

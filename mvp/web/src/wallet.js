@@ -32,6 +32,8 @@ import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 
 import {
   DEFAULT_RELAYS,
+  LEGACY_RELAYS,
+  withLegacyReadRelays,
   computeEventId,
   buildQuorumForPreset,
   buildP2pOrderEvent,
@@ -344,13 +346,11 @@ export function getNostrRelays() {
     .map((s) => s.trim())
     .filter((s) => s.startsWith("wss://") || s.startsWith("ws://"));
   if (parsed.length === 0) return [...DEFAULT_RELAYS];
-  // Auto-upgrade legacy saved relay lists that predate wss://relay.primal.net
-  // so existing browser sessions never get stuck on slow/offline relays while private windows work.
-  if (
-    !parsed.includes("wss://relay.primal.net") &&
-    parsed.every((r) => ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.snort.social", "wss://nostr.bitcoiner.social"].includes(r))
-  ) {
-    return ["wss://relay.primal.net", "wss://nostr.oxtr.dev", ...parsed];
+  // Auto-upgrade any saved list containing retired legacy relays (damus/nos.lol/oxtr/bitcoiner.social)
+  // to the verified DEFAULT_RELAYS while preserving any custom user-added relays.
+  const legacySet = new Set(LEGACY_RELAYS);
+  if (parsed.some((r) => legacySet.has(r))) {
+    return [...new Set([...DEFAULT_RELAYS, ...parsed.filter((r) => !legacySet.has(r))])];
   }
   return parsed;
 }
@@ -521,9 +521,10 @@ export async function restorePositionsFromNostr(timeoutMs = 4000) {
   const acct = identity?.rpcKey;
   if (!acct?.privHex || !acct?.pubHex) return { restoredCount: 0, totalCount: 0 };
   const relays = getNostrRelays();
+  const readRelays = withLegacyReadRelays(relays);
   let latest = null;
   await Promise.all(
-    relays.map(
+    readRelays.map(
       (relayUrl) =>
         new Promise((resolve) => {
           let ws;
@@ -575,6 +576,11 @@ export async function restorePositionsFromNostr(timeoutMs = 4000) {
 
   const convKey = getConversationKey(hex.decode(acct.privHex), acct.pubHex);
   const parsed = JSON.parse(nip44Decrypt(latest.content, convKey));
+  // Best-effort republish the already-signed positions backup event to the current relay set
+  // so backups fetched from retired legacy relays self-migrate to the new defaults.
+  if (latest.id && latest.sig) {
+    publishOfferEvent(latest, relays).catch(() => {});
+  }
   const remoteMap = parsed?.positions || {};
   const localMap = loadPositions();
   let restoredCount = 0;
