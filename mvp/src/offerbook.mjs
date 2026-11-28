@@ -33,14 +33,18 @@ export function npubToPubkeyHex(npub) {
 }
 
 /**
- * Default 2-of-3 Mutinynet Nostracle oracle quorum (override via NOSTRACLE_NPUBS env).
- * Keys are deterministically derived x-only pubkeys for local/Mutinynet testing.
+ * Default 2-of-3 Nostracle quorum for an LP that does not set NOSTRACLE_NPUBS: the three
+ * live Nostracles of the curated directory (NIP-51 `p2pfiat-nostracles`), the same ones
+ * the web wallet falls back to.
+ *
+ * Never put small-scalar test keys (1·G, 2·G, 3·G, …) here: their private keys are public,
+ * so anyone could sign a dispute payout for every position quoted with them.
  */
 export const DEFAULT_NOSTRACLE_QUORUM = (() => {
   const pubkeys = [
-    { name: "Nostracle-1", pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" },
-    { name: "Nostracle-2", pubkey: "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5" },
-    { name: "Nostracle-3", pubkey: "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9" },
+    { name: "Nostracle-1", pubkey: "32bf77878296c74d4ec5740a572b748c0a758d875aaf4429ccd268c1339b9e2a" },
+    { name: "Nostracle-2", pubkey: "4d6247e2c75922d662be9e97c55f775f42735d32d954366f4ac16d1e13e83bee" },
+    { name: "Nostracle-3", pubkey: "550a7fa2d48c5a5937f4b164d3377f7646b4617df3dc812d2bf9634e3dba2f68" },
   ];
   return {
     threshold: 2,
