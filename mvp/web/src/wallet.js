@@ -46,7 +46,7 @@ import {
   nip44Decrypt,
 } from "./nip17.js";
 import { computeKormirOutcomePoint } from "./nostracle-client.js";
-import { buildDisputeWitnessSigs } from "./dispute-witness.js";
+import { buildDisputeWitnessSigs, hasLegacyDisputeLeaf, LEGACY_POSITION_TEXT } from "./dispute-witness.js";
 import {
   getOrCreateNostrAccount,
   getActiveIdentity,
@@ -1669,6 +1669,7 @@ export class BrowserP2pFiatWallet {
     const map = loadPositions();
     const pos = map[positionId];
     if (!pos) throw new Error("Unknown position");
+    if (hasLegacyDisputeLeaf(pos)) throw new Error(LEGACY_POSITION_TEXT);
     const target = {
       url: pos.lpUrl || (pos.lpTransport === "nostr-nip17" ? "" : getLpUrl()),
       pubkey: pos.lpPubkey || pos.lpPubHex || null,
@@ -1790,6 +1791,7 @@ export class BrowserP2pFiatWallet {
     const map = loadPositions();
     const pos = map[positionId];
     if (!pos) throw new Error("Unknown position");
+    if (hasLegacyDisputeLeaf(pos)) throw new Error(LEGACY_POSITION_TEXT);
     const target = {
       url: pos.lpUrl || (pos.lpTransport === "nostr-nip17" ? "" : getLpUrl()),
       pubkey: pos.lpPubkey || pos.lpPubHex || null,

@@ -53,6 +53,7 @@ import {
   fetchCuratedNostracleList,
   fetchCuratedWatchtowerList,
 } from "./nostracle-client.js";
+import { hasLegacyDisputeLeaf, LEGACY_POSITION_TEXT } from "./dispute-witness.js";
 import {
   fetchNostrProfile,
   publishNostrProfile,
@@ -984,18 +985,23 @@ function renderPositions() {
               : ""
           }
           ${
+            isOpen && hasLegacyDisputeLeaf(p)
+              ? `<div class="autoroll-status warn">⚠ ${LEGACY_POSITION_TEXT}</div>`
+              : ""
+          }
+          ${
             isOpen
               ? `<div class="action-row">
-                   <button class="btn ${rollHint?.urgent || rollHint?.good ? "primary" : "secondary"} small" data-roll="${p.positionId}">Roll Position</button>
-                   <button class="btn danger small" data-close="${p.positionId}">Close at Spot</button>
+                   <button class="btn ${rollHint?.urgent || rollHint?.good ? "primary" : "secondary"} small" data-roll="${p.positionId}" ${hasLegacyDisputeLeaf(p) ? "disabled" : ""}>Roll Position</button>
+                   <button class="btn danger small" data-close="${p.positionId}" ${hasLegacyDisputeLeaf(p) ? "disabled" : ""}>Close at Spot</button>
                  </div>
                  <div class="wt-footer">
                    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
                      ${wtStatusHtml}
-                     <label class="autoroll-toggle" title="Automatically roll when 50% of the contract term has elapsed (while wallet is open, with ±2% spot verification)">
+                     ${hasLegacyDisputeLeaf(p) ? "" : `<label class="autoroll-toggle" title="Automatically roll when 50% of the contract term has elapsed (while wallet is open, with ±2% spot verification)">
                        <input type="checkbox" data-autoroll="${p.positionId}" ${p.autoRoll ? "checked" : ""} />
                        <span>Auto-Roll (50%)</span>
-                     </label>
+                     </label>`}
                    </div>
                    <div style="display:flex;gap:10px;align-items:center">
                      ${
@@ -1543,7 +1549,7 @@ function renderAutoRollStatus() {
   const map = loadPositions();
   document.querySelectorAll("[data-autoroll-status]").forEach((el) => {
     const id = el.getAttribute("data-autoroll-status");
-    const line = autoRollStatusLine(map[id], autoRollStatus.get(id));
+    const line = hasLegacyDisputeLeaf(map[id]) ? null : autoRollStatusLine(map[id], autoRollStatus.get(id));
     el.textContent = line ? line.text : "";
     el.className = `autoroll-status ${line ? line.tone : ""}`;
     el.hidden = !line;
@@ -1554,7 +1560,7 @@ async function checkAutoRolls() {
   if (!appWallet || autoRollInFlight) return;
   const nowMs = Date.now();
   const nowSecs = Math.floor(nowMs / 1000);
-  const due = Object.values(loadPositions()).filter((p) => isAutoRollDue(p, nowSecs));
+  const due = Object.values(loadPositions()).filter((p) => isAutoRollDue(p, nowSecs) && !hasLegacyDisputeLeaf(p));
   renderAutoRollStatus();
   if (due.length === 0) return;
 

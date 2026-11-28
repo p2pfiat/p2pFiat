@@ -72,3 +72,23 @@ export function buildDisputeWitnessSigs(disputeScript, sigsByPubkeyHex) {
   }
   return { kind, pubkeysHex, sigs: stack };
 }
+
+/**
+ * Positions opened before the switch to arkd-native `CSVMultisigTapscript` dispute leaves
+ * carry a legacy `OP_CHECKSIGADD` leaf. arkd cannot parse such a taptree, so it rejects every
+ * offchain spend of the VTXO (roll, close) with "failed to parse taptree field". Those
+ * positions can only exit on L1.
+ */
+export const LEGACY_POSITION_TEXT =
+  "Opened with the old dispute-script format (OP_CHECKSIGADD), which the Ark server cannot parse: " +
+  "this position cannot be rolled or closed through Ark. It can only be exited on L1 (unilateral exit).";
+
+/** True when the position's dispute leaf is the legacy `OP_CHECKSIGADD` form. */
+export function hasLegacyDisputeLeaf(pos) {
+  if (!pos?.disputeScriptHex) return false;
+  try {
+    return parseDisputeLeaf(hex.decode(pos.disputeScriptHex)).kind === "checksigadd";
+  } catch {
+    return false;
+  }
+}
