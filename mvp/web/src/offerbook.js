@@ -308,15 +308,52 @@ function weightedMedian(items) {
   return sorted[sorted.length - 1].value;
 }
 
+/**
+ * Status text while no LP can be selected. "Scanning" only until a relay has answered; after
+ * that, say plainly that there is no live offer and when the most recent LP was last seen.
+ */
+export function noLiveOfferText({ answered = false, lastSeen = null, nowSecs = Math.floor(Date.now() / 1000) } = {}) {
+  if (!answered) return "Scanning Nostr relays…";
+  if (!lastSeen) return "No LP offers on Nostr relays";
+  const mins = Math.max(0, Math.round((nowSecs - Number(lastSeen.createdAt)) / 60));
+  const ago = mins < 1 ? "just now" : mins < 120 ? `${mins} min ago` : `${Math.round(mins / 60)} h ago`;
+  return `No live LP offers on Nostr relays — ${lastSeen.lpName || "last LP"} last seen ${ago}`;
+}
+
 export class LocalOrderBook {
   constructor() {
     this.offers = new Map();
     this.verifications = new Map();
+    // Every validly signed offer seen, expired or not: { lpName, createdAt } per LP pubkey.
+    this.lastSeen = new Map();
+    // True once at least one relay finished sending its stored offers (EOSE).
+    this.relaysAnswered = false;
+  }
+
+  /** The most recently seen LP (from any signed offer, even an expired one), or null. */
+  getLastSeenLp() {
+    let best = null;
+    for (const v of this.lastSeen.values()) if (!best || v.createdAt > best.createdAt) best = v;
+    return best;
+  }
+
+  _noteSeen(offer) {
+    if (!offer?.pubkey) return;
+    const prev = this.lastSeen.get(offer.pubkey);
+    if (!prev || offer.createdAt > prev.createdAt) {
+      this.lastSeen.set(offer.pubkey, { lpName: offer.lpName || offer.pubkey.slice(0, 8), createdAt: offer.createdAt });
+    }
   }
 
   ingest(event, nowSecs = Math.floor(Date.now() / 1000)) {
     const offer = verifyOfferEvent(event, nowSecs);
-    if (!offer) return false;
+    if (!offer) {
+      // Expired offers are not tradeable, but still tell when that LP was last online.
+      const stale = verifyOfferEvent(event, 0);
+      if (stale && stale.makerType !== "p2p") this._noteSeen(stale);
+      return false;
+    }
+    if (offer.makerType !== "p2p") this._noteSeen(offer);
     const key = offer.offerKey || `${offer.pubkey}:${offer.dTag || offer.pair}`;
     const prev = this.offers.get(key);
     if (prev) {
@@ -623,6 +660,10 @@ export class LocalOrderBook {
             } else if (frame[0] === "EOSE") {
               statuses.set(relayUrl, "live");
               emitStatus();
+              if (!this.relaysAnswered) {
+                this.relaysAnswered = true;
+                onUpdate?.(this.getOffers(), this.getOrderbookPrice());
+              }
             }
           } catch {}
         };
