@@ -179,11 +179,15 @@ export function verifyOfferEvent(event, nowSecs = Math.floor(Date.now() / 1000))
     const currency = content.currency || (pair.includes("-") ? pair.split("-")[1] : "USD");
     const bidVal = Number(content.bidPrice ?? content.bidUsd ?? spotVal);
     const askVal = Number(content.askPrice ?? content.askUsd ?? spotVal);
+    const dTag = event.tags.find((t) => Array.isArray(t) && t[0] === "d")?.[1] || "";
+    const offerKey = `${event.pubkey}:${dTag || pair}`;
 
     return {
       ...content,
       pair,
       currency,
+      dTag,
+      offerKey,
       spotPrice: spotVal,
       spotUsd: spotVal,
       bidPrice: bidVal,
@@ -283,7 +287,7 @@ export class LocalOrderBook {
   ingest(event, nowSecs = Math.floor(Date.now() / 1000)) {
     const offer = verifyOfferEvent(event, nowSecs);
     if (!offer) return false;
-    const key = `${offer.pubkey}:${offer.pair}`;
+    const key = offer.offerKey || `${offer.pubkey}:${offer.dTag || offer.pair}`;
     const prev = this.offers.get(key);
     if (prev) {
       if (offer.createdAt < prev.createdAt) return false;
@@ -444,7 +448,15 @@ export class LocalOrderBook {
   getOrderbookPrice({ pair = null, nowSecs = Math.floor(Date.now() / 1000), verifiedOnly = false } = {}) {
     // Backwards compatibility if caller passes a number directly: getOrderbookPrice(baseTime)
     const ts = typeof arguments[0] === "number" ? arguments[0] : nowSecs;
-    const offers = this.getOffers({ pair, nowSecs: ts });
+    // Deduplicate by LP pubkey so an LP publishing multiple term tiers never double-counts
+    // its verified liquidity or oracle weight.
+    const seenPubs = new Set();
+    const offers = [];
+    for (const o of this.getOffers({ pair, nowSecs: ts })) {
+      if (seenPubs.has(o.pubkey)) continue;
+      seenPubs.add(o.pubkey);
+      offers.push(o);
+    }
     if (offers.length === 0) {
       return {
         medianMidUsd: null,
