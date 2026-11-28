@@ -22,6 +22,7 @@ import crypto from "node:crypto";
 import {
   Wallet,
   SingleKey,
+  Ramps,
   RestArkProvider,
   RestIndexerProvider,
   EsploraProvider,
@@ -679,12 +680,7 @@ export async function createLpServer({
 
       const finalCk0 = combineTapscriptSigs(userCkSigned, serverCk0);
       const finalCk1 = combineTapscriptSigs(pend.lpCkSigned, serverCk1);
-      await arkProvider.finalizeTx(sub.arkTxid, [
-        base64.encode(finalCk0.toPSBT()),
-        base64.encode(finalCk1.toPSBT()),
-      ]);
 
-      pendingOpen.delete(body.positionId);
       const position = {
         positionId: body.positionId,
         status: "open",
@@ -719,9 +715,23 @@ export async function createLpServer({
         disputeManifest: pend.disputeManifest,
         exitDelaySecs: Number(exitDelaySecs),
       };
+      // Persist immediately after submitTx succeeds so a transient finalizeTx error can never
+      // orphan a live Arkade contract VTXO from lp.json.
       store.update((d) => {
         d.positions[position.positionId] = position;
       });
+      const ckPayloads = [base64.encode(finalCk0.toPSBT()), base64.encode(finalCk1.toPSBT())];
+      try {
+        await arkProvider.finalizeTx(sub.arkTxid, ckPayloads);
+      } catch (firstErr) {
+        console.warn(`  LP open retry  : finalizeTx failed (${firstErr?.message || firstErr}), retrying once...`);
+        await new Promise((r) => setTimeout(r, 1_000));
+        await arkProvider.finalizeTx(sub.arkTxid, ckPayloads);
+      }
+      pendingOpen.delete(body.positionId);
+      console.log(
+        `  LP open        : ${position.positionId} (${position.currency} ${position.notional}, ${position.totalCollateralSats} sats, vtxo ${sub.arkTxid.slice(0, 14)}…)`
+      );
       return position;
     }
 
@@ -1082,11 +1092,40 @@ export async function createLpServer({
     publishTimer.unref?.();
   }
 
+  // Automatic L1 boarding -> Arkade onboarding: whenever confirmed sats arrive at the LP's
+  // boarding address (e.g. funded via L1 Mutinynet/Bitcoin), onboard them into spendable Arkade VTXOs.
+  let onboarding = false;
+  async function onboardLpBoardingUtxos() {
+    if (onboarding || settling || pendingOpen.size > 0 || pendingRoll.size > 0 || pendingClose.size > 0) return;
+    onboarding = true;
+    try {
+      const bal = await wallet.getBalance();
+      const confirmed = Number(bal?.boarding?.confirmed || 0);
+      if (confirmed < 1_000) return;
+      console.log(`  LP onboard     : boarding ${confirmed.toLocaleString()} confirmed L1 sats into Arkade...`);
+      const txid = await new Ramps(wallet).onboard(info.fees);
+      console.log(`  LP onboard     : boarded ${confirmed.toLocaleString()} sats into Arkade (${txid || "ok"})`);
+      if (relays.length > 0) buildAndPublishOffer().catch(() => {});
+    } catch (err) {
+      console.warn(`  LP onboard     : skipped (${err?.message || err})`);
+    } finally {
+      onboarding = false;
+    }
+  }
+  const onboardTimer = setInterval(() => {
+    onboardLpBoardingUtxos().catch(() => {});
+  }, 5 * 60 * 1000);
+  onboardTimer.unref?.();
+  const bootOnboardTimer = setTimeout(() => {
+    onboardLpBoardingUtxos().catch(() => {});
+  }, 10_000);
+  bootOnboardTimer.unref?.();
+
   // Smart periodic VTXO compaction: only settle preconfirmed LP VTXOs when chain depth >= 6 hops
   // (avoids paying ~40 sat Arkade round fees on shallow 1-2 hop VTXOs while preventing deep chains).
   let settling = false;
   async function compactLpVtxos() {
-    if (settling || pendingOpen.size > 0 || pendingRoll.size > 0 || pendingClose.size > 0) return;
+    if (settling || onboarding || pendingOpen.size > 0 || pendingRoll.size > 0 || pendingClose.size > 0) return;
     settling = true;
     try {
       const vtxos = await wallet.getVtxos();
@@ -1132,10 +1171,13 @@ export async function createLpServer({
     nip17Connected,
     initialPublish,
     publishOffer: buildAndPublishOffer,
+    onboardLpBoardingUtxos,
     compactLpVtxos,
     handleRpc,
     close: async () => {
       if (publishTimer) clearInterval(publishTimer);
+      clearInterval(onboardTimer);
+      clearTimeout(bootOnboardTimer);
       clearInterval(settleTimer);
       clearTimeout(bootSettleTimer);
       nip17Peer?.close();
