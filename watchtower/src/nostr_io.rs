@@ -7,10 +7,11 @@
 
 use crate::bounty::WatchtowerRole;
 use crate::dispute::{
-    assemble_dispute_tx_witness, build_watchtower_dispute_tx, DEFAULT_DISPUTE_MINER_FEE_SATS,
+    assemble_dispute_tx_witness, build_watchtower_dispute_tx, dispute_leaves, leaf_request,
+    verified_signers, DEFAULT_DISPUTE_MINER_FEE_SATS,
 };
 use crate::service::{WatchtowerReply, WatchtowerRequest, WatchtowerService};
-use crate::storage::{DisputePackageSpec, WatchState};
+use crate::storage::WatchState;
 use anyhow::{anyhow, ensure, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -534,25 +535,28 @@ pub async fn fetch_live_spot_price(http: &reqwest::Client, currency: &str) -> Re
     Ok(prices[prices.len() / 2])
 }
 
-/// Request BIP-340 Schnorr signatures over NIP-17 RPC (`sign_dispute`) from all oracles
-/// in `dispute.oracle_quorum` and wait up to `timeout` for `>= threshold` replies.
+/// Request BIP-340 Schnorr signatures over NIP-17 RPC (`sign_dispute`) from `oracle_pubkeys`
+/// and wait up to `timeout` for `>= need` replies. `round` keeps request ids of a second round
+/// apart from the first.
 pub async fn request_dispute_signatures(
     client: &Client,
     own_pk: PublicKey,
-    dispute: &DisputePackageSpec,
+    oracle_pubkeys: &[String],
+    need: usize,
     rpc_params: &serde_json::Value,
     timeout: Duration,
+    round: &str,
 ) -> Result<HashMap<String, String>> {
-    let threshold = dispute.oracle_quorum.threshold;
+    let threshold = need;
     let mut req_ids: HashMap<String, String> = HashMap::new();
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    for (idx, oracle) in dispute.oracle_quorum.oracles.iter().enumerate() {
-        let Ok(pk) = PublicKey::parse(&oracle.pubkey) else { continue };
-        let req_id = format!("wt-dispute-{now_secs}-{idx}");
+    for (idx, oracle_pk) in oracle_pubkeys.iter().enumerate() {
+        let Ok(pk) = PublicKey::parse(oracle_pk) else { continue };
+        let req_id = format!("wt-dispute-{round}-{now_secs}-{idx}");
         let envelope = serde_json::json!({
             "type": "p2pfiat-rpc-req",
             "reqId": req_id,
@@ -564,7 +568,7 @@ pub async fn request_dispute_signatures(
             .await
             .is_ok()
         {
-            req_ids.insert(req_id, oracle.pubkey.trim().to_lowercase());
+            req_ids.insert(req_id, oracle_pk.trim().to_lowercase());
         }
     }
 
@@ -667,12 +671,32 @@ pub async fn resolve_pending_disputes(
             }
         };
 
-        let sigs = match request_dispute_signatures(
+        let threshold = dispute.oracle_quorum.threshold;
+        let leaves = dispute_leaves(dispute);
+        let primary = match leaf_request(&built, dispute, &leaves[0]) {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("{}: Leaf 2 dispute leaf invalid: {e:#}", c.package.id);
+                continue;
+            }
+        };
+
+        // Round 1: every quorum oracle is asked to sign the primary leaf. Each one that signs
+        // locks this exact tx, so it will sign the same tx for another committed leaf.
+        let all_oracles: Vec<String> = dispute
+            .oracle_quorum
+            .oracles
+            .iter()
+            .map(|o| o.pubkey.trim().to_lowercase())
+            .collect();
+        let round1 = match request_dispute_signatures(
             client,
             own_pk,
-            dispute,
-            &built.rpc_params,
+            &all_oracles,
+            threshold,
+            &primary.rpc_params,
             Duration::from_secs(20),
+            "r1",
         )
         .await
         {
@@ -682,8 +706,52 @@ pub async fn resolve_pending_disputes(
                 continue;
             }
         };
+        let signers = verified_signers(&primary, &round1);
+        let primary_ok = if primary.legacy_checksigadd {
+            primary.keys.iter().filter(|k| signers.contains_key(*k)).count() >= threshold
+        } else {
+            primary.keys.iter().all(|k| signers.contains_key(k))
+        };
 
-        match assemble_dispute_tx_witness(&built, dispute, &sigs) {
+        // Round 2 (manifest v2): a primary oracle did not sign but k others did; ask those k
+        // to sign the same tx for their own committed leaf.
+        let (leaf, sigs) = if primary_ok {
+            (primary, round1)
+        } else {
+            let fallback = leaves[1..].iter().find_map(|spec| {
+                let req = leaf_request(&built, dispute, spec).ok()?;
+                (!req.legacy_checksigadd && req.keys.iter().all(|k| signers.contains_key(k))).then_some(req)
+            });
+            match fallback {
+                Some(fb) => {
+                    log::info!(
+                        "{}: primary dispute leaf incomplete; asking {} for their committed leaf",
+                        c.package.id,
+                        fb.keys.iter().map(|k| &k[..8]).collect::<Vec<_>>().join(", ")
+                    );
+                    match request_dispute_signatures(
+                        client,
+                        own_pk,
+                        &fb.keys,
+                        fb.keys.len(),
+                        &fb.rpc_params,
+                        Duration::from_secs(20),
+                        "r2",
+                    )
+                    .await
+                    {
+                        Ok(s) => (fb, s),
+                        Err(e) => {
+                            log::warn!("{}: Leaf 2 round-2 sign_dispute failed: {e:#}", c.package.id);
+                            continue;
+                        }
+                    }
+                }
+                None => (primary, round1),
+            }
+        };
+
+        match assemble_dispute_tx_witness(&built, &leaf, threshold, &sigs) {
             Ok(final_tx) => {
                 log::info!(
                     "{}: assembled autonomous Leaf 2 dispute tx ({cur} @ {live_spot:.2}, user={} sats, lp={} sats, bounty={} sats)",

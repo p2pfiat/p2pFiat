@@ -65,11 +65,29 @@ pub struct DisputeManifest {
     pub user_pubkey_hex: String,
     pub lp_pubkey_hex: String,
     pub vtxo_pk_script_hex: String,
+    /// The primary dispute leaf. In a v1 manifest this is the only committed leaf.
     pub dispute_script_hex: String,
     pub user_payout_script_hex: String,
     pub lp_payout_script_hex: String,
     pub user_manifest_sig_hex: String,
     pub lp_manifest_sig_hex: String,
+    /// `1` (commits to `dispute_script_hex`) or `2` (commits to `dispute_leaf_hashes_hex`).
+    #[serde(default = "default_manifest_version")]
+    pub manifest_version: u8,
+    /// v2: BIP-341 leaf hashes of every committed k-of-n subset dispute leaf.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispute_leaf_hashes_hex: Vec<String>,
+}
+
+fn default_manifest_version() -> u8 {
+    1
+}
+
+/// One k-of-n subset dispute leaf and its control block in the contract taptree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DisputeLeafSpec {
+    pub script_hex: String,
+    pub control_block_hex: String,
 }
 
 fn default_dispute_side() -> String {
@@ -85,6 +103,10 @@ pub struct DisputePackageSpec {
     pub oracle_quorum: DisputeQuorum,
     #[serde(default)]
     pub manifest: Option<DisputeManifest>,
+    /// Every committed dispute leaf (manifest v2). Empty for older packages: then only
+    /// `script_hex` / `control_block_hex` is usable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leaves: Vec<DisputeLeafSpec>,
 }
 
 /// Everything a keyless watchtower receives at contract opening.
