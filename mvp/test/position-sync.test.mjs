@@ -5,7 +5,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { filterPositionsQuery } from "../src/lp.mjs";
-import { mergeRecoveredLpPositions } from "../web/src/position-sync.js";
+import {
+  mergeRecoveredLpPositions,
+  buildPendingPosition,
+  reconcilePendingPosition,
+} from "../web/src/position-sync.js";
 
 const USER_A = "aa".repeat(32);
 const USER_B = "bb".repeat(32);
@@ -114,4 +118,56 @@ test("mergeRecoveredLpPositions enforces account isolation, preserves local stat
   assert.equal(merged["pos-other-user"], undefined, "other user's position must never be merged");
   assert.equal(merged["pos-closed"], undefined);
   assert.equal(merged["pos-bad-tx"], undefined);
+});
+
+test("buildPendingPosition & reconcilePendingPosition promote confirmed Arkade VTXOs without LP and drop stale ones", () => {
+  const now = 1_800_000_000;
+  const pending = buildPendingPosition({
+    prop: {
+      positionId: "pos-pending-1",
+      openedAt: now,
+      lpPubHex: LP_PUB,
+      contractPkScriptHex: "5120" + "dd".repeat(32),
+      settleScriptHex: "aa",
+      exitScriptHex: "bb",
+    },
+    quote: {
+      side: "short",
+      currency: "USD",
+      pair: "BTC-USD",
+      notional: 4,
+      spotPrice: 60_000,
+      spreadBps: 1,
+      termSecs: 3600,
+      fundingRateBpsPerDay: 0.27,
+      userCollateralSats: 6730,
+      lpCollateralSats: 6730,
+      totalCollateralSats: 13460,
+    },
+    arkTxId: TX_2,
+    userPubHex: USER_A,
+    target: { url: "", pubkey: LP_PUB, lpName: "LP-Home", preferNip17: true },
+    nowSecs: now,
+  });
+
+  assert.equal(pending.status, "pending");
+  assert.equal(pending.vtxoTxid, TX_2);
+  assert.equal(pending.termSecs, 3600);
+
+  // 1. Not yet on Arkade and within window -> keep-pending
+  const wait = reconcilePendingPosition(pending, { vtxoExistsOnArkade: false, nowSecs: now + 60 });
+  assert.equal(wait.action, "keep-pending");
+  assert.equal(wait.position.status, "pending");
+
+  // 2. Confirmed on Arkade indexer -> promote to open (LP-independent!)
+  const promoted = reconcilePendingPosition(pending, { vtxoExistsOnArkade: true, nowSecs: now + 15 });
+  assert.equal(promoted.action, "promote");
+  assert.equal(promoted.position.status, "open");
+  assert.equal("pendingSince" in promoted.position, false);
+  assert.equal(promoted.position.vtxoTxid, TX_2);
+
+  // 3. Not on Arkade after >10 min -> drop stale pending record
+  const dropped = reconcilePendingPosition(pending, { vtxoExistsOnArkade: false, nowSecs: now + 601 });
+  assert.equal(dropped.action, "drop");
+  assert.equal(dropped.position, null);
 });

@@ -48,7 +48,11 @@ import {
   nip44Decrypt,
 } from "./nip17.js";
 import { computeKormirOutcomePoint } from "./nostracle-client.js";
-import { mergeRecoveredLpPositions } from "./position-sync.js";
+import {
+  mergeRecoveredLpPositions,
+  buildPendingPosition,
+  reconcilePendingPosition,
+} from "./position-sync.js";
 import {
   buildDisputeWitnessSigs,
   hasLegacyDisputeLeaf,
@@ -1541,6 +1545,48 @@ export class BrowserP2pFiatWallet {
     return { recoveredCount, recoveredIds };
   }
 
+  /**
+   * Verify any locally checkpointed `status: "pending"` positions directly against the
+   * Arkade indexer (100% LP-independent). Promotes confirmed VTXOs to `"open"` and drops
+   * unconfirmed pending entries older than 10 minutes.
+   */
+  async reconcilePendingPositions() {
+    const map = loadPositions();
+    const pendingEntries = Object.values(map).filter((p) => p?.status === "pending" && p?.vtxoTxid);
+    if (pendingEntries.length === 0) return { promotedCount: 0, droppedCount: 0 };
+
+    let promotedCount = 0;
+    let droppedCount = 0;
+    let changed = false;
+    const nowSecs = Math.floor(Date.now() / 1000);
+
+    await Promise.all(
+      pendingEntries.map(async (p) => {
+        let exists = false;
+        try {
+          const res = await this.indexerProvider.getVirtualTxs([p.vtxoTxid]);
+          exists = Boolean(res?.txs?.length > 0);
+        } catch {
+          // Transient indexer error: leave pending untouched for next refresh
+          return;
+        }
+        const decision = reconcilePendingPosition(p, { vtxoExistsOnArkade: exists, nowSecs });
+        if (decision.action === "promote") {
+          map[p.positionId] = decision.position;
+          promotedCount++;
+          changed = true;
+        } else if (decision.action === "drop") {
+          delete map[p.positionId];
+          droppedCount++;
+          changed = true;
+        }
+      })
+    );
+
+    if (changed) savePositions(map);
+    return { promotedCount, droppedCount };
+  }
+
   async requestQuote(notional, target = getLpUrl(), currency = "USD", side = "short") {
     const t = this._normalizeTarget(target);
     return this.callLp(t, "quote", {
@@ -1631,6 +1677,22 @@ export class BrowserP2pFiatWallet {
       preSignedRefundSigHex = hex.encode(schnorrSign(this.userKey, refHash));
     }
 
+    // Checkpoint the full position locally + to the user's own Nostr backup BEFORE sending
+    // `open/finalize`, so even if the LP reply times out or the tab closes, the wallet can
+    // independently verify `arkTx.id` on the Arkade indexer and promote it to `"open"`.
+    const pendingPos = buildPendingPosition({
+      prop,
+      quote: q,
+      arkTxId: arkTx.id,
+      userPubHex: this.userKey.pubHex,
+      target: t,
+      lpName,
+      preSignedManifest,
+    });
+    const preMap = loadPositions();
+    preMap[pendingPos.positionId] = pendingPos;
+    savePositions(preMap);
+
     let pos;
     try {
       pos = await this.callLp(t, "open/finalize", {
@@ -1641,26 +1703,29 @@ export class BrowserP2pFiatWallet {
         userRefundSigHex: preSignedRefundSigHex || undefined,
       });
     } catch (finErr) {
-      // If `open/finalize` succeeded on Arkade but the NIP-17 reply timed out,
-      // check whether the LP already recorded this finalized position so the user never loses it.
+      // 1. Trustless check: verify directly on the Arkade indexer if `arkTx.id` finalized.
       try {
-        const check = await this.callLp(t, "positions", {
-          userPubHex: this.userKey.pubHex,
-          positionId: prop.positionId,
-        });
-        const recovered = (check?.positions || []).find(
-          (p) =>
-            p?.positionId === prop.positionId &&
-            String(p?.userPubHex || "").toLowerCase() === this.userKey.pubHex.toLowerCase()
-        );
-        if (recovered) {
-          pos = recovered;
-        } else {
-          throw finErr;
+        const vtxs = await this.indexerProvider.getVirtualTxs([arkTx.id]);
+        if (vtxs?.txs?.length > 0) {
+          pos = reconcilePendingPosition(pendingPos, { vtxoExistsOnArkade: true }).position;
         }
-      } catch {
-        throw finErr;
+      } catch {}
+      // 2. Fallback: ask LP if it recorded the finalized position.
+      if (!pos) {
+        try {
+          const check = await this.callLp(t, "positions", {
+            userPubHex: this.userKey.pubHex,
+            positionId: prop.positionId,
+          });
+          const recovered = (check?.positions || []).find(
+            (p) =>
+              p?.positionId === prop.positionId &&
+              String(p?.userPubHex || "").toLowerCase() === this.userKey.pubHex.toLowerCase()
+          );
+          if (recovered) pos = recovered;
+        } catch {}
       }
+      if (!pos) throw finErr;
     }
     pos.lpUrl = t.url || "";
     pos.lpPubkey = t.pubkey || q.lpPubkey || pos.lpPubHex || null;
