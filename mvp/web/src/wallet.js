@@ -32,6 +32,7 @@ import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 
 import {
   DEFAULT_RELAYS,
+  LEGACY_RELAYS,
   computeEventId,
   buildQuorumForPreset,
   buildP2pOrderEvent,
@@ -344,17 +345,11 @@ export function getNostrRelays() {
     .map((s) => s.trim())
     .filter((s) => s.startsWith("wss://") || s.startsWith("ws://"));
   if (parsed.length === 0) return [...DEFAULT_RELAYS];
-  // Auto-upgrade legacy default relay lists (damus/nos.lol/oxtr/bitcoiner.social) that block
-  // kind:38384 or NIP-17 kind:1059 for new keys, preserving any custom user-added relays.
-  const LEGACY_RELAYS = new Set([
-    "wss://relay.damus.io",
-    "wss://nos.lol",
-    "wss://relay.primal.net",
-    "wss://nostr.oxtr.dev",
-    "wss://nostr.bitcoiner.social",
-  ]);
-  if (parsed.every((r) => LEGACY_RELAYS.has(r))) {
-    return [...DEFAULT_RELAYS];
+  // Auto-upgrade any saved list containing retired legacy relays (damus/nos.lol/oxtr/bitcoiner.social)
+  // to the verified DEFAULT_RELAYS while preserving any custom user-added relays.
+  const legacySet = new Set(LEGACY_RELAYS);
+  if (parsed.some((r) => legacySet.has(r))) {
+    return [...new Set([...DEFAULT_RELAYS, ...parsed.filter((r) => !legacySet.has(r))])];
   }
   return parsed;
 }

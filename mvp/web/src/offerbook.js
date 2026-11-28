@@ -17,6 +17,14 @@ export const DEFAULT_RELAYS = [
   "wss://relay.satlantis.io",
   "wss://relay.nostr.net",
 ];
+// Retired default relays kept for read-fallback (wallet seed backups & profiles)
+// and automatic localStorage migration.
+export const LEGACY_RELAYS = [
+  "wss://relay.damus.io",
+  "wss://nos.lol",
+  "wss://nostr.oxtr.dev",
+  "wss://nostr.bitcoiner.social",
+];
 
 const enc = new TextEncoder();
 

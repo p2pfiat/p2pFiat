@@ -15,9 +15,11 @@ esplora_url = "https://mempool.space/api"
 # Nostr relays used to receive NIP-17 exit packages and fetch external DLC
 # oracle announcements (kind 88) and attestations (kind 89).
 relays = [
-  "wss://relay.damus.io",
-  "wss://nos.lol",
   "wss://relay.primal.net",
+  "wss://relay.snort.social",
+  "wss://relay.noswhere.com",
+  "wss://relay.satlantis.io",
+  "wss://relay.nostr.net",
 ]
 
 cpfp_fee_sats   = 600   # minimum / fallback CPFP fee per unroll hop
