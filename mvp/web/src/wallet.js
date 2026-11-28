@@ -1616,7 +1616,7 @@ export class BrowserP2pFiatWallet {
     return pos;
   }
 
-  async rollPosition(positionId) {
+  async rollPosition(positionId, { expectedSpot = 0, maxSpotDriftPct = 2.0 } = {}) {
     const map = loadPositions();
     const pos = map[positionId];
     if (!pos) throw new Error("Unknown position");
@@ -1630,6 +1630,15 @@ export class BrowserP2pFiatWallet {
       positionId,
       watchtowerPubHex: getWatchtowerPubkey() || undefined,
     });
+    const proposedSpot = Number(prop.rollSpotUsd || 0);
+    if (expectedSpot > 0 && proposedSpot > 0) {
+      const driftPct = (Math.abs(proposedSpot - expectedSpot) / expectedSpot) * 100;
+      if (driftPct > maxSpotDriftPct) {
+        throw new Error(
+          `LP roll spot ${proposedSpot} deviates ${driftPct.toFixed(2)}% from live spot ${expectedSpot} — refusing to sign`
+        );
+      }
+    }
     const arkTx = Transaction.fromPSBT(base64.decode(prop.arkTxB64));
     const ck = Transaction.fromPSBT(base64.decode(prop.ckB64));
     const settleScript = hex.decode(pos.settleScriptHex);
@@ -1641,6 +1650,17 @@ export class BrowserP2pFiatWallet {
       arkTx.getOutput(0).amount !== BigInt(prop.newTotalCollateralSats)
     ) {
       throw new Error("LP roll proposal output 0 mismatch! Refusing to sign.");
+    }
+    const expectedSurplus = BigInt(Math.max(0, Math.floor(Number(prop.userSurplusSats || 0))));
+    if (expectedSurplus > 0n) {
+      const out1 = arkTx.outputsLength > 1 ? arkTx.getOutput(1) : null;
+      if (
+        !out1 ||
+        hex.encode(out1.script) !== hex.encode(this.userArkScript.pkScript) ||
+        out1.amount !== expectedSurplus
+      ) {
+        throw new Error("LP roll proposal user surplus output mismatch! Refusing to sign.");
+      }
     }
 
     const ckHash = tapscriptSighash(ck, 0, [contractPkScript], [BigInt(pos.totalCollateralSats)], settleScript);
@@ -1657,6 +1677,7 @@ export class BrowserP2pFiatWallet {
     rolled.lpPubkey = target.pubkey;
     rolled.lpName = pos.lpName || "LP";
     rolled.lpTransport = pos.lpTransport || "http";
+    rolled.autoRoll = Boolean(pos.autoRoll);
 
     // Co-sign fresh DLC exit payouts + refund tx for the rolled VTXO
     if (prop.exitSuite) {

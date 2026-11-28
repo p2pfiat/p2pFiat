@@ -159,6 +159,31 @@ body {
   color: var(--accent);
   border-bottom-color: var(--accent);
 }
+.autoroll-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.74rem;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(15, 23, 42, 0.55);
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.autoroll-toggle:has(input:checked) {
+  color: var(--green);
+  border-color: rgba(34, 197, 94, 0.45);
+  background: rgba(34, 197, 94, 0.08);
+}
+.autoroll-toggle input {
+  width: auto;
+  margin: 0;
+  accent-color: var(--green);
+  cursor: pointer;
+}
 .long-gauge-labels {
   display: flex;
   justify-content: space-between;

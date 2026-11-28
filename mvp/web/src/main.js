@@ -978,7 +978,13 @@ function renderPositions() {
                    <button class="btn danger small" data-close="${p.positionId}">Close at Spot</button>
                  </div>
                  <div class="wt-footer">
-                   ${wtStatusHtml}
+                   <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+                     ${wtStatusHtml}
+                     <label class="autoroll-toggle" title="Automatically roll when 50% of the contract term has elapsed (while wallet is open, with ±2% spot verification)">
+                       <input type="checkbox" data-autoroll="${p.positionId}" ${p.autoRoll ? "checked" : ""} />
+                       <span>Auto-Roll (50%)</span>
+                     </label>
+                   </div>
                    <div style="display:flex;gap:10px;align-items:center">
                      ${
                        p.disputeScriptHex
@@ -999,6 +1005,23 @@ function renderPositions() {
       const txt = el.getAttribute("data-copy-text");
       await navigator.clipboard.writeText(txt);
       showToast(`Copied ${shortNpub(txt)}`);
+    };
+  });
+
+  container.querySelectorAll("[data-autoroll]").forEach((cb) => {
+    cb.onchange = () => {
+      const id = cb.getAttribute("data-autoroll");
+      const map = loadPositions();
+      if (!map[id]) return;
+      map[id].autoRoll = Boolean(cb.checked);
+      savePositions(map);
+      showToast(
+        cb.checked
+          ? `↻ Auto-Roll enabled for ${id} (rolls automatically at 50% term while wallet is open)`
+          : `Auto-Roll disabled for ${id}`,
+        3500
+      );
+      if (cb.checked) checkAutoRolls();
     };
   });
 
@@ -1450,6 +1473,53 @@ function renderHistory(txs) {
 }
 
 let autoOnboardInFlight = false;
+let autoRollInFlight = false;
+const autoRollLastAttempt = new Map();
+
+async function checkAutoRolls() {
+  if (!appWallet || autoRollInFlight) return;
+  const nowMs = Date.now();
+  const nowSecs = Math.floor(nowMs / 1000);
+  const open = Object.values(loadPositions()).filter((p) => p.status === "open" && p.autoRoll === true);
+  if (open.length === 0) return;
+
+  autoRollInFlight = true;
+  try {
+    for (const p of open) {
+      const termSecs = Math.max(60, Number(p.termSecs || 86_400));
+      const startTs = Number(p.lastRolledAt || p.openedAt || nowSecs);
+      const elapsed = nowSecs - startTs;
+      if (elapsed < termSecs * 0.5) continue;
+
+      const lastTry = autoRollLastAttempt.get(p.positionId) || 0;
+      if (nowMs - lastTry < 5 * 60_000) continue;
+
+      const pCur = (p.currency || "USD").toUpperCase();
+      const liveSpot = Number(spots[pCur] || 0);
+      if (liveSpot <= 0) continue; // Require live spot so ±2% price guardrail is always enforced
+
+      autoRollLastAttempt.set(p.positionId, nowMs);
+      try {
+        const rolled = await appWallet.rollPosition(p.positionId, {
+          expectedSpot: liveSpot,
+          maxSpotDriftPct: 2.0,
+        });
+        const rSym = curSym((rolled.currency || pCur).toUpperCase());
+        const paidSats = Number(rolled.lastRollUserSurplusSats || 0);
+        const detail =
+          paidSats > 0
+            ? `+${paidSats.toLocaleString()} sats yield paid to Available BTC`
+            : `term reset (${fmtTimeLeft(termSecs)})`;
+        showToast(`↻ Auto-rolled #${rolled.rollCount} at ${rSym}${rolled.openSpotUsd} — ${detail}`, 6000);
+        await refresh();
+      } catch (err) {
+        console.warn(`[auto-roll] ${p.positionId} skipped:`, err?.message || err);
+      }
+    }
+  } finally {
+    autoRollInFlight = false;
+  }
+}
 let autoOnboardFailed = false;
 let incomingPollTimer = null;
 
@@ -2875,12 +2945,21 @@ async function boot() {
     if (document.visibilityState === "visible") autoCompactVtxos();
   }, 30 * 60_000);
 
+  // Opt-in client-side Auto-Rollover (runs at 50% term elapsed while wallet is open)
+  setTimeout(checkAutoRolls, 12_000);
+  setInterval(() => {
+    if (document.visibilityState === "visible") checkAutoRolls();
+  }, 60_000);
+
   // Battery-friendly 10s local interest ticker (pauses automatically when tab is hidden)
   setInterval(() => {
     if (document.visibilityState === "visible") tickInterest();
   }, 10_000);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") tickInterest();
+    if (document.visibilityState === "visible") {
+      tickInterest();
+      checkAutoRolls();
+    }
   });
 }
 
