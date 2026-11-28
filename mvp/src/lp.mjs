@@ -204,7 +204,11 @@ export async function createLpServer({
   relays = [],
   publicUrl,
   publishIntervalMs = 45_000,
+  logStartup = false,
 } = {}) {
+  const bootLog = (step, msg) => {
+    if (logStartup) console.log(`[LP boot ${step}] ${msg}`);
+  };
   const tiers =
     Array.isArray(offerTiers) && offerTiers.length > 0
       ? offerTiers
@@ -225,6 +229,7 @@ export async function createLpServer({
   }
   const lpKey = keyFromHex(lpKeyHex || state.lpKeyHex);
 
+  bootLog("1/4", `Starting ${lpName} (Arkade: ${ARK_URL}, relays: ${relays.length})...`);
   const arkProvider = new RestArkProvider(ARK_URL);
   const indexerProvider = new RestIndexerProvider(ARK_URL);
   const onchainProvider = new EsploraProvider(ESPLORA_URL);
@@ -233,6 +238,7 @@ export async function createLpServer({
   const exitDelaySecs = BigInt(info.unilateralExitDelay);
   const checkpointTapscript = CSVMultisigTapscript.decode(hex.decode(info.checkpointTapscript));
 
+  bootLog("2/4", `Connected to Arkade (${info.network || "mutinynet"}); initializing LP wallet...`);
   const wallet = await Wallet.create({
     identity: SingleKey.fromHex(lpKey.privHex),
     arkProvider,
@@ -244,6 +250,14 @@ export async function createLpServer({
       contractRepository: new InMemoryContractRepository(),
     },
   });
+  if (logStartup) {
+    const bootBal = await wallet.getBalance().catch(() => ({ available: 0 }));
+    const openCount = Object.values(store.read().positions || {}).filter((p) => p.status === "open").length;
+    bootLog(
+      "3/4",
+      `Wallet ready (available: ${Number(bootBal.available || 0).toLocaleString()} sats, open positions: ${openCount}); connecting to ${relays.length} Nostr relay(s)...`
+    );
+  }
   const lpArkScript = buildDefaultArkScript(lpKey.pubXOnly, serverXOnly, exitDelaySecs);
   const lpDefaultSettleLeaf = lpArkScript.forfeit();
   const lpDefaultLeafScript = lpDefaultSettleLeaf[1].slice(0, -1); // strip 0xc0 leaf version byte
@@ -1187,20 +1201,25 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.met
     offerTiers,
     publicUrl,
     relays,
+    logStartup: true,
   });
   const tierSummary = offerTiers
     .map((t) => `${t.termSecs >= 86_400 ? `${Math.round(t.termSecs / 86_400)}d` : `${Math.round(t.termSecs / 3600)}h`}@${t.fundingRateBpsPerDay}bps/d`)
     .join(", ");
+  const bal = await lp.wallet.getBalance().catch(() => ({ available: 0 }));
+  const openCount = Object.values(lp.store.read().positions || {}).filter((p) => p.status === "open").length;
   console.log(
-    `p2pFiat LP ready (${lp.lpName}, spread=${spreadBps}bps, tiers=[${tierSummary}])`
+    `[LP boot 4/4] ONLINE & READY (${lp.lpName}, spread=${spreadBps}bps, tiers=[${tierSummary}])`
   );
   console.log(`  HTTP endpoint  : ${lp.url || "DISABLED (serverless NIP-17 P2P mode)"}`);
   console.log(`  LP pubkey      : ${lp.lpKey.pubHex}`);
   console.log(`  LP Ark address : ${await lp.wallet.getAddress()}`);
   console.log(`  LP boarding    : ${await lp.wallet.getBoardingAddress()}`);
+  console.log(`  LP liquidity   : ${Number(bal.available || 0).toLocaleString()} sats (${openCount} open position${openCount === 1 ? "" : "s"})`);
   if (relays.length > 0) {
     const ok = lp.initialPublish?.relayResult?.okRelays || [];
-    console.log(`  Nostr offer    : published to ${ok.length}/${relays.length} relays (${ok.join(", ") || "none"})`);
+    const evCount = lp.initialPublish?.events?.length || 0;
+    console.log(`  Nostr offers   : published ${evCount} offer(s) to ${ok.length}/${relays.length} relays (${ok.join(", ") || "none"})`);
     console.log(`  NIP-17 P2P RPC : listening on ${lp.nip17Connected}/${relays.length} relays`);
   }
 }
