@@ -44,6 +44,7 @@ import {
   nip44Decrypt,
 } from "./nip17.js";
 import { computeKormirOutcomePoint } from "./nostracle-client.js";
+import { buildDisputeWitnessSigs } from "./dispute-witness.js";
 import {
   getOrCreateNostrAccount,
   getActiveIdentity,
@@ -1987,7 +1988,9 @@ export class BrowserP2pFiatWallet {
    *
    * 1. Builds the deterministic BIP-342 dispute payout tx at live spot + pro-rata yield/funding.
    * 2. Requests BIP-340 Schnorr signatures from all `n` Nostracles in parallel over NIP-17 RPC (`sign_dispute`).
-   * 3. Verifies >= `k` signatures, assembles the BIP-342 `OP_CHECKSIGADD` witness, and broadcasts
+   * 3. Verifies the signatures, assembles the witness for the manifest's dispute leaf
+   *    (arkd-native `CSVMultisigTapscript`: all k leaf oracles must sign; legacy `OP_CHECKSIGADD`
+   *    leaves still supported), and broadcasts
    *    onchain if the DLC VTXO is confirmed (or returns the signed raw tx for broadcast after unroll).
    */
   async forceDisputeExit(positionId, spotPrice = null) {
@@ -2117,25 +2120,16 @@ export class BrowserP2pFiatWallet {
       );
     }
 
-    // Assemble Tapscript witness stack:
-    // - Legacy OP_CHECKSIGADD (0xba): reverse order of all n pubkeys with empty bytes for non-signers.
-    // - arkd-native CSVMultisigTapscript (CHECKSIGVERIFY/CHECKSIG): reverse order of the k signing pubkeys only.
-    const usesChecksigAdd = disputeScript.includes(0xba);
-    const witnessStack = [];
-    if (usesChecksigAdd) {
-      for (let i = oracles.length - 1; i >= 0; i--) {
-        const sig = sigsByOracle.get(oracles[i].pubkey.toLowerCase());
-        witnessStack.push(sig || new Uint8Array(0));
-      }
-    } else {
-      const targetPubs = oracles.slice(0, threshold).map((o) => o.pubkey.toLowerCase());
-      for (let i = targetPubs.length - 1; i >= 0; i--) {
-        const sig = sigsByOracle.get(targetPubs[i]);
-        if (!sig) throw new Error(`Missing required oracle signature for CSVMultisig dispute leaf`);
-        witnessStack.push(sig);
-      }
+    // Witness signatures come from the leaf script's own key order (parsed opcodes, not a
+    // byte search for 0xba, which misread ~1/3 of CSVMultisig leaves as OP_CHECKSIGADD).
+    // The manifest commits to one leaf, so for CSVMultisig every oracle in that leaf must sign.
+    let witnessSigs;
+    try {
+      ({ sigs: witnessSigs } = buildDisputeWitnessSigs(disputeScript, sigsByOracle));
+    } catch (err) {
+      throw new Error(`${err.message}${errors.length ? ` (${errors.join("; ")})` : ""}`);
     }
-    witnessStack.push(disputeScript, hex.decode(pos.disputeControlBlockHex));
+    const witnessStack = [...witnessSigs, disputeScript, hex.decode(pos.disputeControlBlockHex)];
     tx.updateInput(0, { finalScriptWitness: witnessStack });
     const rawTxHex = hex.encode(tx.toBytes(true, true));
 
