@@ -6,6 +6,7 @@ import {
   autoRollStatusLine,
   chooseGuardSpot,
   describeAutoRollError,
+  NO_INDEPENDENT_SPOT_TEXT,
   isAutoRollDue,
   lpRelaysFromOffers,
   medianOf,
@@ -129,14 +130,17 @@ test("guard spot is the median of independent sources; self-quote only as a last
   assert.deepEqual(g.sources, ["LP B", "Coinbase", "Kraken"]);
   assert.doesNotMatch(g.note, /self/);
 
-  const self = chooseGuardSpot({ independent: [{ name: "Coinbase", spot: 0 }], selfSpot: 95_000 });
+  // default: no independent source means no guard spot at all (Auto-Roll waits), even with a self-quote
+  assert.equal(chooseGuardSpot({ independent: [{ name: "Coinbase", spot: 0 }], selfSpot: 95_000 }), null);
+  assert.equal(chooseGuardSpot({ selfSpot: 95_000 }), null);
+  const self = chooseGuardSpot({ independent: [{ name: "Coinbase", spot: 0 }], selfSpot: 95_000, allowSelfQuote: true });
   assert.deepEqual(self, { spot: 95_000, selfOnly: true, sources: ["own LP"], note: "guard: LP self-quote only" });
   assert.equal(chooseGuardSpot({ independent: [], selfSpot: 0 }), null);
   assert.equal(chooseGuardSpot(), null);
 });
 
 test("status line says when the guard fell back to the LP's self-quote", () => {
-  const selfGuard = chooseGuardSpot({ selfSpot: 95_000 });
+  const selfGuard = chooseGuardSpot({ selfSpot: 95_000, allowSelfQuote: true });
   const indep = chooseGuardSpot({ independent: [{ name: "Coinbase", spot: 95_000 }] });
   const nowBefore = (T0 + 40_000) * 1000;
   const sched = autoRollStatusLine(pos(), null, nowBefore, selfGuard);
@@ -148,4 +152,14 @@ test("status line says when the guard fell back to the LP's self-quote", () => {
   const nowDue = (T0 + 50_000) * 1000;
   const blocked = autoRollStatusLine(pos(), { state: "blocked", text: "x", at: nowDue }, nowDue, selfGuard);
   assert.match(blocked.text, /Auto-Roll blocked: x · retry in 5m · guard: LP self-quote only$/);
+});
+
+test("no independent price blocks the roll with a clear reason", () => {
+  const r = describeAutoRollError(new Error(NO_INDEPENDENT_SPOT_TEXT));
+  assert.equal(r.kind, "no-price");
+  assert.match(r.text, /not rolling on the LP's own quote/);
+  const nowDue = (T0 + 50_000) * 1000;
+  const line = autoRollStatusLine(pos(), { state: "blocked", text: r.text, at: nowDue }, nowDue);
+  assert.equal(line.tone, "warn");
+  assert.match(line.text, /Auto-Roll blocked: no independent price .* · retry in 5m$/);
 });

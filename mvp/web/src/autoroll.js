@@ -115,10 +115,12 @@ export function medianOf(values) {
 /**
  * Pick the spot the guard compares the roll quote with.
  *  - `independent`: [{ name, spot }] from peer LPs and public feeds (failed ones may carry spot 0);
- *  - `selfSpot`: the position's own LP /health spot, used only when no independent source answered.
- * Returns { spot, selfOnly, sources, note } or null when there is no spot at all.
+ *  - `selfSpot` + `allowSelfQuote`: the position's own LP /health spot, only when explicitly
+ *    allowed and no independent source answered. Off by default: checking the LP's quote
+ *    against its own price is no check, so Auto-Roll waits for an independent source instead.
+ * Returns { spot, selfOnly, sources, note } or null when there is no usable spot.
  */
-export function chooseGuardSpot({ independent = [], selfSpot = 0 } = {}) {
+export function chooseGuardSpot({ independent = [], selfSpot = 0, allowSelfQuote = false } = {}) {
   const ok = independent.filter((s) => Number.isFinite(s?.spot) && s.spot > 0);
   if (ok.length > 0) {
     const names = ok.map((s) => s.name);
@@ -129,7 +131,7 @@ export function chooseGuardSpot({ independent = [], selfSpot = 0 } = {}) {
       note: `guard: median of ${names.join(", ")}`,
     };
   }
-  if (Number.isFinite(selfSpot) && selfSpot > 0) {
+  if (allowSelfQuote && Number.isFinite(selfSpot) && selfSpot > 0) {
     return { spot: selfSpot, selfOnly: true, sources: ["own LP"], note: "guard: LP self-quote only" };
   }
   return null;
@@ -146,6 +148,7 @@ export function lpRelaysFromOffers(offers, lpPubkey) {
 /** Turn a roll failure into a short, user-facing reason. */
 export function describeAutoRollError(err) {
   const msg = String(err?.message || err || "unknown error");
+  if (msg === NO_INDEPENDENT_SPOT_TEXT) return { kind: "no-price", text: msg };
   if (/deviates .*% from live spot/i.test(msg)) {
     return { kind: "spot", text: `price guard: ${msg.replace(/ — refusing to sign$/i, "")}` };
   }
@@ -197,3 +200,7 @@ export function autoRollStatusLine(p, status, nowMs = Date.now(), guard = null) 
   }
   return { tone: infoTone, text: `↻ Auto-Roll due — will roll within a minute${tail}` };
 }
+
+/** Why Auto-Roll waits when no independent price source answered. */
+export const NO_INDEPENDENT_SPOT_TEXT =
+  "no independent price (Coinbase, Kraken and other LPs did not answer) — not rolling on the LP's own quote";

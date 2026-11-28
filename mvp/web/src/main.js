@@ -25,6 +25,7 @@ import {
   parseFeedSpot,
   peerSpotTargets,
   PUBLIC_SPOT_FEEDS,
+  NO_INDEPENDENT_SPOT_TEXT,
   spotFromHealth,
 } from "./autoroll.js";
 import {
@@ -1640,24 +1641,14 @@ async function fetchGuardSpot(cur, p) {
   const settled = await Promise.allSettled([...peerJobs, ...feedJobs]);
   const independent = settled.filter((s) => s.status === "fulfilled").map((s) => s.value);
 
-  let guard = chooseGuardSpot({ independent });
-  let lastErr = settled.find((s) => s.status === "rejected")?.reason || null;
+  // No independent source: wait for the next retry rather than check the LP against itself.
+  const guard = chooseGuardSpot({ independent });
   if (!guard) {
-    try {
-      const health = await withTimeout(appWallet.fetchLpHealth(own), GUARD_SOURCE_TIMEOUT_MS, "LP health");
-      guard = chooseGuardSpot({ selfSpot: spotFromHealth(health, cur) });
-    } catch (e) {
-      lastErr = e;
-    }
+    const lastErr = settled.find((s) => s.status === "rejected")?.reason || null;
+    console.warn(`[auto-roll] ${p.positionId}: no independent ${cur} spot${lastErr?.message ? ` (${lastErr.message})` : ""}`);
+    throw new Error(NO_INDEPENDENT_SPOT_TEXT);
   }
-  if (!guard) {
-    throw new Error(`no live ${cur} spot (price sources unreachable${lastErr?.message ? `: ${lastErr.message}` : ""})`);
-  }
-  if (guard.selfOnly) {
-    console.warn(`[auto-roll] ${p.positionId}: no independent ${cur} spot — ${guard.note}`);
-  } else {
-    spots[cur] = guard.spot;
-  }
+  spots[cur] = guard.spot;
   autoRollGuard.set(p.positionId, guard);
   return guard;
 }
