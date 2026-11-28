@@ -2076,11 +2076,21 @@ export class BrowserP2pFiatWallet {
     const dust = 350n;
     const notional = Number(manifest.notional_fiat);
     const openedAt = Number(manifest.opened_at);
-    const disputeTimestamp = Math.floor(Date.now() / 1000);
+    // A Nostracle that signed a dispute tx for this coin refuses every other tx for it (its
+    // anti-cherry-pick lock). The tx is fixed by (timestamp, spot), so the first attempt's values
+    // are kept and reused on every retry; otherwise one interrupted attempt would lock the
+    // signing Nostracles to a tx this wallet can never rebuild.
+    const pending = pos.pendingDispute;
+    const disputeTimestamp = pending ? Number(pending.disputeTimestamp) : Math.floor(Date.now() / 1000);
     const fundingBps = Number(manifest.funding_rate_bps_per_day);
-    const liveSpot = Number(spotPrice || pos.openSpotPrice || pos.openSpotUsd);
+    const liveSpot = pending ? Number(pending.spot) : Number(spotPrice || pos.openSpotPrice || pos.openSpotUsd);
     if (!Number.isFinite(liveSpot) || liveSpot <= 0) {
       throw new Error("Live BTC spot price unavailable for dispute calculation");
+    }
+    if (!pending) {
+      pos.pendingDispute = { disputeTimestamp, spot: liveSpot, at: Date.now() };
+      map[positionId] = pos;
+      savePositions(map);
     }
 
     const elapsedDays = Math.max(0, disputeTimestamp - openedAt) / 86_400;
@@ -2204,6 +2214,15 @@ export class BrowserP2pFiatWallet {
         sigsByLeaf.set(leaf.leafHashHex, await requestLeafSigs(leaf.script, pubkeysHex));
       })
     );
+
+    // Nobody signed anything, so no Nostracle locked this tx: a retry may build a fresh one.
+    if ([...sigsByLeaf.values()].every((m) => m.size === 0)) {
+      const fresh = loadPositions();
+      if (fresh[positionId]) {
+        delete fresh[positionId].pendingDispute;
+        savePositions(fresh);
+      }
+    }
 
     // Round 2 (v2): the primary leaf if all its oracles are live, else the first committed leaf
     // whose oracles all are; ask only those that have not signed that leaf yet.

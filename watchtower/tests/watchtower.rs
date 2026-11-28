@@ -19,7 +19,7 @@ use ark_watchtower::client::{ArkIndexerClient, ArkVtxoState, BoxFuture, ChainCli
 use ark_watchtower::config::Config;
 use ark_watchtower::nostr_io::{self, KIND_ANNOUNCEMENT, KIND_ATTESTATION};
 use ark_watchtower::service::{WatchtowerReply, WatchtowerRequest, WatchtowerService};
-use ark_watchtower::storage::{ExitPayout, ExitRefund, WatchState, WatchtowerPackage, WatchtowerStorage};
+use ark_watchtower::storage::{ExitPayout, ExitRefund, PendingDispute, WatchState, WatchtowerPackage, WatchtowerStorage};
 use ark_watchtower::wallet::{WalletUtxo, WatchtowerWallet, P2A_SCRIPT_BYTES};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -981,4 +981,44 @@ async fn time_based_csv_exit_waits_for_mediantime() {
     chain.mine_blocks(1);
     let rec = svc.storage.get("time-csv-1").unwrap();
     assert!(matches!(rec.state, WatchState::BountySwept { net_profit_sats: 2800, .. }));
+}
+
+#[test]
+fn pending_dispute_survives_restart_and_old_files_still_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wt.json");
+    let spec = BountySpec {
+        amount_sats: BOUNTY_AMOUNT,
+        vout: 2,
+        primary_pubkey: WatchtowerWallet::from_secret(SecretKey::from_slice(&[1u8; 32]).unwrap(), Network::Regtest)
+            .xonly_pubkey
+            .to_string(),
+        backup_pubkeys: vec![],
+        backup_csv: BACKUP_CSV,
+    };
+    let pkg = build_contract_fixture("pending-1", spec, None, None, None, 180, 1);
+    {
+        let st = WatchtowerStorage::open(&path).unwrap();
+        st.insert(pkg, 1000).unwrap();
+        assert_eq!(st.get("pending-1").unwrap().pending_dispute, None);
+        st.update("pending-1", |w| {
+            w.pending_dispute = Some(PendingDispute { dispute_timestamp: 1_760_000_000, live_spot: 97_100.5 })
+        })
+        .unwrap();
+    }
+    // restart: the first attempt's inputs are still there
+    let st = WatchtowerStorage::open(&path).unwrap();
+    assert_eq!(
+        st.get("pending-1").unwrap().pending_dispute,
+        Some(PendingDispute { dispute_timestamp: 1_760_000_000, live_spot: 97_100.5 })
+    );
+    drop(st);
+
+    // a store written before this field existed still loads, with no pending dispute
+    let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let contracts = json["contracts"].as_object_mut().unwrap();
+    contracts.get_mut("pending-1").unwrap().as_object_mut().unwrap().remove("pending_dispute");
+    std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+    let st = WatchtowerStorage::open(&path).unwrap();
+    assert_eq!(st.get("pending-1").unwrap().pending_dispute, None);
 }

@@ -183,6 +183,17 @@ pub struct WatchedContract {
     pub bounty_earned: u64,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// The first dispute attempt's inputs. A Nostracle that signed a dispute tx refuses every
+    /// other tx for that coin, so retries must rebuild exactly the same tx from these values.
+    #[serde(default)]
+    pub pending_dispute: Option<PendingDispute>,
+}
+
+/// Inputs that fix the dispute tx (with the package's manifest and bounty).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PendingDispute {
+    pub dispute_timestamp: u64,
+    pub live_spot: f64,
 }
 
 impl WatchedContract {
@@ -253,6 +264,7 @@ impl WatchtowerStorage {
                 sweep_fee_spent: 0,
                 bounty_earned: 0,
                 last_error: None,
+                pending_dispute: None,
             },
         );
         self.persist(&st)?;
