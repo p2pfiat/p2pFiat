@@ -14,7 +14,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { extract as hkdfExtract, expand as hkdfExpand } from "@noble/hashes/hkdf.js";
 import { hex, bech32 } from "@scure/base";
-import { computeEventId, DEFAULT_RELAYS, LEGACY_RELAYS, pubkeyHexToNpub, publishOfferEvent } from "./offerbook.js";
+import { computeEventId, DEFAULT_RELAYS, withLegacyReadRelays, pubkeyHexToNpub, publishOfferEvent } from "./offerbook.js";
 import { getConversationKey, nip44Decrypt } from "./nip17.js";
 
 const LS_NOSTR_PRIVKEY = "p2pfiat_nostr_privkey_hex";
@@ -159,11 +159,6 @@ export function getActiveIdentity() {
     walletSeedHex,
     rpcKey: acct,
   };
-}
-
-function withLegacyReadRelays(relays) {
-  const base = Array.isArray(relays) && relays.length > 0 ? relays : DEFAULT_RELAYS;
-  return [...new Set([...base, ...LEGACY_RELAYS])];
 }
 
 /**

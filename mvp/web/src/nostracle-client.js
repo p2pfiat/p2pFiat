@@ -5,6 +5,7 @@
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { hex, bech32 } from "@scure/base";
+import { withLegacyReadRelays } from "./offerbook.js";
 
 export const P2PFIAT_CURATOR_NPUB =
   "npub1p2ppegcr9j875e2d76vzn9za9s3rd6npgvde8d5cwjza8c80en3sj72l43";
@@ -197,9 +198,10 @@ async function fetchCuratedNip51List(
   if (!/^[0-9a-f]{64}$/i.test(curatorHex)) return null;
   curatorHex = curatorHex.toLowerCase();
 
+  const readRelays = withLegacyReadRelays(relays);
   let latest = null;
   await Promise.all(
-    relays.map(
+    readRelays.map(
       (relayUrl) =>
         new Promise((resolve) => {
           let ws;

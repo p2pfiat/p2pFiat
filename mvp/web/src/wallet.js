@@ -33,6 +33,7 @@ import { sha256 as nobleSha256 } from "@noble/hashes/sha2.js";
 import {
   DEFAULT_RELAYS,
   LEGACY_RELAYS,
+  withLegacyReadRelays,
   computeEventId,
   buildQuorumForPreset,
   buildP2pOrderEvent,
@@ -520,9 +521,10 @@ export async function restorePositionsFromNostr(timeoutMs = 4000) {
   const acct = identity?.rpcKey;
   if (!acct?.privHex || !acct?.pubHex) return { restoredCount: 0, totalCount: 0 };
   const relays = getNostrRelays();
+  const readRelays = withLegacyReadRelays(relays);
   let latest = null;
   await Promise.all(
-    relays.map(
+    readRelays.map(
       (relayUrl) =>
         new Promise((resolve) => {
           let ws;
@@ -574,6 +576,11 @@ export async function restorePositionsFromNostr(timeoutMs = 4000) {
 
   const convKey = getConversationKey(hex.decode(acct.privHex), acct.pubHex);
   const parsed = JSON.parse(nip44Decrypt(latest.content, convKey));
+  // Best-effort republish the already-signed positions backup event to the current relay set
+  // so backups fetched from retired legacy relays self-migrate to the new defaults.
+  if (latest.id && latest.sig) {
+    publishOfferEvent(latest, relays).catch(() => {});
+  }
   const remoteMap = parsed?.positions || {};
   const localMap = loadPositions();
   let restoredCount = 0;

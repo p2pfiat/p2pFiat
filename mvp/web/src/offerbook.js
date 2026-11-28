@@ -26,6 +26,12 @@ export const LEGACY_RELAYS = [
   "wss://nostr.bitcoiner.social",
 ];
 
+/** Return `relays` (or `DEFAULT_RELAYS`) unioned with retired `LEGACY_RELAYS` for read-fallback. */
+export function withLegacyReadRelays(relays) {
+  const base = Array.isArray(relays) && relays.length > 0 ? relays : DEFAULT_RELAYS;
+  return [...new Set([...base, ...LEGACY_RELAYS])];
+}
+
 const enc = new TextEncoder();
 
 export function pubkeyHexToNpub(pubHex) {
