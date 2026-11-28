@@ -333,12 +333,31 @@ function combineTapscriptSigs(baseTx, otherTx) {
   return out;
 }
 
+function isLocalDevHost() {
+  try {
+    const host = String(globalThis?.location?.hostname || "").toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
 export function getLpUrl() {
-  return localStorage.getItem(LS_LP_URL) || "http://127.0.0.1:3456";
+  const saved = (localStorage.getItem(LS_LP_URL) || "").trim();
+  if (saved) return saved;
+  // Only fall back to a local dev LP when the web app itself runs on localhost;
+  // on public HTTPS origins (e.g. p2pfiat.github.io) fetching 127.0.0.1 triggers
+  // Chrome's scary "Access other apps and services on this device" (PNA) prompt.
+  return isLocalDevHost() ? "http://127.0.0.1:3456" : "";
 }
 
 export function setLpUrl(url) {
-  localStorage.setItem(LS_LP_URL, url.trim().replace(/\/+$/, ""));
+  const clean = String(url || "").trim().replace(/\/+$/, "");
+  if (!clean) {
+    localStorage.removeItem(LS_LP_URL);
+    return;
+  }
+  localStorage.setItem(LS_LP_URL, clean);
 }
 
 export function getNostrRelays() {
@@ -1477,6 +1496,9 @@ export class BrowserP2pFiatWallet {
       const peer = this.getNip17Peer();
       if (t.relays?.length) await peer.ensureRelays(t.relays);
       return peer.request(t.pubkey, method, params);
+    }
+    if (!t.url) {
+      throw new Error("No LP connected yet (waiting for Nostr orderbook offers)");
     }
     try {
       if (method === "health" || method === "offer" || method === "positions") {
