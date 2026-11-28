@@ -125,6 +125,7 @@ let vaultIsMax = false;
 const orderBook = new LocalOrderBook();
 let relaySub = null;
 let manualOfferKey = null;
+const syncedLpKeys = new Set();
 
 function offerKeyOf(o) {
   return o?.offerKey || `${o?.pubkey || ""}:${o?.dTag || o?.pair || ""}`;
@@ -1880,6 +1881,25 @@ async function refresh() {
         $("lp-status").textContent = `${health.lpName || selected.lpName}${selected.preferNip17 ? " (NIP-17)" : ""}: ${Number(health.arkBalance?.available || 0).toLocaleString()} sats`;
         $("lp-status").className = "pill ok";
         lpOk = true;
+        const lpSyncKey = `${appWallet.userKey?.pubHex || ""}:${selected.pubkey || selected.url}`;
+        if (!syncedLpKeys.has(lpSyncKey)) {
+          syncedLpKeys.add(lpSyncKey);
+          appWallet
+            .syncPositionsFromLp(selected)
+            .then((syncRes) => {
+              if (syncRes?.recoveredCount > 0) {
+                renderPositions();
+                tickInterest();
+                showToast(
+                  `↻ Recovered ${syncRes.recoveredCount} open position${syncRes.recoveredCount === 1 ? "" : "s"} from ${health.lpName || selected.lpName}`,
+                  6000
+                );
+              }
+            })
+            .catch(() => {
+              syncedLpKeys.delete(lpSyncKey);
+            });
+        }
       } catch {
         $("lp-status").textContent = `${selected.lpName} offline`;
         $("lp-status").className = "pill err";
