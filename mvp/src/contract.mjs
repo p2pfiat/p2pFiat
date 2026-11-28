@@ -11,6 +11,7 @@ import {
 import * as btc from "@scure/btc-signer";
 import { hex, base64 } from "@scure/base";
 import { sha256 } from "@noble/hashes/sha2.js";
+import { schnorr } from "@noble/curves/secp256k1.js";
 import {
   schnorrSign,
   adaptorSign,
@@ -474,9 +475,38 @@ export function buildLpExitSuite({
 }
 
 /**
- * Build an On-Demand Dispute payout transaction spent via Leaf 3 (`k-of-n` Nostracle
- * BIP-342 threshold Tapscript). Computes pro-rata yield/funding up to `disputeTimestamp`
+ * Pick the `CSVMultisigTapscript` dispute leaf whose k oracle pubkeys are all in
+ * `signerPubsHex`. With no signer set, returns the primary leaf (the first k oracles).
+ * Throws when fewer than k of the given signers belong to the quorum.
+ */
+export function selectDisputeLeaf(disputeClosure, signerPubsHex = null) {
+  const leaves = disputeClosure.allLeaves || [
+    {
+      script: disputeClosure.script,
+      scriptHex: disputeClosure.scriptHex,
+      oraclePubsHex: disputeClosure.oraclePubsHex,
+    },
+  ];
+  if (!signerPubsHex) return leaves[0];
+  const signers = new Set(signerPubsHex.map((p) => p.trim().toLowerCase()));
+  const leaf = leaves.find((l) => l.oraclePubsHex.every((p) => signers.has(p)));
+  if (!leaf) {
+    const total = (disputeClosure.allOraclePubsHex || disputeClosure.oraclePubsHex).length;
+    throw new Error(
+      `No dispute leaf for the given signers: need ${disputeClosure.threshold}-of-${total} quorum members`
+    );
+  }
+  return leaf;
+}
+
+/**
+ * Build an On-Demand Dispute payout transaction spent via one `k-of-n` Nostracle
+ * `CSVMultisigTapscript` subset leaf. Computes pro-rata yield/funding up to `disputeTimestamp`
  * and handles both mid-term anytime exits and early liquidation (>= 50% BTC drop).
+ *
+ * The BIP-341 sighash commits to the spent leaf, so the signing subset must be fixed
+ * before the oracles sign: pass `signerPubsHex` (the oracles that will sign) to choose
+ * the matching leaf, or omit it to use the primary leaf.
  */
 export function buildOnDemandDisputeTx({
   vtxoTxid,
@@ -494,7 +524,9 @@ export function buildOnDemandDisputeTx({
   lpPubXOnly,
   bountyPkScript = null,
   bountyAmtSats = 0n,
+  signerPubsHex = null,
 }) {
+  const leaf = selectDisputeLeaf(disputeClosure, signerPubsHex);
   const total = BigInt(totalCollateralSats);
   const bounty = BigInt(bountyAmtSats || 0n);
   const dust = 350n;
@@ -536,10 +568,10 @@ export function buildOnDemandDisputeTx({
     btc.SigHash.DEFAULT,
     [total],
     -1,
-    disputeClosure.script,
+    leaf.script,
     0xc0
   );
-  const [ctrlObj] = contractScript.findLeaf(disputeClosure.scriptHex);
+  const [ctrlObj] = contractScript.findLeaf(leaf.scriptHex);
   const ctrlBytes = btc.TaprootControlBlock.encode(ctrlObj);
 
   return {
@@ -549,6 +581,9 @@ export function buildOnDemandDisputeTx({
     sighashHex: hex.encode(sighash),
     controlBlock: ctrlBytes,
     controlBlockHex: hex.encode(ctrlBytes),
+    leafScript: leaf.script,
+    leafScriptHex: leaf.scriptHex,
+    leafOraclePubsHex: leaf.oraclePubsHex,
     userAmtSats: Number(userAmt),
     lpAmtSats: Number(lpAmt),
     bountyAmtSats: Number(bounty),
@@ -557,38 +592,45 @@ export function buildOnDemandDisputeTx({
 }
 
 /**
- * Assemble the final BIP-342 Tapscript witness for the `k-of-n` Nostracle Dispute Leaf.
+ * Assemble the final Tapscript witness for the chosen `k-of-n` Nostracle dispute leaf
+ * (`CSVMultisigTapscript`: `<pk_1> CHECKSIGVERIFY ... <pk_k> CHECKSIG`).
  * `sigsByPubkeyHex` maps each signing oracle's x-only pubkey (64-hex) to its 64-byte Schnorr sig (128-hex).
- * Enforces `validCount >= threshold` and pushes signatures in reverse key order as required by OP_CHECKSIGADD.
+ * Every one of the leaf's k oracles must supply a BIP-340 signature valid for `disputeTx.sighash`;
+ * signatures are pushed in reverse key order, with no empty slots (an empty sig fails CHECKSIGVERIFY).
  */
 export function assembleDisputeWitness(disputeTx, disputeClosure, sigsByPubkeyHex) {
-  const pubs = disputeClosure.oraclePubsHex;
-  const witnessSigs = [];
-  let validCount = 0;
+  const leafScript = disputeTx.leafScript || disputeClosure.script;
+  const pubs = disputeTx.leafOraclePubsHex || disputeClosure.oraclePubsHex;
+  const totalOracles = (disputeClosure.allOraclePubsHex || pubs).length;
+  const sigs = Object.fromEntries(
+    Object.entries(sigsByPubkeyHex).map(([pk, sig]) => [pk.trim().toLowerCase(), sig])
+  );
 
-  // BIP-342 OP_CHECKSIG / OP_CHECKSIGADD consumes stack items in reverse order of pubkeys in the script
-  for (let i = pubs.length - 1; i >= 0; i--) {
-    const pk = pubs[i];
-    const sigHex = sigsByPubkeyHex[pk];
-    if (sigHex) {
-      const sigBytes = hex.decode(sigHex);
-      if (sigBytes.length !== 64) {
-        throw new Error(`Invalid Schnorr signature length for oracle ${pk.slice(0, 8)}`);
-      }
-      witnessSigs.push(sigBytes);
-      validCount++;
-    } else {
-      witnessSigs.push(new Uint8Array(0)); // empty push fails OP_CHECKSIG(ADD) cleanly with 0
+  const validSigs = new Map();
+  for (const pk of pubs) {
+    const sigHex = sigs[pk];
+    if (!sigHex) continue;
+    const sigBytes = hex.decode(sigHex);
+    if (sigBytes.length !== 64) {
+      throw new Error(`Invalid Schnorr signature length for oracle ${pk.slice(0, 8)}`);
     }
+    if (!schnorr.verify(sigBytes, disputeTx.sighash, hex.decode(pk))) {
+      throw new Error(`Invalid Schnorr signature for oracle ${pk.slice(0, 8)}`);
+    }
+    validSigs.set(pk, sigBytes);
   }
 
-  if (validCount < disputeClosure.threshold) {
+  if (validSigs.size < disputeClosure.threshold) {
     throw new Error(
-      `Insufficient Nostracle signatures: got ${validCount}, need at least ${disputeClosure.threshold}-of-${pubs.length}`
+      `Insufficient Nostracle signatures: got ${validSigs.size}, need at least ${disputeClosure.threshold}-of-${totalOracles}`
     );
   }
 
-  const finalWitness = [...witnessSigs, disputeClosure.script, disputeTx.controlBlock];
+  // The script checks pubkeys left to right, so the first pubkey's sig must be on top of the stack.
+  const witnessSigs = [];
+  for (let i = pubs.length - 1; i >= 0; i--) witnessSigs.push(validSigs.get(pubs[i]));
+
+  const finalWitness = [...witnessSigs, leafScript, disputeTx.controlBlock];
   const finalized = btc.Transaction.fromRaw(hex.decode(disputeTx.txHex), {
     allowUnknownInputs: true,
     allowUnknownOutputs: true,
@@ -598,8 +640,8 @@ export function assembleDisputeWitness(disputeTx, disputeClosure, sigsByPubkeyHe
   return {
     rawSignedHex,
     witnessStack: finalWitness,
-    signedCount: validCount,
+    signedCount: validSigs.size,
     threshold: disputeClosure.threshold,
-    totalOracles: pubs.length,
+    totalOracles,
   };
 }
