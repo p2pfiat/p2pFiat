@@ -533,7 +533,11 @@ export async function createLpServer({
           user_pubkey_hex: body.userPubHex.toLowerCase(),
           lp_pubkey_hex: lpKey.pubHex.toLowerCase(),
           vtxo_pk_script_hex: hex.encode(contractScript.pkScript),
+          // v2: commit to every k-of-n subset leaf so any k online oracles can sign a
+          // dispute (p2pfiat/p2pFiat#20). dispute_script_hex stays as the primary leaf.
+          manifest_version: 2,
           dispute_script_hex: disputeClosure.scriptHex,
+          dispute_leaf_hashes_hex: disputeClosure.leafHashesHex,
           user_payout_script_hex: userPayoutScriptHex,
           lp_payout_script_hex: lpPayoutScriptHex,
         };
@@ -577,6 +581,12 @@ export async function createLpServer({
                   control_block_hex: disputeControlBlockHex,
                   csv_sequence: disputeClosure.csvSequence,
                   oracle_quorum: posQuorum,
+                  leaves: disputeClosure.allLeaves.map((l) => ({
+                    script_hex: l.scriptHex,
+                    control_block_hex: hex.encode(
+                      btc.TaprootControlBlock.encode(contractScript.findLeaf(l.scriptHex)[0])
+                    ),
+                  })),
                 }
               : null,
           })

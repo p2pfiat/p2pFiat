@@ -9,15 +9,25 @@
 //!    - `output[2]`: Compiled tiered NUMS P2TR Watchtower Bounty script (`BountyScript::compile`),
 //!    - leaving a bounded L1 miner fee (default 350 sats) so the tx passes mempool min-relay-fee,
 //! 3. `k-of-n` BIP-340 Schnorr signatures collected over NIP-17 RPC (`sign_dispute`) from the
-//!    contract's Nostracle quorum, assembled into a standard BIP-342 `OP_CHECKSIGADD` witness.
+//!    contract's Nostracle quorum, assembled into the witness of ONE dispute leaf.
+//!
+//! Since p2pFiat 06f8e70 a k-of-n quorum is one arkd `CSVMultisigTapscript` leaf per k-subset
+//! (`<csv> CSV DROP <O_1> CHECKSIGVERIFY ... <O_k> CHECKSIG`): all k keys of the spent leaf must
+//! sign. Older contracts use one `OP_CHECKSIGADD` leaf (empty pushes for non-signers).
+//! A v2 manifest (`p2pfiat/dispute-manifest/v2`, p2pFiat#20) commits to every subset leaf, so
+//! when an oracle of the primary leaf is offline the watchtower asks k oracles that did sign to
+//! sign the same tx for their own leaf (see `nostr_io::resolve_pending_disputes`).
 
 use crate::bounty::{parse_xonly, BountyScript, BountySpec};
 use crate::client::parse_outpoint;
-use crate::storage::{DisputeManifest, DisputePackageSpec};
+use crate::storage::{DisputeLeafSpec, DisputeManifest, DisputePackageSpec};
 use anyhow::{anyhow, ensure, Context, Result};
 use kormir::bitcoin::absolute::LockTime;
 use kormir::bitcoin::consensus::encode::serialize_hex;
 use kormir::bitcoin::hashes::{sha256, Hash};
+use kormir::bitcoin::opcodes::all::{OP_CHECKSIG, OP_CHECKSIGADD, OP_CHECKSIGVERIFY, OP_CSV, OP_DROP};
+use kormir::bitcoin::opcodes::Opcode;
+use kormir::bitcoin::script::Instruction;
 use kormir::bitcoin::secp256k1::schnorr::Signature as SchnorrSig;
 use kormir::bitcoin::secp256k1::{Message, Secp256k1};
 use kormir::bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
@@ -31,10 +41,23 @@ pub const DUST_SATS: u64 = 350;
 pub const DEFAULT_DISPUTE_MINER_FEE_SATS: u64 = 350;
 pub const MAX_DISPUTE_MINER_FEE_SATS: u64 = 5_000;
 const MANIFEST_TAG: &[u8] = b"p2pfiat/dispute-manifest/v1";
+const MANIFEST_TAG_V2: &[u8] = b"p2pfiat/dispute-manifest/v2";
 
-/// Deterministic BIP-340 tagged hash (`p2pfiat/dispute-manifest/v1`) matching
-/// `nostracle::dispute::compute_manifest_hash` and `mvp/src/contract.mjs`.
+/// Deterministic BIP-340 tagged hash of a Contract Manifest, matching
+/// `nostracle::dispute::compute_manifest_hash` and `mvp/web/src/dispute-manifest.js`:
+/// v1 over `dispute_script_hex`, v2 over the sorted, comma-joined committed leaf hashes.
 pub fn compute_manifest_hash(m: &DisputeManifest) -> [u8; 32] {
+    let (tag, dispute_field) = if m.manifest_version == 2 {
+        let mut hashes: Vec<String> = m
+            .dispute_leaf_hashes_hex
+            .iter()
+            .map(|h| h.trim().to_lowercase())
+            .collect();
+        hashes.sort();
+        (MANIFEST_TAG_V2, hashes.join(","))
+    } else {
+        (MANIFEST_TAG, m.dispute_script_hex.trim().to_lowercase())
+    };
     let notional_cents = (m.notional_fiat * 100.0).round() as i64;
     let funding_bps_x100 = (m.funding_rate_bps_per_day * 100.0).round() as i64;
     let canonical = format!(
@@ -50,11 +73,11 @@ pub fn compute_manifest_hash(m: &DisputeManifest) -> [u8; 32] {
         m.user_pubkey_hex.trim().to_lowercase(),
         m.lp_pubkey_hex.trim().to_lowercase(),
         m.vtxo_pk_script_hex.trim().to_lowercase(),
-        m.dispute_script_hex.trim().to_lowercase(),
+        dispute_field,
         m.user_payout_script_hex.trim().to_lowercase(),
         m.lp_payout_script_hex.trim().to_lowercase(),
     );
-    let tag_hash = sha256::Hash::hash(MANIFEST_TAG);
+    let tag_hash = sha256::Hash::hash(tag);
     let mut preimage = Vec::with_capacity(64 + canonical.len());
     preimage.extend_from_slice(tag_hash.as_byte_array());
     preimage.extend_from_slice(tag_hash.as_byte_array());
@@ -64,6 +87,11 @@ pub fn compute_manifest_hash(m: &DisputeManifest) -> [u8; 32] {
 
 /// Cryptographically verify BOTH User and LP BIP-340 signatures on a `DisputeManifest`.
 pub fn verify_dispute_manifest(m: &DisputeManifest) -> Result<()> {
+    ensure!(
+        m.manifest_version == 1 || m.manifest_version == 2,
+        "unsupported manifest_version {}",
+        m.manifest_version
+    );
     let secp = Secp256k1::verification_only();
     let digest = compute_manifest_hash(m);
     let msg = Message::from_digest(digest);
@@ -250,6 +278,11 @@ pub fn build_watchtower_dispute_tx(
         "lp_payout_script_hex": manifest.lp_payout_script_hex,
         "sighash_hex": sighash_hex,
     });
+    let mut rpc_params = rpc_params;
+    if manifest.manifest_version == 2 {
+        rpc_params["manifest_version"] = json!(2);
+        rpc_params["dispute_leaf_hashes_hex"] = json!(manifest.dispute_leaf_hashes_hex);
+    }
 
     Ok(BuiltDisputeTx {
         unsigned_tx,
@@ -264,37 +297,150 @@ pub fn build_watchtower_dispute_tx(
     })
 }
 
-/// Verify `>= threshold` BIP-340 oracle Schnorr signatures and attach the BIP-342
-/// `OP_CHECKSIGADD` Tapscript witness stack (reverse pubkey order, empty element for non-signers).
-pub fn assemble_dispute_tx_witness(
+/// Oracle keys of a dispute leaf in script order, and whether it is the legacy
+/// `OP_CHECKSIGADD` shape. Strict: the leaf must start with `<csv> CSV DROP` and then be exactly
+/// `(<pk> CHECKSIGVERIFY)* <pk> CHECKSIG` or `<pk> CHECKSIG (<pk> CHECKSIGADD)* <k> GREATERTHANOREQUAL`.
+/// Opcodes are parsed, never found by byte search (0xba also occurs inside pubkeys).
+pub fn dispute_leaf_keys(script: &ScriptBuf) -> Result<(Vec<String>, bool)> {
+    let ins: Vec<Instruction> = script
+        .instructions()
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow!("undecodable dispute leaf: {e}"))?;
+    let op = |i: usize| match ins.get(i) {
+        Some(Instruction::Op(o)) => Some(*o),
+        _ => None,
+    };
+    let bad = || anyhow!("unrecognised dispute leaf script");
+    ensure!(op(1) == Some(OP_CSV) && op(2) == Some(OP_DROP), bad());
+    let is_sig_op = |o: Opcode| o == OP_CHECKSIG || o == OP_CHECKSIGVERIFY || o == OP_CHECKSIGADD;
+    let mut keys = Vec::new();
+    let mut sig_ops = Vec::new();
+    let mut i = 3;
+    let mut tail = Vec::new();
+    while i < ins.len() {
+        match &ins[i] {
+            Instruction::PushBytes(b) if b.len() == 32 => {
+                let next = op(i + 1).filter(|o| is_sig_op(*o)).ok_or_else(bad)?;
+                keys.push(hex::encode(b.as_bytes()));
+                sig_ops.push(next);
+                i += 2;
+            }
+            Instruction::Op(o) if is_sig_op(*o) => return Err(bad()),
+            other => {
+                tail.push(*other);
+                i += 1;
+            }
+        }
+    }
+    ensure!(keys.len() >= 2, "dispute leaf has fewer than 2 oracle keys");
+    if sig_ops.contains(&OP_CHECKSIGADD) {
+        ensure!(
+            sig_ops[0] == OP_CHECKSIG && sig_ops[1..].iter().all(|o| *o == OP_CHECKSIGADD),
+            bad()
+        );
+        // <k> GREATERTHANOREQUAL
+        ensure!(tail.len() == 2, bad());
+        return Ok((keys, true));
+    }
+    ensure!(
+        tail.is_empty()
+            && sig_ops.last() == Some(&OP_CHECKSIG)
+            && sig_ops[..sig_ops.len() - 1].iter().all(|o| *o == OP_CHECKSIGVERIFY),
+        bad()
+    );
+    Ok((keys, false))
+}
+
+/// Every dispute leaf the watchtower may spend, primary (`script_hex`) first. For a v2 manifest
+/// only committed leaves are returned; v1 and older packages yield just the primary leaf.
+pub fn dispute_leaves(dispute: &DisputePackageSpec) -> Vec<DisputeLeafSpec> {
+    let primary = DisputeLeafSpec {
+        script_hex: dispute.script_hex.trim().to_lowercase(),
+        control_block_hex: dispute.control_block_hex.trim().to_lowercase(),
+    };
+    let Some(m) = dispute.manifest.as_ref().filter(|m| m.manifest_version == 2) else {
+        return vec![primary];
+    };
+    let committed: std::collections::HashSet<String> = m
+        .dispute_leaf_hashes_hex
+        .iter()
+        .map(|h| h.trim().to_lowercase())
+        .collect();
+    let mut out = vec![primary.clone()];
+    for leaf in &dispute.leaves {
+        let Ok(bytes) = hex::decode(leaf.script_hex.trim()) else { continue };
+        let h = TapLeafHash::from_script(&ScriptBuf::from_bytes(bytes), LeafVersion::TapScript);
+        if committed.contains(&h.to_string()) && leaf.script_hex.trim().to_lowercase() != primary.script_hex {
+            out.push(leaf.clone());
+        }
+    }
+    out
+}
+
+/// The `sign_dispute` request and witness data for spending ONE dispute leaf with a built tx.
+#[derive(Debug, Clone)]
+pub struct DisputeLeafRequest {
+    pub script: ScriptBuf,
+    pub control_block: ControlBlock,
+    /// Oracle keys in script order (lowercase x-only hex).
+    pub keys: Vec<String>,
+    pub legacy_checksigadd: bool,
+    pub sighash: [u8; 32],
+    pub rpc_params: Value,
+}
+
+/// Sighash and RPC params for spending `leaf` with the (fixed) `built` dispute tx. The tx and
+/// its txid do not depend on the leaf, so an oracle that already approved the tx for one
+/// committed leaf will sign it for another.
+pub fn leaf_request(
     built: &BuiltDisputeTx,
     dispute: &DisputePackageSpec,
+    leaf: &DisputeLeafSpec,
+) -> Result<DisputeLeafRequest> {
+    let manifest = dispute
+        .manifest
+        .as_ref()
+        .ok_or_else(|| anyhow!("dispute package missing 2-party signed manifest"))?;
+    let script = ScriptBuf::from_bytes(hex::decode(leaf.script_hex.trim()).context("leaf script_hex")?);
+    let cb_bytes = hex::decode(leaf.control_block_hex.trim()).context("leaf control_block_hex")?;
+    let control_block =
+        ControlBlock::decode(&cb_bytes).map_err(|e| anyhow!("invalid dispute control block: {e}"))?;
+    let (keys, legacy_checksigadd) = dispute_leaf_keys(&script)?;
+    let prevout = TxOut {
+        value: Amount::from_sat(manifest.total_collateral_sats),
+        script_pubkey: ScriptBuf::from_bytes(
+            hex::decode(manifest.vtxo_pk_script_hex.trim()).context("vtxo_pk_script_hex")?,
+        ),
+    };
+    let leaf_hash = TapLeafHash::from_script(&script, LeafVersion::TapScript);
+    let sighash_obj = SighashCache::new(&built.unsigned_tx)
+        .taproot_script_spend_signature_hash(0, &Prevouts::All(&[prevout]), leaf_hash, TapSighashType::Default)
+        .map_err(|e| anyhow!("dispute tx sighash: {e}"))?;
+    let mut sighash = [0u8; 32];
+    sighash.copy_from_slice(sighash_obj.as_ref());
+    let mut rpc_params = built.rpc_params.clone();
+    rpc_params["dispute_script_hex"] = json!(hex::encode(script.as_bytes()));
+    rpc_params["sighash_hex"] = json!(hex::encode(sighash));
+    Ok(DisputeLeafRequest {
+        script,
+        control_block,
+        keys,
+        legacy_checksigadd,
+        sighash,
+        rpc_params,
+    })
+}
+
+/// Oracle keys of `leaf` whose returned signature verifies against `leaf.sighash`.
+pub fn verified_signers(
+    leaf: &DisputeLeafRequest,
     sigs_by_pubkey: &HashMap<String, String>,
-) -> Result<Transaction> {
-    let threshold = dispute.oracle_quorum.threshold;
-    let oracles = &dispute.oracle_quorum.oracles;
-    ensure!(threshold >= 1, "dispute threshold must be >= 1");
-    ensure!(
-        oracles.len() >= threshold,
-        "dispute quorum has {} oracles, need at least {threshold}",
-        oracles.len()
-    );
-
-    let dispute_script = ScriptBuf::from_bytes(
-        hex::decode(dispute.script_hex.trim()).context("dispute.script_hex")?,
-    );
-    let control_block_bytes =
-        hex::decode(dispute.control_block_hex.trim()).context("dispute.control_block_hex")?;
-    let control_block = ControlBlock::decode(&control_block_bytes)
-        .map_err(|e| anyhow!("invalid dispute control block: {e}"))?;
-
+) -> HashMap<String, [u8; 64]> {
     let secp = Secp256k1::verification_only();
-    let msg = Message::from_digest(built.sighash);
-
-    let mut verified: HashMap<String, [u8; 64]> = HashMap::new();
-    for entry in oracles {
-        let pk_key = entry.pubkey.trim().to_lowercase();
-        let Some(sig_hex) = sigs_by_pubkey.get(&pk_key) else { continue };
+    let msg = Message::from_digest(leaf.sighash);
+    let mut verified = HashMap::new();
+    for (pk_hex, sig_hex) in sigs_by_pubkey {
+        let pk_key = pk_hex.trim().to_lowercase();
         let Ok(pk) = parse_xonly(&pk_key) else { continue };
         let Ok(sig_bytes) = hex::decode(sig_hex.trim()) else { continue };
         let Ok(sig) = SchnorrSig::from_slice(&sig_bytes) else { continue };
@@ -302,27 +448,51 @@ pub fn assemble_dispute_tx_witness(
             verified.insert(pk_key, sig.serialize());
         }
     }
+    verified
+}
 
-    ensure!(
-        verified.len() >= threshold,
-        "only {}/{} valid Nostracle signatures collected for Leaf 2 dispute",
-        verified.len(),
-        threshold
-    );
+/// Verify the oracle signatures for `leaf` and attach its Tapscript witness to the tx:
+/// - CSVMultisig leaf: every one of its k keys must sign; signatures in reverse script order
+///   (first key's signature on top), no empty slots.
+/// - Legacy CHECKSIGADD leaf: `>= threshold` signatures, empty push for each non-signer.
+pub fn assemble_dispute_tx_witness(
+    built: &BuiltDisputeTx,
+    leaf: &DisputeLeafRequest,
+    threshold: usize,
+    sigs_by_pubkey: &HashMap<String, String>,
+) -> Result<Transaction> {
+    ensure!(threshold >= 1, "dispute threshold must be >= 1");
+    let verified = verified_signers(leaf, sigs_by_pubkey);
+    let signed_in_leaf = leaf.keys.iter().filter(|k| verified.contains_key(*k)).count();
+    if leaf.legacy_checksigadd {
+        ensure!(
+            signed_in_leaf >= threshold,
+            "only {signed_in_leaf}/{threshold} valid Nostracle signatures collected for Leaf 2 dispute"
+        );
+    } else {
+        let missing: Vec<&str> = leaf
+            .keys
+            .iter()
+            .filter(|k| !verified.contains_key(*k))
+            .map(|k| &k[..8])
+            .collect();
+        ensure!(
+            missing.is_empty(),
+            "dispute leaf needs all {} of its oracles to sign; missing {}",
+            leaf.keys.len(),
+            missing.join(", ")
+        );
+    }
 
-    // BIP-342 OP_CHECKSIGADD witness stack: reverse order of pubkeys in script,
-    // empty byte vector for non-signing oracles, followed by script and control block.
     let mut witness = Witness::new();
-    for entry in oracles.iter().rev() {
-        let pk_key = entry.pubkey.trim().to_lowercase();
-        if let Some(sig) = verified.get(&pk_key) {
-            witness.push(sig);
-        } else {
-            witness.push([]);
+    for k in leaf.keys.iter().rev() {
+        match verified.get(k) {
+            Some(sig) => witness.push(sig),
+            None => witness.push([]), // legacy CHECKSIGADD only
         }
     }
-    witness.push(dispute_script.as_bytes());
-    witness.push(control_block.serialize());
+    witness.push(leaf.script.as_bytes());
+    witness.push(leaf.control_block.serialize());
 
     let mut final_tx = built.unsigned_tx.clone();
     final_tx.input[0].witness = witness;
@@ -334,9 +504,7 @@ mod tests {
     use super::*;
     use crate::bounty::nums_internal_key;
     use crate::storage::{DisputeOracleEntry, DisputeQuorum};
-    use kormir::bitcoin::opcodes::all::{
-        OP_CHECKSIG, OP_CHECKSIGADD, OP_CSV, OP_DROP, OP_GREATERTHANOREQUAL,
-    };
+    use kormir::bitcoin::opcodes::all::OP_GREATERTHANOREQUAL;
     use kormir::bitcoin::script::Builder;
     use kormir::bitcoin::secp256k1::{Keypair, SecretKey};
     use kormir::bitcoin::taproot::TaprootBuilder;
@@ -416,6 +584,8 @@ mod tests {
             lp_payout_script_hex: hex::encode(p2tr_script(&lp_kp).as_bytes()),
             user_manifest_sig_hex: String::new(),
             lp_manifest_sig_hex: String::new(),
+            manifest_version: 1,
+            dispute_leaf_hashes_hex: Vec::new(),
         };
         let digest = compute_manifest_hash(&manifest);
         let msg = Message::from_digest(digest);
@@ -437,6 +607,7 @@ mod tests {
                 ],
             },
             manifest: Some(manifest),
+            leaves: Vec::new(),
         };
         let bounty = BountySpec {
             amount_sats: 1_000,
@@ -493,16 +664,20 @@ mod tests {
         let sig1 = hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &o1).serialize());
         let sig3 = hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &o3).serialize());
 
+        let leaf = leaf_request(&built, &dispute, &dispute_leaves(&dispute)[0]).unwrap();
+        assert!(leaf.legacy_checksigadd);
+        assert_eq!(leaf.sighash, built.sighash);
+
         // 1-of-3 must fail
         let mut only_one = HashMap::new();
         only_one.insert(o1.x_only_public_key().0.to_string(), sig1.clone());
-        assert!(assemble_dispute_tx_witness(&built, &dispute, &only_one).is_err());
+        assert!(assemble_dispute_tx_witness(&built, &leaf, 2, &only_one).is_err());
 
         // 2-of-3 (O1 + O3, with O2 offline) must succeed with reverse-order witness stack
         let mut two = HashMap::new();
         two.insert(o1.x_only_public_key().0.to_string(), sig1);
         two.insert(o3.x_only_public_key().0.to_string(), sig3);
-        let final_tx = assemble_dispute_tx_witness(&built, &dispute, &two).unwrap();
+        let final_tx = assemble_dispute_tx_witness(&built, &leaf, 2, &two).unwrap();
         // Witness elements: [sig_O3, empty_O2, sig_O1, dispute_script, control_block]
         assert_eq!(final_tx.input[0].witness.len(), 5);
         assert_eq!(final_tx.input[0].witness.nth(0).unwrap().len(), 64);
@@ -512,5 +687,276 @@ mod tests {
         // Tampered manifest must be rejected
         dispute.manifest.as_mut().unwrap().notional_fiat = 999.0;
         assert!(verify_dispute_manifest(dispute.manifest.as_ref().unwrap()).is_err());
+    }
+
+    // ---- manifest v2 + arkd CSVMultisig subset leaves ----
+
+    fn csv_multisig_leaf(keys: &[Keypair]) -> ScriptBuf {
+        let mut b = Builder::new()
+            .push_int(((1 << 22) | 4) as i64)
+            .push_opcode(OP_CSV)
+            .push_opcode(OP_DROP);
+        for (i, k) in keys.iter().enumerate() {
+            b = b.push_x_only_key(&k.x_only_public_key().0);
+            b = b.push_opcode(if i + 1 == keys.len() { OP_CHECKSIG } else { OP_CHECKSIGVERIFY });
+        }
+        b.into_script()
+    }
+
+    /// 3-of-5 quorum, 10 subset leaves in one taptree, v2 manifest committing to all of them.
+    /// The primary leaf is oracles #1,#2,#3.
+    fn make_v2_fixture() -> (DisputePackageSpec, BountySpec, Vec<Keypair>) {
+        let secp = Secp256k1::new();
+        let (user_kp, lp_kp, wt_kp) = (kp(1), kp(2), kp(3));
+        let oracles: Vec<Keypair> = (21u8..26).map(kp).collect();
+        let mut subsets = Vec::new();
+        for a in 0..5 {
+            for b in a + 1..5 {
+                for c in b + 1..5 {
+                    subsets.push([a, b, c]);
+                }
+            }
+        }
+        let scripts: Vec<ScriptBuf> = subsets
+            .iter()
+            .map(|ix| csv_multisig_leaf(&[oracles[ix[0]], oracles[ix[1]], oracles[ix[2]]]))
+            .collect();
+        let spend_info = TaprootBuilder::with_huffman_tree(scripts.iter().map(|s| (1u32, s.clone())))
+            .unwrap()
+            .finalize(&secp, nums_internal_key())
+            .unwrap();
+        let vtxo_pk_script = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
+        let leaves: Vec<DisputeLeafSpec> = scripts
+            .iter()
+            .map(|s| DisputeLeafSpec {
+                script_hex: hex::encode(s.as_bytes()),
+                control_block_hex: hex::encode(
+                    spend_info.control_block(&(s.clone(), LeafVersion::TapScript)).unwrap().serialize(),
+                ),
+            })
+            .collect();
+        let mut hashes: Vec<String> = scripts
+            .iter()
+            .map(|s| TapLeafHash::from_script(s, LeafVersion::TapScript).to_string())
+            .collect();
+        hashes.sort();
+
+        let mut manifest = DisputeManifest {
+            contract_id: "pos-wt-v2".into(),
+            vtxo_outpoint: format!("{}:0", "bb".repeat(32)),
+            currency: "USD".into(),
+            side: "short".into(),
+            total_collateral_sats: 200_000,
+            notional_fiat: 100.0,
+            opened_at: 1_760_000_000,
+            funding_rate_bps_per_day: 3.0,
+            user_pubkey_hex: user_kp.x_only_public_key().0.to_string(),
+            lp_pubkey_hex: lp_kp.x_only_public_key().0.to_string(),
+            vtxo_pk_script_hex: hex::encode(vtxo_pk_script.as_bytes()),
+            dispute_script_hex: leaves[0].script_hex.clone(),
+            user_payout_script_hex: hex::encode(p2tr_script(&user_kp).as_bytes()),
+            lp_payout_script_hex: hex::encode(p2tr_script(&lp_kp).as_bytes()),
+            user_manifest_sig_hex: String::new(),
+            lp_manifest_sig_hex: String::new(),
+            manifest_version: 2,
+            dispute_leaf_hashes_hex: hashes,
+        };
+        let msg = Message::from_digest(compute_manifest_hash(&manifest));
+        manifest.user_manifest_sig_hex = hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &user_kp).serialize());
+        manifest.lp_manifest_sig_hex = hex::encode(secp.sign_schnorr_no_aux_rand(&msg, &lp_kp).serialize());
+
+        let dispute = DisputePackageSpec {
+            script_hex: leaves[0].script_hex.clone(),
+            control_block_hex: leaves[0].control_block_hex.clone(),
+            csv_sequence: (1 << 22) | 4,
+            oracle_quorum: DisputeQuorum {
+                threshold: 3,
+                oracles: oracles
+                    .iter()
+                    .map(|o| DisputeOracleEntry { name: None, pubkey: o.x_only_public_key().0.to_string() })
+                    .collect(),
+            },
+            manifest: Some(manifest),
+            leaves,
+        };
+        let bounty = BountySpec {
+            amount_sats: 1_000,
+            vout: 2,
+            primary_pubkey: wt_kp.x_only_public_key().0.to_string(),
+            backup_pubkeys: vec![],
+            backup_csv: 4,
+        };
+        (dispute, bounty, oracles)
+    }
+
+    fn sign_all(leaf: &DisputeLeafRequest, who: &[&Keypair]) -> HashMap<String, String> {
+        let secp = Secp256k1::new();
+        let msg = Message::from_digest(leaf.sighash);
+        who.iter()
+            .map(|k| {
+                (
+                    k.x_only_public_key().0.to_string(),
+                    hex::encode(secp.sign_schnorr_no_aux_rand(&msg, k).serialize()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn csv_multisig_primary_leaf_needs_all_k_signers_and_has_no_empty_slots() {
+        let (dispute, bounty, o) = make_v2_fixture();
+        let built = build_watchtower_dispute_tx(&dispute, &bounty, 100_000.0, 1_760_086_400, 350).unwrap();
+        assert_eq!(built.rpc_params["manifest_version"], 2);
+        assert_eq!(built.rpc_params["dispute_leaf_hashes_hex"].as_array().unwrap().len(), 10);
+        let leaves = dispute_leaves(&dispute);
+        assert_eq!(leaves.len(), 10, "primary + 9 other committed leaves");
+        let primary = leaf_request(&built, &dispute, &leaves[0]).unwrap();
+        assert!(!primary.legacy_checksigadd);
+        assert_eq!(primary.sighash, built.sighash);
+
+        // #1 and #3 only: the primary leaf (#1,#2,#3) cannot be completed
+        let partial = sign_all(&primary, &[&o[0], &o[2]]);
+        let err = assemble_dispute_tx_witness(&built, &primary, 3, &partial).unwrap_err();
+        assert!(err.to_string().contains("missing"), "unexpected err: {err}");
+
+        let full = sign_all(&primary, &[&o[0], &o[1], &o[2]]);
+        let tx = assemble_dispute_tx_witness(&built, &primary, 3, &full).unwrap();
+        let w = &tx.input[0].witness;
+        assert_eq!(w.len(), 5, "3 sigs + script + control block");
+        assert!((0..3).all(|i| w.nth(i).unwrap().len() == 64));
+        // top of stack (last sig pushed) is the first key's signature
+        assert_eq!(hex::encode(w.nth(2).unwrap()), full[&o[0].x_only_public_key().0.to_string()]);
+    }
+
+    #[test]
+    fn v2_falls_back_to_the_signers_committed_leaf_for_the_same_tx() {
+        let (dispute, bounty, o) = make_v2_fixture();
+        let built = build_watchtower_dispute_tx(&dispute, &bounty, 100_000.0, 1_760_086_400, 350).unwrap();
+        let leaves = dispute_leaves(&dispute);
+        let primary = leaf_request(&built, &dispute, &leaves[0]).unwrap();
+
+        // Round 1: #2 is offline; #1, #3, #5 sign the primary leaf
+        let round1 = sign_all(&primary, &[&o[0], &o[2], &o[4]]);
+        let signers = verified_signers(&primary, &round1);
+        let fb = leaves[1..]
+            .iter()
+            .filter_map(|l| leaf_request(&built, &dispute, l).ok())
+            .find(|l| l.keys.iter().all(|k| signers.contains_key(k)))
+            .expect("a committed leaf of #1,#3,#5");
+        let want: Vec<String> = [0, 2, 4].iter().map(|i| o[*i].x_only_public_key().0.to_string()).collect();
+        assert_eq!(fb.keys, want);
+        assert_ne!(fb.sighash, primary.sighash, "sighash commits to the leaf");
+        assert_eq!(fb.rpc_params["raw_tx_hex"], primary.rpc_params["raw_tx_hex"], "same tx, same txid");
+        assert_eq!(fb.rpc_params["dispute_script_hex"], json!(hex::encode(fb.script.as_bytes())));
+
+        // Round 2: the same three sign the fallback leaf
+        let round2 = sign_all(&fb, &[&o[0], &o[2], &o[4]]);
+        let tx = assemble_dispute_tx_witness(&built, &fb, 3, &round2).unwrap();
+        assert_eq!(tx.compute_txid(), built.unsigned_tx.compute_txid());
+        assert_eq!(tx.input[0].witness.len(), 5);
+        // Round-1 signatures are for the other leaf and must not be accepted here
+        assert!(assemble_dispute_tx_witness(&built, &fb, 3, &round1).is_err());
+    }
+
+    #[test]
+    fn dispute_leaves_only_offers_committed_leaves() {
+        let (mut dispute, _, o) = make_v2_fixture();
+        let rogue = csv_multisig_leaf(&[o[0], o[1]]);
+        dispute.leaves.push(DisputeLeafSpec {
+            script_hex: hex::encode(rogue.as_bytes()),
+            control_block_hex: dispute.leaves[0].control_block_hex.clone(),
+        });
+        assert_eq!(dispute_leaves(&dispute).len(), 10, "uncommitted leaf dropped");
+
+        let (v1, _, _) = make_fixture();
+        assert_eq!(dispute_leaves(&v1).len(), 1, "v1 packages only use the primary leaf");
+    }
+
+    #[test]
+    fn dispute_leaf_parser_is_strict_and_not_fooled_by_0xba_in_keys() {
+        // find three oracle keys whose leaf bytes contain 0xba (OP_CHECKSIGADD) inside a pubkey
+        let mut seed = 30u8;
+        let leaf = loop {
+            let l = csv_multisig_leaf(&[kp(seed), kp(seed + 1), kp(seed + 2)]);
+            if l.as_bytes().contains(&0xba) {
+                break l;
+            }
+            seed += 1;
+        };
+        let (keys, legacy) = dispute_leaf_keys(&leaf).unwrap();
+        assert!(!legacy);
+        assert_eq!(keys.len(), 3);
+
+        let k = |s: u8| kp(s).x_only_public_key().0;
+        let csv = ((1 << 22) | 4) as i64;
+        let stray = Builder::new()
+            .push_int(csv).push_opcode(OP_CSV).push_opcode(OP_DROP)
+            .push_slice([9u8; 32]).push_opcode(OP_DROP)
+            .push_x_only_key(&k(1)).push_opcode(OP_CHECKSIGVERIFY)
+            .push_x_only_key(&k(2)).push_opcode(OP_CHECKSIG)
+            .into_script();
+        let trailing = Builder::new()
+            .push_int(csv).push_opcode(OP_CSV).push_opcode(OP_DROP)
+            .push_x_only_key(&k(1)).push_opcode(OP_CHECKSIGVERIFY)
+            .push_x_only_key(&k(2)).push_opcode(OP_CHECKSIG)
+            .push_opcode(OP_DROP)
+            .into_script();
+        let no_csv = Builder::new()
+            .push_x_only_key(&k(1)).push_opcode(OP_CHECKSIGVERIFY)
+            .push_x_only_key(&k(2)).push_opcode(OP_CHECKSIG)
+            .into_script();
+        for s in [stray, trailing, no_csv] {
+            assert!(dispute_leaf_keys(&s).is_err(), "must refuse {s:?}");
+        }
+        let legacy = Builder::new()
+            .push_int(csv).push_opcode(OP_CSV).push_opcode(OP_DROP)
+            .push_x_only_key(&k(1)).push_opcode(OP_CHECKSIG)
+            .push_x_only_key(&k(2)).push_opcode(OP_CHECKSIGADD)
+            .push_int(2).push_opcode(OP_GREATERTHANOREQUAL)
+            .into_script();
+        assert!(dispute_leaf_keys(&legacy).unwrap().1);
+    }
+
+    /// Cross-language vector shared with p2pFiat `mvp/test/dispute-manifest-v2.test.mjs` and
+    /// nostracle `dispute::tests::manifest_v2_hash_matches_cross_language_vector`.
+    #[test]
+    fn manifest_v2_hash_matches_cross_language_vector() {
+        let m = DisputeManifest {
+            contract_id: "pos-vector-1".into(),
+            vtxo_outpoint: format!("{}:0", "aa".repeat(32)),
+            currency: "USD".into(),
+            side: "short".into(),
+            total_collateral_sats: 333_334,
+            notional_fiat: 100.0,
+            opened_at: 1_795_000_000,
+            funding_rate_bps_per_day: 3.0,
+            user_pubkey_hex: "11".repeat(32),
+            lp_pubkey_hex: "22".repeat(32),
+            vtxo_pk_script_hex: format!("5120{}", "33".repeat(32)),
+            dispute_script_hex: "51".into(),
+            user_payout_script_hex: format!("5120{}", "44".repeat(32)),
+            lp_payout_script_hex: format!("5120{}", "55".repeat(32)),
+            user_manifest_sig_hex: String::new(),
+            lp_manifest_sig_hex: String::new(),
+            manifest_version: 2,
+            dispute_leaf_hashes_hex: vec!["bb".repeat(32), "aa".repeat(32), "CC".repeat(32)],
+        };
+        assert_eq!(
+            hex::encode(compute_manifest_hash(&m)),
+            "362770732e8595c4c6c159e5aa17b142188bbd8e1ed09f7fde9547b801005116"
+        );
+    }
+
+    #[test]
+    fn packages_stored_before_v2_still_load() {
+        let (v1, _, _) = make_fixture();
+        let mut json = serde_json::to_value(&v1).unwrap();
+        let m = json["manifest"].as_object_mut().unwrap();
+        m.remove("manifest_version");
+        m.remove("dispute_leaf_hashes_hex");
+        json.as_object_mut().unwrap().remove("leaves");
+        let back: DisputePackageSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back.manifest.unwrap().manifest_version, 1);
+        assert!(back.leaves.is_empty());
     }
 }
