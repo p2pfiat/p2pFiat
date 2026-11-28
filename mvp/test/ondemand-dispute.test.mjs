@@ -130,8 +130,8 @@ const sigs2 = {
 };
 assert.throws(
   () => assembleDisputeWitness(midExit, disputeClosure, sigs2),
-  /Insufficient Nostracle signatures/,
-  "must reject < threshold signatures"
+  new RegExp(`Insufficient Nostracle signatures.*missing ${oracles[4].key.pubHex.slice(0, 8)}`),
+  "must reject < threshold signatures and name the leaf oracle that did not sign"
 );
 assert.throws(
   () => selectDisputeLeaf(disputeClosure, [oracles[0].key.pubHex, oracles[2].key.pubHex]),

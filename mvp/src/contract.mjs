@@ -622,7 +622,9 @@ export function assembleDisputeWitness(disputeTx, disputeClosure, sigsByPubkeyHe
 
   if (validSigs.size < disputeClosure.threshold) {
     throw new Error(
-      `Insufficient Nostracle signatures: got ${validSigs.size}, need at least ${disputeClosure.threshold}-of-${totalOracles}`
+      `Insufficient Nostracle signatures: got ${validSigs.size}, need at least ${disputeClosure.threshold}-of-${totalOracles}; ` +
+        `the tx spends the leaf of oracles ${pubs.map((p) => p.slice(0, 8)).join(", ")}, missing ` +
+        pubs.filter((p) => !validSigs.has(p)).map((p) => p.slice(0, 8)).join(", ")
     );
   }
 
